@@ -72,6 +72,8 @@ def _tick(delta):
 
 
 def start():
+    if os.environ.get("ABF_MCP_HIDDEN") == "1":
+        return          # a hidden MCP process (headless Blueprint tools) must not answer the server
     _enable_remote_execution()
     BRIDGE.mkdir(parents=True, exist_ok=True)
     # A request left from an earlier session (one that quit the editor, say) must not run again.
