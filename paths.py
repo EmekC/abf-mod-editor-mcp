@@ -37,6 +37,12 @@ def bridge_dir():
     return local_app_data() / "abf-mod-editor-mcp" / "bridge"
 
 
+def headless_dir():
+    """Runtime root of the hidden Blueprint tools (staging copies, runs, backups, hidden-editor userdir).
+    Outside the repo and outside any mod: Upload zips the whole mod folder."""
+    return Path(os.environ.get("ABF_HEADLESS_DIR") or (local_app_data() / "abf-mod-editor-mcp" / "headless"))
+
+
 def saved_dir():
     """The cooked editor's Saved folder (logs, config)."""
     return Path(os.environ.get("ABF_EDITOR_SAVED") or (local_app_data() / "AbioticFactor" / "Saved"))

@@ -14,6 +14,7 @@ import urllib.request
 from pathlib import Path
 
 FILTER_URL = "https://cdn.abfmods.com/blueprint-filter/1.5/BlueprintFilter.txt"
+BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 HERE = Path(__file__).resolve().parent
 FILTER_FILE = HERE / "data" / "BlueprintFilter.txt"
 
@@ -26,7 +27,8 @@ def load_filter(max_age_hours=24):
     stale = not FILTER_FILE.is_file() or time.time() - FILTER_FILE.stat().st_mtime > max_age_hours * 3600
     if stale:
         try:
-            with urllib.request.urlopen(FILTER_URL, timeout=15) as r:
+            req = urllib.request.Request(FILTER_URL, headers={"User-Agent": BROWSER_UA})
+            with urllib.request.urlopen(req, timeout=15) as r:
                 data = r.read()
             if data.startswith(b"# ABF-BlueprintFilter"):
                 FILTER_FILE.parent.mkdir(exist_ok=True)
@@ -90,6 +92,11 @@ def _parse_node_props(node, btxt):
         mm = re.search(r"^\s*" + key + r"=(.*)$", btxt, re.M)
         if mm:
             node[key[0].lower() + key[1:]] = mm.group(1).strip().strip('"')[:160]
+    px = re.search(r"^\s*NodePosX=(-?\d+)", btxt, re.M)
+    py = re.search(r"^\s*NodePosY=(-?\d+)", btxt, re.M)
+    node["pos"] = [int(px.group(1)) if px else 0, int(py.group(1)) if py else 0]
+    guid = re.search(r"^\s*NodeGuid=([0-9A-Fa-f]{32})", btxt, re.M)
+    node["guid"] = guid.group(1) if guid else None
     err = re.search(r'ErrorMsg="(.*)"', btxt)
     if err:
         node["error"] = err.group(1)[:300]
@@ -107,8 +114,15 @@ def _parse_node_props(node, btxt):
         if obj and obj.group(1) not in ("None", ""):
             pm = _PATHREF.search(obj.group(1))
             entry["object"] = pm.group(1) if pm else obj.group(1).strip('"')
+        pid = re.search(r"PinId=([0-9A-Fa-f]+)", pin)
+        entry["id"] = pid.group(1) if pid else None
+        entry["links"] = []
         if linked and linked[0]:
             entry["linked"] = [l.split(" ")[0] for l in linked[0].split(",") if l]
+            for l in linked[0].split(","):
+                parts = l.strip().split(" ")
+                if len(parts) == 2:
+                    entry["links"].append({"node": parts[0], "pin_id": parts[1]})
         default = re.search(r'DefaultValue="([^"]*)"', pin)
         if default and default.group(1):
             entry["default"] = default.group(1)[:80]
@@ -192,3 +206,207 @@ def check_nodes(nodes, rules):
                 seen.add(key)
                 unlisted.append({"parent": parent, "member": member, "first_node": n["name"]})
     return {"blocked": blocked, "unlisted": unlisted}
+
+
+# ---- structure (bp_read) ----------------------------------------------------
+
+def _build_tree(text):
+    """Nested objects of a T3D export. Declaration and definition passes merge by name within the parent."""
+    root = {"name": None, "cls": "", "lines": [], "children": {}}
+    stack = [root]
+    for raw in text.splitlines():
+        line = raw.rstrip("\r")
+        m = _BEGIN.match(line)
+        if m:
+            cur = stack[-1]
+            cls, name = (m.group(2) or ""), m.group(3)
+            child = cur["children"].get(name)
+            if child is None:
+                child = {"name": name, "cls": "", "lines": [], "children": {}}
+                cur["children"][name] = child
+            if cls:
+                child["cls"] = cls
+            stack.append(child)
+            continue
+        if line.strip() == "End Object":
+            if len(stack) > 1:
+                stack.pop()
+            continue
+        stack[-1]["lines"].append(line)
+    return root
+
+
+def _last_name(ref):
+    """"/Script/Engine.EdGraph'Foo'" or ".../Path.Asset:Graph.Foo" -> "Foo"."""
+    m = re.search(r"'([^']+)'", ref)
+    s = m.group(1) if m else ref.strip().strip('"')
+    return re.split(r"[.:]", s)[-1]
+
+
+def _array_names(lines, prop):
+    out = []
+    for l in lines:
+        m = re.match(r"\s*" + prop + r"\(\d+\)=(.*)$", l)
+        if m:
+            out.append(_last_name(m.group(1)))
+    return out
+
+
+def _var_type(vartype):
+    """Type string in the bp_apply grammar from the inside of VarType=(...) / PinType=(...)."""
+    cat = re.search(r'PinCategory="([^"]*)"', vartype)
+    sub = re.search(r'PinSubCategory="([^"]*)"', vartype)
+    obj = re.search(r'PinSubCategoryObject="([^"]*)"', vartype)
+    cont = re.search(r"ContainerType=(\w+)", vartype)
+    cat = cat.group(1) if cat else "?"
+    path = None
+    if obj and obj.group(1) not in ("None", ""):
+        pm = _PATHREF.search(obj.group(1))
+        path = pm.group(1) if pm else obj.group(1)
+    if cat == "real":
+        t = "float" if (sub and sub.group(1) == "float") else "real"
+    elif cat in ("object", "class", "softobject", "softclass", "interface", "struct") and path:
+        t = cat + ":" + path
+    elif cat == "byte" and path:
+        t = "enum:" + path
+    else:
+        t = cat
+    if cont and cont.group(1) != "None":
+        t = cont.group(1).lower() + ":" + t
+    return t, path
+
+
+def _balanced(s, opener):
+    """Text inside the parentheses that `opener` (ending in '(') starts, or ''."""
+    i = s.find(opener)
+    if i < 0:
+        return ""
+    depth, start = 0, i + len(opener) - 1
+    for j in range(start, len(s)):
+        if s[j] == "(":
+            depth += 1
+        elif s[j] == ")":
+            depth -= 1
+            if depth == 0:
+                return s[start + 1:j]
+    return s[start + 1:]
+
+
+def _user_pins(lines):
+    ins, outs = [], []
+    for l in lines:
+        m = re.match(r'\s*CustomProperties UserDefinedPin \(PinName="([^"]*)",(.*),DesiredPinDirection=(\w+)\)\s*$', l)
+        if not m:
+            continue
+        t, _ = _var_type(_balanced(m.group(2), "PinType=("))
+        (outs if m.group(3) == "EGPD_Output" else ins).append({"name": m.group(1), "type": t})
+    return ins, outs
+
+
+def _graph_nodes(graph):
+    names = _array_names(graph["lines"], "Nodes")
+    nodes = []
+    for name in names:
+        ch = graph["children"].get(name)
+        if ch is None:
+            continue
+        node = {"name": name, "class": ch["cls"].split(".")[-1], "graph": graph["name"]}
+        _parse_node_props(node, "\n".join(ch["lines"]))
+        node["_lines"] = ch["lines"]
+        nodes.append(node)
+    by_name = {n["name"]: n for n in nodes}
+    for n in nodes:
+        for p in n["pins"]:
+            for l in p.get("links", []):
+                tgt = by_name.get(l["node"])
+                if tgt:
+                    for tp in tgt["pins"]:
+                        if tp.get("id") == l["pin_id"]:
+                            l["pin"] = tp["name"]
+                            break
+    return nodes
+
+
+def _descendants(obj):
+    for c in obj["children"].values():
+        yield c
+        yield from _descendants(c)
+
+
+def parse_structure(text):
+    """Structure of a Blueprint export: variables, functions, macros, dispatchers, timelines, interfaces,
+    components, graphs (nodes restricted to each graph's Nodes(i) lines) and the widget tree."""
+    tree = _build_tree(text)
+    bps = [c for c in tree["children"].values() if "Blueprint" in c["cls"].split(".")[-1]]
+    if not bps:
+        return {"blueprint": {}, "variables": [], "functions": [], "macros": [], "dispatchers": [], "timelines": [],
+                "interfaces": [], "components": [], "graphs": {}, "widgets": []}
+    bp = bps[0]
+    lines = bp["lines"]
+    info = {"class": bp["cls"].split(".")[-1], "name": bp["name"]}
+    for l in lines:
+        pc = re.match(r"\s*ParentClass=(.*)$", l)
+        if pc:
+            pm = _PATHREF.search(pc.group(1))
+            info["parent_class"] = pm.group(1) if pm else pc.group(1).strip()
+            break
+    variables = []
+    for l in lines:
+        m = re.match(r'\s*NewVariables\(\d+\)=\(VarName="([^"]+)"(.*)\)\s*$', l)
+        if not m:
+            continue
+        t, sub_obj = _var_type(_balanced(m.group(2), "VarType=("))
+        d = re.search(r'DefaultValue="((?:[^"\\]|\\.)*)"', m.group(2))
+        variables.append({"name": m.group(1), "type": t, "sub_object": sub_obj, "default": d.group(1) if d else None})
+    graphs = {}
+    for c in bp["children"].values():
+        if c["cls"].split(".")[-1] == "EdGraph":
+            graphs[c["name"]] = _graph_nodes(c)
+    functions = []
+    for name in _array_names(lines, "FunctionGraphs"):
+        ins, outs = [], []
+        for n in graphs.get(name, []):
+            if n["class"] == "K2Node_FunctionEntry":
+                ins = _user_pins(n["_lines"])[1]
+            elif n["class"] == "K2Node_FunctionResult":
+                outs = _user_pins(n["_lines"])[0]
+        functions.append({"name": name, "inputs": ins, "outputs": outs})
+    macros = _array_names(lines, "MacroGraphs")
+    dispatchers = _array_names(lines, "DelegateSignatureGraphs")
+    timelines = [n[:-9] if n.endswith("_Template") else n for n in _array_names(lines, "Timelines")]
+    interfaces = []
+    for l in lines:
+        if re.match(r"\s*ImplementedInterfaces\(\d+\)=", l):
+            pm = _PATHREF.search(l)
+            if pm:
+                interfaces.append(pm.group(1))
+    components = []
+    for d in _descendants(bp):
+        if d["cls"].split(".")[-1] == "SCS_Node":
+            body = "\n".join(d["lines"])
+            vn = re.search(r'InternalVariableName="([^"]+)"', body)
+            cc = re.search(r"ComponentClass=(.*)$", body, re.M)
+            par = re.search(r'ParentComponentOrVariableName="([^"]+)"', body)
+            pm = _PATHREF.search(cc.group(1)) if cc else None
+            components.append({"name": vn.group(1) if vn else d["name"], "class": pm.group(1) if pm else None,
+                               "parent": par.group(1) if par else None})
+    widgets = []
+    wt = bp["children"].get("WidgetTree")
+    if wt:
+        parent_of = {}
+        for w in wt["children"].values():
+            for s in w["children"].values():
+                for l in s["lines"]:
+                    c = re.match(r"\s*Content=(.*)$", l)
+                    if c:
+                        parent_of[_last_name(c.group(1))] = w["name"]
+        for w in wt["children"].values():
+            if w["cls"].split(".")[-1].endswith("Slot"):
+                continue
+            widgets.append({"name": w["name"], "class": w["cls"], "parent": parent_of.get(w["name"])})
+    for g in graphs.values():
+        for n in g:
+            n.pop("_lines", None)
+    return {"blueprint": info, "variables": variables, "functions": functions, "macros": macros,
+            "dispatchers": dispatchers, "timelines": timelines, "interfaces": interfaces,
+            "components": components, "graphs": graphs, "widgets": widgets}

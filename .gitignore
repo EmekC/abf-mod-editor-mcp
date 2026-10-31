@@ -10,3 +10,15 @@ exports/
 data/BlueprintFilter.txt
 data/*.json
 config.json
+
+# logs, staged mods, screenshots and runtime output of the hidden Blueprint tools
+*.log
+*.dmp
+*.t3d
+*.uasset
+staging/
+headless/
+runs/
+backups/
+tests/_tmp/
+.env

@@ -28,12 +28,16 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(HERE / "editor"))
 import wininput  # noqa: E402
 import bpscan    # noqa: E402
 import paths     # noqa: E402
+import headless_tools  # noqa: E402
+import headless  # noqa: E402
+import staging   # noqa: E402
 
 SERVER_NAME = "abiotic-mod-editor"
-SERVER_VERSION = "2.2.0"
+SERVER_VERSION = "2.3.0"
 
 EDITOR_ROOT = paths.find_editor_root()          # None when no Mod Editor install was found
 EDITOR_EXE = paths.editor_exe(EDITOR_ROOT)
@@ -1162,7 +1166,8 @@ def t_blueprint_filter_check(args):
     report["verdict"] = "BLOCKED REFERENCES" if report["blocked"] else "OK"
     report["note"] = ("Same rule file the upload Asset Audit uses, applied to function/variable/object references found in the "
                       "T3D export. Parent-class override signatures and the cloud cook's editor-only checks are not covered; "
-                      "run check_upload too.")
+                      "run check_upload too. False alarms have been seen on a PlayerController cast, Controller.IsLocalController and "
+                      "Controller.K2_GetPawn while the editor's real audit passed: prefer mod_audit, which runs that audit.")
     return json.dumps(report, indent=2), bool(report["blocked"])
 
 
@@ -1315,7 +1320,8 @@ TOOLS = [
      S(asset_path=STR, graph=STR, node_prefix=STR, include_nodes=BOOL, include_pins=BOOL, limit=INT), ["asset_path"]),
     ("blueprint_filter_check", t_blueprint_filter_check,
      "Check mod Blueprints against Deep Field's Blueprint filter (the list the upload Asset Audit enforces; cached in data/, refreshed daily): "
-     "lists every Blocked function/variable/class reference with its node and the rule that blocks it. Pass asset_paths or mod_root.",
+     "lists every Blocked function/variable/class reference with its node and the rule that blocks it. Pass asset_paths or mod_root. "
+     "It has raised false alarms (PlayerController cast, Controller.IsLocalController, Controller.K2_GetPawn) on Blueprints the real audit passed: prefer mod_audit.",
      S(asset_paths={"type": "array", "items": STR}, mod_root=STR), []),
     ("load_map", t_load_map,
      "Load a map in the editor, e.g. /Game/Maps/Facility (needed before Play In Editor; a fresh mod opens on Empty).",
@@ -1333,13 +1339,16 @@ TOOLS = [
      "Tail of the Mod Editor log, optional regex filter (works with the editor closed). Upload/mod.io errors are under LogModio.",
      S(lines=INT, contains={"type": "string", "description": "Case-insensitive regex."}, file=STR), []),
 ]
+TOOLS.extend(headless_tools.build(run_json, (RemoteError,), t3d_errors, HERE / "editor", [EDITOR_ROOT], PY_STATUS))
 TOOL_MAP = {t[0]: t for t in TOOLS}
 
 INSTRUCTIONS = (
     "Tools for the official Abiotic Factor Mod Editor (custom Unreal 5.4.4 cooked editor, Python 3.11). Start with editor_status. "
     "Mods are plugins with an AbioticModConfig and per-row assets (e.g. /<Mod>/DataTables/ItemTable_Gear/<Row>) whose data is the 'row' property. "
     "Never edit or save /Game (base content); never T3D-export /Game Blueprints (crash); never delete many assets in one loop (crash). "
-    "Python cannot create Blueprint nodes: generate T3D and use paste_graph, then compile and export_t3d to check. "
+    "Python cannot create Blueprint nodes in the open editor. To create or edit Blueprints prefer the headless route, which uses no mouse or keyboard "
+    "and no editor window: staging_sync -> bp_apply -> bp_compile_report -> bp_game_test -> mod_audit -> bp_publish. "
+    "paste_graph is the older route that needs the real desktop. "
     "Copied game Blueprints must pass the upload Asset Audit (Blueprint filter) and the cloud cook; run check_upload before an upload. "
     "Screenshots are per editor window only. The user does mod.io uploads."
 )
@@ -1377,7 +1386,7 @@ def handle(req):
             if isinstance(res, dict) and "content" in res:
                 return res
             text, is_error = res if isinstance(res, tuple) else (res, False)
-        except (RemoteError, wininput.WinError) as e:
+        except (RemoteError, wininput.WinError, headless.HeadlessError, staging.StagingError) as e:
             text, is_error = str(e), True
         except Exception:
             text, is_error = traceback.format_exc(), True
