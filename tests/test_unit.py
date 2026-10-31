@@ -767,12 +767,14 @@ class StagingTests(unittest.TestCase):
         self.stage_write("Content/A.uasset", b"edited A")
         self.stage_write("Content/Sub/B.uasset", b"edited B")
         real_copy = shutil.copyfile
+        state = {"copy_failed": False}      # shutil.copy2 calls copyfile on some Python versions: only fail after the publish copy fails
 
         def flaky(src, dst, *a, **k):
             if str(dst).endswith("B.uasset.mcpnew"):
+                state["copy_failed"] = True
                 Path(dst).write_bytes(b"partial")
                 raise OSError("disk full (simulated)")
-            if not str(dst).endswith(".mcpnew"):
+            if state["copy_failed"] and not str(dst).endswith(".mcpnew"):
                 raise PermissionError("locked during rollback (simulated)")
             return real_copy(src, dst, *a, **k)
 
