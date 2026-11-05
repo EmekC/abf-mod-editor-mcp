@@ -18,7 +18,7 @@ New to this? There's a step-by-step setup and usage guide on mod.io: [Use an AI 
 ## Install
 
 ```bash
-git clone https://github.com/theelites11gamer/abf-mod-editor-mcp.git
+git clone https://github.com/EmekC/abf-mod-editor-mcp.git
 cd abf-mod-editor-mcp
 python install.py
 ```
@@ -213,6 +213,10 @@ Integration tests run hidden Mod Editor processes against a fixture mod generate
 - Headless Blueprint tools: the Mod Browser tile position used by `hidden_editor_shot` and `mod_audit` is fragile (it follows the picker layout of this build; `ABF_PICKER_TILE` overrides it). The hidden Facility map has a real pawn but no live HUD (`W_PlayerHUD_Main` is not in the viewport), so anything injected there cannot be tested hidden. `PrintString` is not logged in this build: read state back instead. Memory offsets for the Blueprint arrays are discovered per build and the tools refuse rather than guess. Pure functions are not offered (the engine rejected the generated ones). Collapsed graphs are refused, `set` and `map` types are refused, and neither component nor Blueprint reparenting is offered. Re-run `install.py` once to get the hook guard that keeps hidden processes from answering remote-execution pings.
 - A mod made with these tools still has to pass the editor's Asset Audit and mod.io's cloud cook; the checkers here reduce surprises, they don't guarantee anything.
 
+## Credits
+
+Originally created by [theelites11gamer](https://github.com/theelites11gamer/abf-mod-editor-mcp). The headless Blueprint tools (`staging_sync`, `bp_apply`, `bp_read`, `bp_compile_report`, `bp_game_test`, `mod_audit`, `hidden_editor_shot`, `bp_publish`) were added by DezionDev.
+
 ## License
 
-MIT. The Blueprint filter list belongs to Deep Field Games and is downloaded from their CDN at run time, not shipped here.
+MIT, copyright theelites11gamer and DezionDev. The Blueprint filter list belongs to Deep Field Games and is downloaded from their CDN at run time, not shipped here.
