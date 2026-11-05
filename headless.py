@@ -209,13 +209,20 @@ def parse_compile_log(text, mod=None):
         if not m:
             continue
         sev = m.group("sev")
-        asset = _asset_of(m.group("src"), m.group("where"), mod)
+        src = m.group("src")
+        asset = _asset_of(src, m.group("where"), mod)
         msg = m.group("msg").strip()
-        key = (sev, asset, msg)
+        key = (sev, asset, msg, src)
         if key in seen:
             continue
         seen.add(key)
-        out["errors" if sev == "Error" else "warnings"].append({"asset": asset, "message": msg})
+        entry = {"asset": asset, "message": msg}
+        if src:
+            # src like /Mod/X/BP.BP:EventGraph.K2Node_CallFunction_12 -> graph EventGraph, node K2Node_CallFunction_12
+            where = src.split(":", 1)[1] if ":" in src else ""
+            graph, _dot, node = where.rpartition(".")
+            entry.update({"source": src, "graph": graph or None, "node": node or None})
+        out["errors" if sev == "Error" else "warnings"].append(entry)
     return out
 
 

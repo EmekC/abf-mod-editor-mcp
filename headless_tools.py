@@ -311,6 +311,7 @@ def build(run_json, remote_errors, t3d_errors, kit_root, forbidden, py_status, l
                     n.pop("object_refs", None)
         st["asset"] = path
         st["run"] = res["run"]
+        st["seconds"] = res.get("seconds")
         return _out(st)
 
     def t_bp_compile_report(args):
@@ -330,8 +331,10 @@ def build(run_json, remote_errors, t3d_errors, kit_root, forbidden, py_status, l
             for e in c[kind]:
                 per.setdefault(e["asset"], {"errors": [], "warnings": []})[kind].append(e["message"])
         bad = unchecked(res["result"])
+        messages = [{"severity": sev, "asset": e["asset"], "message": e["message"], "node": e.get("node"), "graph": e.get("graph")}
+                    for sev, kind in (("error", "errors"), ("warning", "warnings")) for e in c[kind]]
         return _out({"clean": not c["errors"] and not bad, "unchecked": bad, "error_count": len(c["errors"]), "warning_count": len(c["warnings"]),
-                     "assets": per, "compiled": res["result"]["compiled"], "skipped": res["result"]["skipped"],
+                     "assets": per, "messages": messages, "compiled": res["result"]["compiled"], "skipped": res["result"]["skipped"],
                      "run": res["run"], "seconds": res["seconds"]})
 
     # ---------------------------------------------------------------- game test
