@@ -52,20 +52,35 @@ def _object_ref(kind, path):
     return class_ref(path, "/Script/Engine.BlueprintGeneratedClass")
 
 
-def parse_type(t):
-    """'int', 'real', 'object:/Script/Engine.Actor', 'array:int' ... -> {"cat","sub","obj","container"}."""
+_CLASSLIKE = ("object", "class", "softobject", "softclass", "interface")
+
+
+def parse_type(t, class_text=None):
+    """'int', 'real', 'object:/Script/Engine.Actor', 'array:int' ... -> {"cat","sub","obj","container"}.
+
+    class_text: optional callable(path) -> T3D class reference for non-/Script class paths
+    (bp_apply passes Env.class_text)."""
     if not isinstance(t, str) or not t.strip():
         raise SpecError("type must be a non-empty string, got %r" % (t,))
     t = t.strip()
     if t.startswith("array:"):
-        inner = dict(parse_type(t[6:]))
+        inner = dict(parse_type(t[6:], class_text))
         if inner["container"]:
             raise SpecError("nested containers are not supported: %s" % t)
         inner["container"] = "Array"
         return inner
     head = t.split(":", 1)[0]
-    if head in ("set", "map"):
-        raise SpecError("%s types are not supported (arrays only): %s" % (head, t))
+    if head == "map":
+        key, sep, val = t[4:].partition(":")
+        if not sep or key not in _SIMPLE or key == "exec":
+            raise SpecError("map types are map:<key>:<value> with a simple key type (int int64 bool byte name string text real double float): %s" % t)
+        v = parse_type(val, class_text)
+        if v["container"]:
+            raise SpecError("nested containers are not supported: %s" % t)
+        cat, sub = _SIMPLE[key]
+        return {"cat": cat, "sub": sub, "obj": None, "container": "Map", "value": v}
+    if head == "set":
+        raise SpecError("%s types are not supported (arrays and maps only): %s" % (head, t))
     if t in _SIMPLE:
         cat, sub = _SIMPLE[t]
         return {"cat": cat, "sub": sub, "obj": None, "container": None}
@@ -73,11 +88,14 @@ def parse_type(t):
         path = t.split(":", 1)[1].strip()
         if not path:
             raise SpecError("type %r needs a path (a struct with no type crashes the import)" % head)
-        return {"cat": _OBJ_KINDS[head], "sub": "", "obj": _object_ref(head, path), "container": None}
+        obj = _object_ref(head, path)
+        if class_text is not None and head in _CLASSLIKE and not path.startswith("/Script/") and "'" not in path:
+            obj = class_text(path)
+        return {"cat": _OBJ_KINDS[head], "sub": "", "obj": obj, "container": None}
     if head in _OBJ_KINDS:
         raise SpecError("type %r needs a path, e.g. %s:/Script/Engine.Actor" % (head, head))
     raise SpecError("unknown type %r (exec int int64 bool byte name string text real double float "
-                    "object:<path> class:<path> softobject:<path> softclass:<path> interface:<path> struct:<path> enum:<path> array:<type>)" % t)
+                    "object:<path> class:<path> softobject:<path> softclass:<path> interface:<path> struct:<path> enum:<path> array:<type> map:<key>:<type>)" % t)
 
 
 def _direction(d):
@@ -88,12 +106,25 @@ def _direction(d):
     raise SpecError("direction must be in or out, got %r" % (d,))
 
 
-def _pin_type_attrs(t):
+def _terminal_text(v):
+    s = '(TerminalCategory="%s"' % v["cat"]
+    if v["sub"]:
+        s += ',TerminalSubCategory="%s"' % v["sub"]
+    if v["obj"]:
+        s += ',TerminalSubCategoryObject="%s"' % v["obj"]
+    return s + ")"
+
+
+def _pin_type_core(t):
     return ('PinType.PinCategory="%s",PinType.PinSubCategory="%s",PinType.PinSubCategoryObject=%s,'
-            'PinType.PinSubCategoryMemberReference=(),PinType.PinValueType=(),PinType.ContainerType=%s,'
-            'PinType.bIsReference=False,PinType.bIsConst=False,PinType.bIsWeakPointer=False,'
-            'PinType.bIsUObjectWrapper=False,PinType.bSerializeAsSinglePrecisionFloat=False'
-            % (t["cat"], t["sub"], '"%s"' % t["obj"] if t["obj"] else "None", t["container"] or "None"))
+            'PinType.PinSubCategoryMemberReference=(),PinType.PinValueType=%s,PinType.ContainerType=%s'
+            % (t["cat"], t["sub"], '"%s"' % t["obj"] if t["obj"] else "None",
+               _terminal_text(t["value"]) if t.get("value") else "()", t["container"] or "None"))
+
+
+def _pin_type_attrs(t):
+    return (_pin_type_core(t) + ',PinType.bIsReference=False,PinType.bIsConst=False,PinType.bIsWeakPointer=False,'
+            'PinType.bIsUObjectWrapper=False,PinType.bSerializeAsSinglePrecisionFloat=False')
 
 
 def _compact_type(t):
@@ -104,6 +135,9 @@ def _compact_type(t):
         s += ',PinSubCategoryObject="%s"' % t["obj"]
     if t["container"]:
         s += ",ContainerType=%s" % t["container"]
+    v = t.get("value")
+    if t["container"] == "Map" and v:
+        s += ",PinValueType=" + _terminal_text(v)
     return s
 
 
@@ -152,6 +186,13 @@ _ID_RX = re.compile(r"PinId=([0-9A-Fa-f]+)")
 _LINK_RX = re.compile(r",LinkedTo=\(([^)]*)\)")
 _DEFAULT_RX = re.compile(r',DefaultValue="(?:[^"\\]|\\.)*"')
 _DEFOBJ_RX = re.compile(r',DefaultObject=(?:"(?:[^"\\]|\\.)*"|None)')
+_PINTYPE_RX = re.compile(r'PinType\.PinCategory="[^"]*",PinType\.PinSubCategory="[^"]*",PinType\.PinSubCategoryObject=(?:"[^"]*"|None),'
+                         r'PinType\.PinSubCategoryMemberReference=\([^)]*\),PinType\.PinValueType=\([^)]*\),PinType\.ContainerType=\w+')
+_CAT_RX = re.compile(r'PinType\.PinCategory="([^"]*)"')
+_CONTAINER_RX = re.compile(r'PinType\.ContainerType=(\w+)')
+_CONTAINER_HINT = {"None": "a single-value pin (give a type without array:/map:)", "Array": "an array pin (give array:<type>)",
+                   "Map": "a map pin (give map:<key>:<type>)", "Set": "a set pin (set types are not supported)"}
+DEFAULT_WILDCARDS = {"K2Node_DynamicCast": {"Object": "object:/Script/CoreUObject.Object"}}
 _POS_RX = {"x": re.compile(r"^NodePosX=(-?\d+)"), "y": re.compile(r"^NodePosY=(-?\d+)")}
 
 
@@ -183,6 +224,24 @@ class Pin:
     def id(self):
         m = _ID_RX.search(self.text)
         return m.group(1) if m else ""
+
+    @property
+    def category(self):
+        m = _CAT_RX.search(self.text)
+        return m.group(1) if m else ""
+
+    @property
+    def container(self):
+        m = _CONTAINER_RX.search(self.text)
+        return m.group(1) if m else "None"
+
+    def is_wildcard(self):
+        return self.category == "wildcard" or 'TerminalCategory="wildcard"' in self.text
+
+    def set_type(self, t):
+        if _PINTYPE_RX.search(self.text) is None:
+            raise SpecError("cannot read the PinType of pin %r" % self.name)
+        self.text = _PINTYPE_RX.sub(lambda m: _pin_type_core(t), self.text, count=1)
 
     def links(self):
         m = _LINK_RX.search(self.text)
@@ -264,6 +323,23 @@ class GraphNode:
         if not matches:
             raise SpecError("no pin %r on %s (%s). Available: %s" % (name, self.name, self.cls.split(".")[-1], avail))
         raise SpecError("pin %r on %s is ambiguous (%s)" % (name, self.name, avail))
+
+    def resolve_wildcard(self, pin, t):
+        p = self.pin(pin)
+        if not p.is_wildcard():
+            raise SpecError("pin_types: pin %r on %s is not a wildcard pin (category %s); only wildcard pins take pin_types"
+                            % (pin, self.name, p.category))
+        if p.container != (t["container"] or "None"):
+            raise SpecError("pin_types: pin %r on %s is %s" % (pin, self.name, _CONTAINER_HINT.get(p.container, p.container)))
+        p.set_type(t)
+
+    def fill_default_wildcards(self):
+        """Type the wildcard pins whose type never depends on the wiring (bp_apply wires by text and the
+        engine never propagates pin types)."""
+        for pin, ts in DEFAULT_WILDCARDS.get(self.cls.rsplit(".", 1)[-1], {}).items():
+            for p in self.pins:
+                if p.name == pin and p.direction == "in" and p.is_wildcard():
+                    p.set_type(parse_type(ts))
 
     def _resolve(self, pin, direction=None):
         return pin if isinstance(pin, Pin) else self.pin(pin, direction)
