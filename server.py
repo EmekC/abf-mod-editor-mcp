@@ -1381,8 +1381,12 @@ def handle(req):
         tool = TOOL_MAP.get(params.get("name"))
         if not tool:
             return {"content": [{"type": "text", "text": f"Unknown tool {params.get('name')}"}], "isError": True}
+        args = params.get("arguments") or {}
+        missing = [k for k in tool[4] if args.get(k) is None]
+        if missing:
+            return {"content": [{"type": "text", "text": "%s: missing required argument(s): %s" % (tool[0], ", ".join(missing))}], "isError": True}
         try:
-            res = tool[1](params.get("arguments") or {})
+            res = tool[1](args)
             if isinstance(res, dict) and "content" in res:
                 return res
             text, is_error = res if isinstance(res, tuple) else (res, False)

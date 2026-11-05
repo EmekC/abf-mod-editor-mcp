@@ -299,6 +299,9 @@ def build(run_json, remote_errors, t3d_errors, kit_root, forbidden, py_status, l
         if not res["ok"]:
             return _out({"error": res.get("error") or "export failed", "run": res["run"], "log_tail": res.get("log_tail")})
         st = bpscan.parse_structure(_read(Path(res["run"]) / "export.t3d"))
+        if not st["blueprint"]:
+            return _out({"error": "the text export of %s has no Blueprint object" % path, "run": res["run"]})
+        bpscan.merge_live(st, res["result"].get("live"))
         if args.get("graph"):
             st["graphs"] = {k: v for k, v in st["graphs"].items() if k == args["graph"]}
         if not args.get("include_pins"):
@@ -455,7 +458,9 @@ def build(run_json, remote_errors, t3d_errors, kit_root, forbidden, py_status, l
          dict(mod=STR, assets={"type": "array", "items": OBJ}, spec_file=STR, keep_on_error=BOOL, timeout_seconds=NUM), ["mod"]),
         ("bp_read", t_bp_read,
          "Structure of a staged mod Blueprint: variables, functions, macros, dispatchers, timelines, interfaces, components, widget tree, "
-         "graphs with nodes, positions and resolved links. Refuses /Game.",
+         "graphs with nodes, positions and resolved links. Refuses /Game. "
+         "Components include the default root and inherited ones (flagged). components is null and components_status \"unavailable\" "
+         "when they could not be read; [] means there really are none.",
          dict(mod=STR, asset_path=STR, graph=STR, include_pins=BOOL, timeout_seconds=NUM), ["mod", "asset_path"]),
         ("bp_compile_report", t_bp_compile_report,
          "Compile staged Blueprints (all of them when asset_paths is empty) and report errors and warnings per asset. Nothing is saved.",

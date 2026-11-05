@@ -85,6 +85,8 @@ hidden_editor_shot(...)      screenshots of asset editors on the hidden desktop
 bp_publish(mod)              back up, then copy changed Content into the real mod (dry_run to preview)
 ```
 
+`bp_read` gets components and variable defaults from the hidden process, because the Blueprint text export omits them. `components` rows are `name, class, parent, inherited, native, default_scene_root`, and they include the default root and inherited ones. `[]` means there are none (a class that is not an Actor); `null` with `components_status: "unavailable"` and `components_error` means they could not be read. `default` is a string; `default_status` is `ok`, `unavailable` (with `default_error`) or `not_applicable`; `defaults_status` summarises.
+
 ### Where things live
 
 Under `%LOCALAPPDATA%\abf-mod-editor-mcp\headless`, or `ABF_HEADLESS_DIR` (**no spaces in the path**: the launch arguments are unproven with them; the tools refuse such a root). Outside the repo and outside any mod, because Upload zips the whole mod folder.
@@ -200,7 +202,7 @@ The startup hook runs in every Mod Editor process, hidden ones included, and swi
 
 Unit tests need no editor and touch no mod: `python -m unittest tests.test_unit -v` (stdlib `unittest`, no packages). They use fakes for the editor side, so nothing reaches a running editor.
 
-Integration tests run hidden Mod Editor processes against a fixture mod generated under a temp folder (30+ minutes, kit installed): `ABF_RUN_INTEGRATION=1 ABF_HEADLESS_DIR=<temp folder without spaces> python -m unittest tests.test_integration -v`. They never touch your editor or your mods (`run_json` is a function that raises); the optional last test uses a copy you point `ABF_TEST_REAL_COPY` at.
+Integration tests run hidden Mod Editor processes against a fixture mod generated under a temp folder (30+ minutes, kit installed): `ABF_RUN_INTEGRATION=1 ABF_HEADLESS_DIR=<temp folder without spaces> python -m unittest tests.test_integration -v`. They never touch your editor or your mods (`run_json` is a function that raises); the optional last test uses a copy you point `ABF_TEST_REAL_COPY` at. `test_16` really publishes into its temp mod, so it can be left out by naming the test ids you want.
 
 `python test_client.py` speaks MCP to the server over stdio and exercises the read-only tools against the open editor. `--bridge` forces the file-bridge transport. `--row <mod row asset> <mod folder>` also edits and restores a row, creates and deletes a row asset, and runs the two checkers. Use a throwaway copy of a mod for that.
 

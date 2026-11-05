@@ -410,3 +410,42 @@ def parse_structure(text):
     return {"blueprint": info, "variables": variables, "functions": functions, "macros": macros,
             "dispatchers": dispatchers, "timelines": timelines, "interfaces": interfaces,
             "components": components, "graphs": graphs, "widgets": widgets}
+
+
+def merge_live(st, live):
+    """Merge the hidden process's live read (components, variable defaults) into parse_structure's result.
+    `live` is None when the read never finished. components is None, never [], when it could not be read."""
+    why = "the hidden read did not finish"
+    comp = (live or {}).get("components") or {"status": "unavailable", "error": why}
+    defs = (live or {}).get("defaults") or {"status": "unavailable", "error": why}
+    st["components_status"] = comp["status"]
+    if comp["status"] == "unavailable":
+        st["components"] = None
+        st["components_error"] = comp.get("error") or why
+    else:
+        st["components"] = comp["items"]
+        if comp.get("note"):
+            st["components_note"] = comp["note"]
+    for v in st["variables"]:
+        got = (defs.get("items") or {}).get(v["name"])
+        if got and got["status"] == "ok":
+            v["default"] = got["default"]
+            v["default_status"] = "ok"
+        elif v["default"] is not None:
+            v["default_status"] = "ok"
+        else:
+            v["default_status"] = got["status"] if got else "unavailable"
+            v["default"] = None
+            err = (got or {}).get("error") or (None if got else defs.get("error") or why)
+            if err:
+                v["default_error"] = err
+    bad = [v["default_status"] for v in st["variables"]].count("unavailable")
+    if not st["variables"]:
+        st["defaults_status"] = "unavailable" if defs["status"] == "unavailable" else "ok"
+    elif bad == 0:
+        st["defaults_status"] = "ok"
+    elif bad == len(st["variables"]):
+        st["defaults_status"] = "unavailable"
+    else:
+        st["defaults_status"] = "partial"
+    return st
