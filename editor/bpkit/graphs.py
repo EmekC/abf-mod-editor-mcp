@@ -168,6 +168,9 @@ def _build_node(spec, model, templates, ctx):
         # a call to the asset's own function: self context, not an external class reference
         node.head = [re.sub(r'FunctionReference=\(MemberParent="[^"]*",MemberName="([^"]+)"', r'FunctionReference=(MemberName="\1",bSelfContext=True', h)
                      for h in node.head]
+    for pin, ts in (spec.get("pin_types") or {}).items():
+        node.resolve_wildcard(pin, t3d.parse_type(ts, ctx["env"].class_text))
+    node.fill_default_wildcards()
     return node
 
 
