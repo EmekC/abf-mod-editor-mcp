@@ -35,9 +35,11 @@ import paths     # noqa: E402
 import headless_tools  # noqa: E402
 import headless  # noqa: E402
 import staging   # noqa: E402
+from bpkit import specs  # noqa: E402
 
 SERVER_NAME = "abiotic-mod-editor"
 SERVER_VERSION = "2.3.0"
+BACKEND_PROTOCOL = 1
 
 EDITOR_ROOT = paths.find_editor_root()          # None when no Mod Editor install was found
 EDITOR_EXE = paths.editor_exe(EDITOR_ROOT)
@@ -1217,6 +1219,14 @@ def t_read_editor_log(args):
     return f"{path} ({len(lines)} matching lines, showing last {min(n, len(lines))})\n" + "\n".join(lines[-n:])
 
 
+def t_backend_info(args):
+    return _json({"protocol": BACKEND_PROTOCOL, "serverVersion": SERVER_VERSION,
+                  "editorRoot": str(EDITOR_ROOT) if EDITOR_ROOT else None,
+                  "headlessDir": str(paths.headless_dir()), "documentsDir": str(paths.documents_dir()),
+                  "capabilities": {"pinTypes": True, "containerTypes": {"array": True, "map": True, "set": False}},
+                  "bpApply": {"features": list(specs.FEATURES), "nodeKinds": sorted(specs.NODE_KINDS)}})
+
+
 S = lambda **p: p  # noqa: E731
 STR, NUM, INT, BOOL, OBJ = ({"type": "string"}, {"type": "number"}, {"type": "integer"}, {"type": "boolean"}, {"type": "object"})
 WIN = {"type": "string", "description": "Part of the editor window title (default: the main editor window). See editor_windows."}
@@ -1226,6 +1236,9 @@ TOOLS = [
     ("editor_status", t_editor_status,
      "Call first. Whether the Mod Editor is running and reachable (remote execution / file bridge), which mod is open, the map, and whether Play In Editor is running.",
      S(wait_seconds=NUM), []),
+    ("backend_info", t_backend_info,
+     "Read-only, needs no editor: backend protocol number, server version, paths and capabilities (for tools such as abfc). "
+     "capabilities.pinTypes: bp_apply node specs accept pin_types.", S(), []),
     ("launch_editor", t_launch_editor,
      "Start the Mod Editor and wait until it is reachable. It opens on the Mod Browser picker; then use open_mod.",
      S(wait_seconds=NUM), []),

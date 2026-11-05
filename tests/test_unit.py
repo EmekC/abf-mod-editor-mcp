@@ -44,6 +44,28 @@ from bpkit.t3d import GraphModel, GraphNode, SpecError  # noqa: E402
 
 # ---------------------------------------------------------------- t3d
 
+_WILD_TAIL = (',PersistentGuid=00000000000000000000000000000000,bHidden=False,bNotConnectable=False,'
+              'bDefaultValueIsReadOnly=False,bDefaultValueIsIgnored=True,bAdvancedView=False,bOrphanedPin=False,)')
+_WILD_CORE = ('PinType.PinCategory="wildcard",PinType.PinSubCategory="",PinType.PinSubCategoryObject=None,'
+              'PinType.PinSubCategoryMemberReference=(),')
+_WILD_FLAGS = 'PinType.bIsWeakPointer=False,PinType.bIsUObjectWrapper=False,PinType.bSerializeAsSinglePrecisionFloat=False'
+WILD_TA = ('CustomProperties Pin (PinId=9A6A353A8DED4870A34EF29B8519A5F3,PinName="TargetArray",' + _WILD_CORE
+           + 'PinType.PinValueType=(),PinType.ContainerType=Array,PinType.bIsReference=True,PinType.bIsConst=True,'
+           + _WILD_FLAGS + _WILD_TAIL)
+WILD_MAP = ('CustomProperties Pin (PinId=1A6A353A8DED4870A34EF29B8519A5F3,PinName="TargetMap",' + _WILD_CORE
+            + 'PinType.PinValueType=(TerminalCategory="wildcard"),PinType.ContainerType=Map,PinType.bIsReference=True,PinType.bIsConst=True,'
+            + _WILD_FLAGS + _WILD_TAIL)
+WILD_ONE = ('CustomProperties Pin (PinId=2A6A353A8DED4870A34EF29B8519A5F3,PinName="Output",Direction="EGPD_Output",' + _WILD_CORE
+            + 'PinType.PinValueType=(),PinType.ContainerType=None,PinType.bIsReference=False,PinType.bIsConst=False,'
+            + _WILD_FLAGS + _WILD_TAIL)
+WILD_OBJ = ('CustomProperties Pin (PinId=3A6A353A8DED4870A34EF29B8519A5F3,PinName="Object",' + _WILD_CORE
+            + 'PinType.PinValueType=(),PinType.ContainerType=None,PinType.bIsReference=False,PinType.bIsConst=False,'
+            + _WILD_FLAGS + _WILD_TAIL)
+INT_PIN = t3d.pin_line("Dimension 1", "int")
+_CALLARRAY = "/Script/BlueprintGraph.K2Node_CallArrayFunction"
+_WIDGET_CB = lambda p: "/Script/UMG.WidgetBlueprintGeneratedClass'%s'" % p  # noqa: E731
+
+
 class T3dTests(unittest.TestCase):
     def test_pin_line_attributes(self):
         p = t3d.pin_line("Amount", "int", "out", pin_id="ABC123", default="5")
@@ -75,6 +97,18 @@ class T3dTests(unittest.TestCase):
         for kind in ("object", "class", "softobject", "softclass", "interface", "struct", "enum"):
             self.assertTrue(t3d.parse_type(kind + ":/Script/Engine.Actor")["obj"])
         self.assertEqual(t3d.parse_type("enum:/Script/Engine.EWhatever")["cat"], "byte")
+
+    def test_map_type(self):
+        m = t3d.parse_type("map:name:int")
+        self.assertEqual((m["cat"], m["container"], m["value"]["cat"]), ("name", "Map", "int"))
+        self.assertEqual(t3d.parse_type("map:int:object:/Script/Engine.Actor")["value"]["cat"], "object")
+        v = t3d.var_line("Counts", "map:name:int", guid="G")
+        self.assertIn('VarType=(PinCategory="name",ContainerType=Map,PinValueType=(TerminalCategory="int"))', v)
+        self.assertIn("ContainerType=Map", t3d.pin_line("M", "map:name:real"))
+        self.assertIn('PinType.PinValueType=(TerminalCategory="real",TerminalSubCategory="double"),PinType.ContainerType=Map', t3d.pin_line("M", "map:name:real"))
+        for bad in ("map:name:array:int", "map:exec:int", "map:object:/Script/Engine.Actor:int", "map:name:"):
+            with self.assertRaises(SpecError, msg=repr(bad)):
+                t3d.parse_type(bad)
 
     def test_type_refusals(self):
         for bad in ("struct:", "struct", "object:", "set:int", "map:int", "array:array:int", "banana", "", None):
@@ -194,6 +228,74 @@ class T3dTests(unittest.TestCase):
             self.assertEqual(p.links(), [])
         n.move(-5, 9)
         self.assertEqual(n.pos(), (-5, 9))
+
+    def test_parse_type_class_text(self):
+        def boom(p):
+            raise AssertionError("class_text called for %s" % p)
+        a = t3d.parse_type("array:object:/Mod/W.W_C", _WIDGET_CB)
+        self.assertEqual((a["container"], a["obj"]), ("Array", "/Script/UMG.WidgetBlueprintGeneratedClass'/Mod/W.W_C'"))
+        m = t3d.parse_type("map:name:object:/Mod/W.W_C", _WIDGET_CB)
+        self.assertEqual(m["value"]["obj"], "/Script/UMG.WidgetBlueprintGeneratedClass'/Mod/W.W_C'")
+        self.assertEqual(t3d.parse_type("object:/Script/Engine.Actor", boom)["cat"], "object")
+        self.assertEqual(t3d.parse_type("struct:/Script/X.Y", boom)["cat"], "struct")
+        plain = t3d.parse_type("object:/Mod/W.W_C")["obj"]
+        self.assertIn("BlueprintGeneratedClass", plain)
+        self.assertNotIn("WidgetBlueprintGeneratedClass", plain)
+
+    def test_resolve_wildcard_array_keeps_flags(self):
+        n = GraphNode.from_template(_CALLARRAY, "K2Node_CallArrayFunction_9001", [WILD_TA], (0, 0))
+        pid = n.pin("TargetArray").id
+        n.resolve_wildcard("TargetArray", t3d.parse_type("array:int"))
+        txt = n.pin("TargetArray").text
+        self.assertIn('PinType.PinCategory="int",PinType.PinSubCategory="",PinType.PinSubCategoryObject=None,'
+                      'PinType.PinSubCategoryMemberReference=(),PinType.PinValueType=(),PinType.ContainerType=Array,'
+                      'PinType.bIsReference=True,PinType.bIsConst=True', txt)
+        self.assertIn("bDefaultValueIsIgnored=True", txt)
+        self.assertEqual(n.pin("TargetArray").id, pid)
+        self.assertFalse(n.pin("TargetArray").is_wildcard())
+        n.link("TargetArray", "X", "1")
+        self.assertEqual(n.pin("TargetArray").links(), [("X", "1")])
+
+    def test_resolve_wildcard_map_and_object(self):
+        n = GraphNode.from_template("/Script/BlueprintGraph.K2Node_CallFunction", "K2Node_CallFunction_9001", [WILD_MAP, WILD_ONE], (0, 0))
+        n.resolve_wildcard("TargetMap", t3d.parse_type("map:name:int"))
+        self.assertIn('PinType.PinCategory="name",PinType.PinSubCategory="",PinType.PinSubCategoryObject=None,'
+                      'PinType.PinSubCategoryMemberReference=(),PinType.PinValueType=(TerminalCategory="int"),PinType.ContainerType=Map',
+                      n.pin("TargetMap").text)
+        n.resolve_wildcard("Output", t3d.parse_type("object:/goodsoupWagdD/SoupInfo/WBP_SoupInfo.WBP_SoupInfo_C", _WIDGET_CB))
+        txt = n.pin("Output").text
+        self.assertIn('PinType.PinSubCategoryObject="/Script/UMG.WidgetBlueprintGeneratedClass\'/goodsoupWagdD/SoupInfo/WBP_SoupInfo.WBP_SoupInfo_C\'"', txt)
+        self.assertIn("PinType.ContainerType=None", txt)
+
+    def test_resolve_wildcard_refusals(self):
+        n = GraphNode.from_template(_CALLARRAY, "K2Node_CallArrayFunction_9001", [WILD_TA, WILD_ONE, INT_PIN], (0, 0))
+        with self.assertRaises(SpecError) as cm:
+            n.resolve_wildcard("Dimension 1", t3d.parse_type("int"))
+        self.assertIn("not a wildcard", str(cm.exception))
+        with self.assertRaises(SpecError) as cm:
+            n.resolve_wildcard("TargetArray", t3d.parse_type("int"))
+        self.assertIn("array pin", str(cm.exception))
+        with self.assertRaises(SpecError) as cm:
+            n.resolve_wildcard("Output", t3d.parse_type("array:int"))
+        self.assertIn("single-value", str(cm.exception))
+        with self.assertRaises(SpecError) as cm:
+            n.resolve_wildcard("Nope", t3d.parse_type("int"))
+        self.assertIn("no pin", str(cm.exception))
+
+    def test_cast_object_default(self):
+        n = GraphNode.from_template("/Script/BlueprintGraph.K2Node_DynamicCast", "K2Node_DynamicCast_9001",
+                                    [WILD_OBJ, t3d.pin_line("AsX", "object:/Script/Engine.Actor", "out")], (0, 0))
+        n.fill_default_wildcards()
+        want = ('PinType.PinCategory="object",PinType.PinSubCategory="",'
+                'PinType.PinSubCategoryObject="/Script/CoreUObject.Class\'/Script/CoreUObject.Object\'"')
+        self.assertIn(want, n.pin("Object").text)
+        before = n.pin("Object").text
+        n.fill_default_wildcards()
+        self.assertEqual(n.pin("Object").text, before)
+        self.assertIn("/Script/Engine.Actor", n.pin("AsX").text)
+        c = GraphNode.from_template("/Script/BlueprintGraph.K2Node_CallFunction", "K2Node_CallFunction_9001", [WILD_OBJ], (0, 0))
+        c.fill_default_wildcards()
+        self.assertTrue(c.pin("Object").is_wildcard())
 
     def test_retarget(self):
         cls = "/Script/Engine.BlueprintGeneratedClass'/Mod/Real.Real_C'"
@@ -315,6 +417,23 @@ class SpecTests(unittest.TestCase):
 
     def test_valid_sample_passes(self):
         self.assertEqual(specs.validate(self.GOOD, "Mod"), [])
+
+    def test_pin_types_validation(self):
+        def add(extra):
+            def m(a):
+                a["graphs"][0]["add"].append(dict({"id": "al", "k": "node", "class": "/Script/BlueprintGraph.K2Node_CallArrayFunction",
+                                                   "props": []}, **extra))
+            return m
+        self.assertEqual(self.problems(add({"pin_types": {"TargetArray": "array:int"}})), [])
+        self.assertEqual(self.problems(add({"pin_types": {"TargetMap": "map:name:int"}})), [])
+        self.assertTrue(any("must be an object" in p for p in self.problems(add({"pin_types": []}))))
+        self.assertTrue(any("pin_types['X']" in p for p in self.problems(add({"pin_types": {"X": "banana"}}))))
+        self.assertTrue(any("exec is not a data type" in p for p in self.problems(add({"pin_types": {"X": "exec"}}))))
+
+        def on_self(a):
+            a["graphs"][0]["add"].append({"id": "sf", "k": "self", "pin_types": {"X": "int"}})
+        self.assertTrue(any("not offered" in p for p in self.problems(on_self)))
+        self.assertEqual(self.problems(lambda a: a["variables"].append({"name": "M", "type": "map:name:int"})), [])
 
     def test_game_refused(self):
         self.assertTrue(any("/Game" in p for p in self.problems(lambda a: a.update(asset="/Game/Maps/X"))))
@@ -1456,17 +1575,26 @@ class StdioSmokeTests(unittest.TestCase):
     def test_tools_list_and_unknown_mod(self):
         reqs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
                 {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
-                {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "staging_status", "arguments": {"mod": "NoSuchMod"}}}]
+                {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "staging_status", "arguments": {"mod": "NoSuchMod"}}},
+                {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "backend_info", "arguments": {}}}]
         env = dict(os.environ, ABF_HEADLESS_DIR=_TMP)
         p = subprocess.run([sys.executable, "-I", str(ROOT / "server.py")], input="\n".join(json.dumps(r) for r in reqs) + "\n",
                            capture_output=True, text=True, env=env, timeout=60, cwd=str(ROOT))
         replies = {json.loads(l)["id"]: json.loads(l) for l in p.stdout.splitlines() if l.strip()}
         self.assertEqual(replies[1]["result"]["serverInfo"]["version"], "2.3.0")
         names = [t["name"] for t in replies[2]["result"]["tools"]]
-        self.assertEqual(len(names), 42)
+        self.assertEqual(len(names), 43)
         for n in ("staging_sync", "staging_status", "bp_apply", "bp_read", "bp_compile_report", "bp_game_test",
-                  "hidden_editor_shot", "mod_audit", "bp_publish"):
+                  "hidden_editor_shot", "mod_audit", "bp_publish", "backend_info"):
             self.assertIn(n, names)
+        bi = replies[4]["result"]
+        self.assertFalse(bi.get("isError"))
+        info = json.loads(bi["content"][0]["text"])
+        self.assertEqual(info["protocol"], 1)
+        self.assertIs(info["capabilities"]["pinTypes"], True)
+        self.assertIs(info["capabilities"]["containerTypes"]["map"], True)
+        self.assertIn("pin_types", info["bpApply"]["features"])
+        self.assertEqual(os.path.normcase(info["headlessDir"]), os.path.normcase(_TMP))
         self.assertTrue(replies[3]["result"]["isError"])
         self.assertIn("staging_sync", replies[3]["result"]["content"][0]["text"])
         self.assertIn("paste_graph is the older route", replies[1]["result"]["instructions"])
