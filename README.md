@@ -39,11 +39,11 @@ The editor's Python plugin has a "remote execution" mode (UDP discovery on 239.0
 
 The server uses remote execution first and the bridge second, opens a fresh connection per command (so it can share the editor with other tools), and reports a command that was sent but got no reply instead of retrying it.
 
-## Tools (42)
+## Tools (43)
 
 | Group | Tools |
 | --- | --- |
-| Status and launch | `editor_status` (call first), `launch_editor`, `open_mod` (drives the picker's Browse… dialog, since the command line can't open a mod) |
+| Status and launch | `editor_status` (call first), `backend_info` (protocol, version, paths, capabilities; no editor needed), `launch_editor`, `open_mod` (drives the picker's Browse… dialog, since the command line can't open a mod) |
 | Python | `run_python`, `evaluate_python`, `run_python_file` (`args` → `ARGS` inside the script) |
 | Mod data | `list_mods`, `list_mod_templates`, `find_assets`, `get_row`, `set_row` (plain values, Python expressions, or whole export text), `create_row_asset` (any of the 72 `*ModRowAsset` classes, optionally copied from a base-game row or another mod row), `delete_asset`, `save_assets`, `compile_blueprint`, `validate_assets` |
 | Base-game data | `get_game_row` — list or read any row the game exposes through its `<Kind>HandleFunctionLibrary` (gear_item, weapon_item, recipe, buff_debuff, npc, pet, trait, …) |
@@ -130,12 +130,13 @@ Logs can contain tokens: they stay in the run folders, which `.gitignore` covers
         {"kind":"python","code":"..."}]}
 ```
 
-- Types: `exec int int64 bool byte name string text real double float`, `object:<class path>`, `class:<path>`, `softobject:<path>`, `softclass:<path>`, `interface:<path>`, `struct:<path>`, `enum:<path>`, `array:<type>`. Sets, maps and a struct with no path are refused.
+- Types: `exec int int64 bool byte name string text real double float`, `object:<class path>`, `class:<path>`, `softobject:<path>`, `softclass:<path>`, `interface:<path>`, `struct:<path>`, `enum:<path>`, `array:<type>`, `map:<key>:<type>` (simple key type: `int int64 bool byte name string text real double float`). Sets, nested containers and a struct with no path are refused.
 - Defaults and pin values are raw T3D strings, the same text the engine exports.
 - Node ids are yours (no `.`); wires are `["id.pin","id.pin"]`, output first. Existing nodes in `graphs` are addressed by their real name (see `bp_read`). Reserved ids: `entry`, `result` in functions and interfaces; `in`, `out` in macros.
 - Generated nodes are placed in columns below everything already in the graph (and the default event bubbles), unless you give `pos`.
 - An `override` of an event that already exists as a disabled default node (for example `ReceiveBeginPlay`) reuses that node.
 - A `call` without `class` calls the asset's own function.
+- Wildcard pins: bp_apply wires by text, so the engine never infers wildcard pin types. Give them with `pin_types: {"<pin>": "<type>"}` on the node (whole pin type: `"TargetArray": "array:int"`, `"Output": "int"`, `"TargetMap": "map:name:int"`). Only wildcard pins accept it and the container must match the pin. The `Object` input of every `cast` is typed automatically.
 - Order inside one `graphs` entry: `remove`, `unwire`, `add`, `wires`, `set`, `objects`, `move`.
 - Refused before anything launches: asset paths outside `/<Mod>/` (including `/Game`), a `reparent` key, unknown kinds, bad wires or types. Collapsed graphs (`K2Node_Composite`) are refused at edit time.
 
@@ -210,7 +211,7 @@ Integration tests run hidden Mod Editor processes against a fixture mod generate
 
 - Built against Mod Editor 1.5.0 (engine `5.4.4-1050002+++DF+ABF`, Python 3.11). A future editor update may change the Python API; the file lists in `data/` are versioned and will need regenerating after a game update.
 - Windows only.
-- Headless Blueprint tools: the Mod Browser tile position used by `hidden_editor_shot` and `mod_audit` is fragile (it follows the picker layout of this build; `ABF_PICKER_TILE` overrides it). The hidden Facility map has a real pawn but no live HUD (`W_PlayerHUD_Main` is not in the viewport), so anything injected there cannot be tested hidden. `PrintString` is not logged in this build: read state back instead. Memory offsets for the Blueprint arrays are discovered per build and the tools refuse rather than guess. Pure functions are not offered (the engine rejected the generated ones). Collapsed graphs are refused, `set` and `map` types are refused, and neither component nor Blueprint reparenting is offered. Re-run `install.py` once to get the hook guard that keeps hidden processes from answering remote-execution pings.
+- Headless Blueprint tools: the Mod Browser tile position used by `hidden_editor_shot` and `mod_audit` is fragile (it follows the picker layout of this build; `ABF_PICKER_TILE` overrides it). The hidden Facility map has a real pawn but no live HUD (`W_PlayerHUD_Main` is not in the viewport), so anything injected there cannot be tested hidden. `PrintString` is not logged in this build: read state back instead. Memory offsets for the Blueprint arrays are discovered per build and the tools refuse rather than guess. Pure functions are not offered (the engine rejected the generated ones). Collapsed graphs are refused, `set` types are refused, and neither component nor Blueprint reparenting is offered. Re-run `install.py` once to get the hook guard that keeps hidden processes from answering remote-execution pings.
 - A mod made with these tools still has to pass the editor's Asset Audit and mod.io's cloud cook; the checkers here reduce surprises, they don't guarantee anything.
 
 ## Credits

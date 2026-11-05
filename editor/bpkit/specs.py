@@ -116,6 +116,8 @@ REQUIRED = {
 }
 CREATE_CLASSES = ("Blueprint", "WidgetBlueprint", "BlueprintInterface")
 RAW_KINDS = ("graph", "tree", "tree_replace", "python")
+# bp_apply features reported by the backend_info tool
+FEATURES = ("cast_object_pin", "map_types", "pin_types")
 _FORBIDDEN_CODE = tuple("delete_" + n for n in ("asset", "directory", "loaded_asset")) + ("reparent_" + "blueprint", "rename_asset")
 
 
@@ -180,6 +182,21 @@ def _check_graph_nodes(problems, where, nodes, wires, reserved, existing_ok):
         for key in ("params", "inputs", "outputs"):
             if key in n:
                 _check_params(problems, "%s.%s" % (w, key), n[key])
+        if "pin_types" in n:
+            pt = n["pin_types"]
+            if k in MANUAL_KINDS:
+                problems.append("%s: pin_types is not offered for k=%s" % (w, k))
+            elif not isinstance(pt, dict) or not pt:
+                problems.append("%s.pin_types must be an object {pin name: type}" % w)
+            else:
+                for pin, ts in pt.items():
+                    pw = "%s.pin_types[%r]" % (w, pin)
+                    if not isinstance(pin, str) or not pin:
+                        problems.append(w + ".pin_types keys must be pin names")
+                    elif ts == "exec":
+                        problems.append(pw + ": exec is not a data type")
+                    else:
+                        _check_type(problems, pw, ts)
         if k in ("get", "set") and n.get("type"):
             _check_type(problems, w + ".type", n["type"])
     for i, wr in enumerate(wires or []):
