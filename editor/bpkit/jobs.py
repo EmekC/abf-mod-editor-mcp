@@ -143,7 +143,12 @@ def _gen_op(name):
     return getattr(hiddenjob, name)
 
 
-COMMANDLET_OPS = {"apply": op_apply, "compile": op_compile, "export": op_export}
+def op_reflect(job):
+    from . import reflect
+    return reflect.run(job)
+
+
+COMMANDLET_OPS = {"apply": op_apply, "compile": op_compile, "export": op_export, "reflect": op_reflect}
 GENERATOR_OPS = ("game_test", "shots", "audit", "live_publish_test")
 
 
