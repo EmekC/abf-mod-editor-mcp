@@ -88,7 +88,11 @@ def op_export(job):
     bp = core.must(unreal.load_asset(path), "asset " + path)
     unreal.BlueprintEditorLibrary.compile_blueprint(bp)
     text = core.export_text(bp, "export.t3d")
-    return {"file": "export.t3d", "chars": len(text)}
+    res = {"file": "export.t3d", "chars": len(text)}
+    write_result(job["run"], True, res, None)   # a hard crash below still leaves a usable export, reported as unavailable
+    from . import readback
+    res["live"] = readback.read_all(bp, text)
+    return res
 
 
 def _drive(gen, run):

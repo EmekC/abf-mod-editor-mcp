@@ -4,12 +4,14 @@ Nothing here may reach server.run_json, server.execute or the file bridge: the e
 """
 import ctypes
 import hashlib
+import importlib
 import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -1034,6 +1036,382 @@ class BpscanTests(unittest.TestCase):
         for key in ("name", "type", "dir"):
             self.assertIn(key, n["pins"][0])
 
+    def test_merge_live_fills_components_and_defaults(self):
+        st = bpscan.parse_structure(self._export())
+        box = {"name": "Box", "class": "/Script/Engine.BoxComponent", "parent": "DefaultSceneRoot", "inherited": False,
+               "native": False, "default_scene_root": False}
+        live = {"components": {"status": "ok", "items": [box]},
+                "defaults": {"status": "ok", "items": {"Score": {"status": "ok", "default": "12"},
+                                                      "Items": {"status": "ok", "default": "()"}}}}
+        self.assertIs(bpscan.merge_live(st, live), st)
+        self.assertEqual(st["components"], [box])
+        self.assertEqual(st["components_status"], "ok")
+        self.assertNotIn("components_note", st)
+        d = {v["name"]: v for v in st["variables"]}
+        self.assertEqual((d["Score"]["default"], d["Score"]["default_status"]), ("12", "ok"))
+        self.assertEqual((d["Items"]["default"], d["Items"]["default_status"]), ("()", "ok"))
+        self.assertEqual(st["defaults_status"], "ok")
+        self.assertEqual(st["blueprint"]["name"], "BP_X")       # everything else stays
+
+    def test_merge_live_empty_is_ok_not_unavailable(self):
+        st = bpscan.parse_structure(self._export())
+        note = "WBP_X_C is not an Actor class, so it has no components"
+        bpscan.merge_live(st, {"components": {"status": "ok", "items": [], "note": note}, "defaults": {"status": "ok", "items": {}}})
+        self.assertEqual(st["components"], [])
+        self.assertEqual(st["components_status"], "ok")
+        self.assertEqual(st["components_note"], note)
+        self.assertNotIn("components_error", st)
+
+    def test_merge_live_unavailable_is_null(self):
+        st = bpscan.parse_structure(self._export())
+        bpscan.merge_live(st, {"components": {"status": "unavailable", "error": "boom"}, "defaults": {"status": "ok", "items": {}}})
+        self.assertIsNone(st["components"])
+        self.assertEqual(st["components_status"], "unavailable")
+        self.assertEqual(st["components_error"], "boom")
+        self.assertNotIn("components_note", st)
+
+    def test_merge_live_none(self):
+        st = bpscan.parse_structure(self._export())
+        bpscan.merge_live(st, None)
+        self.assertIsNone(st["components"])
+        self.assertEqual(st["components_status"], "unavailable")
+        self.assertIn("did not finish", st["components_error"])
+        d = {v["name"]: v for v in st["variables"]}
+        self.assertEqual((d["Score"]["default"], d["Score"]["default_status"]), ("10", "ok"))     # the T3D default is kept
+        self.assertEqual((d["Items"]["default"], d["Items"]["default_status"]), (None, "unavailable"))
+        self.assertIn("did not finish", d["Items"]["default_error"])
+        self.assertEqual(st["defaults_status"], "partial")
+        only = bpscan.parse_structure(self._export())
+        only["variables"] = [v for v in only["variables"] if v["name"] == "Items"]
+        bpscan.merge_live(only, None)
+        self.assertEqual(only["defaults_status"], "unavailable")
+        bare = bpscan.parse_structure(self._export())
+        bare["variables"] = []
+        bpscan.merge_live(bare, None)
+        self.assertEqual(bare["defaults_status"], "unavailable")
+        bpscan.merge_live(bare, {"components": {"status": "ok", "items": []}, "defaults": {"status": "ok", "items": {}}})
+        self.assertEqual(bare["defaults_status"], "ok")
+
+    def test_merge_live_per_variable_states(self):
+        st = bpscan.parse_structure(self._export())
+        st["variables"] = [{"name": n, "type": "int", "sub_object": None, "default": None} for n in ("A", "B", "C")]
+        live = {"components": {"status": "ok", "items": []},
+                "defaults": {"status": "ok", "items": {"A": {"status": "ok", "default": None},
+                                                      "B": {"status": "unavailable", "error": "E: nope"},
+                                                      "C": {"status": "not_applicable"}}}}
+        bpscan.merge_live(st, live)
+        a, b, c = st["variables"]
+        self.assertEqual((a["default"], a["default_status"]), (None, "ok"))
+        self.assertEqual((b["default"], b["default_status"], b["default_error"]), (None, "unavailable", "E: nope"))
+        self.assertEqual((c["default"], c["default_status"]), (None, "not_applicable"))
+        self.assertNotIn("default_error", c)
+        self.assertEqual(st["defaults_status"], "partial")
+
+
+# ---------------------------------------------------------------- readback (editor side, with a fake `unreal`)
+
+class ReadbackTests(unittest.TestCase):
+    NAMES = ("Actor", "Object", "Name", "Text", "EnumBase", "StructBase", "Array", "Set", "Map", "BlueprintEditorLibrary",
+             "SubobjectDataSubsystem", "SubobjectDataBlueprintFunctionLibrary")
+
+    @classmethod
+    def setUpClass(cls):
+        cls.fake = types.ModuleType("unreal")
+        for n in cls.NAMES:
+            setattr(cls.fake, n, type(n, (), {}))
+        cls.patch = mock.patch.dict(sys.modules, {"unreal": cls.fake})
+        cls.patch.start()
+        sys.modules.pop("bpkit.core", None)
+        sys.modules.pop("bpkit.readback", None)
+        import bpkit
+        cls.pkg = bpkit
+        cls.saved_attrs = {n: getattr(bpkit, n) for n in ("core", "readback") if hasattr(bpkit, n)}
+        cls.rb = importlib.import_module("bpkit.readback")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.patch.stop()
+        for n in ("core", "readback"):
+            if hasattr(cls.pkg, n):
+                delattr(cls.pkg, n)
+        for n, v in cls.saved_attrs.items():
+            setattr(cls.pkg, n, v)
+
+    def setup_class_world(self, cdo, gc_name="BP_X_C", lib_extra=None, subsystem=None):
+        """Patch LIB, get_default_object and get_engine_subsystem on the fake for one test."""
+        class GC:
+            def get_name(self):
+                return gc_name
+
+        class Lib:
+            @staticmethod
+            def generated_class(bp):
+                return GC()
+
+        def no_subsystem(_cls):
+            raise AssertionError("the subobject subsystem must not be reached")
+
+        for p in (mock.patch.object(self.rb, "LIB", Lib), mock.patch.object(self.fake, "get_default_object", lambda gc: cdo, create=True),
+                  mock.patch.object(self.fake, "get_engine_subsystem", (lambda _cls: subsystem) if subsystem is not None else no_subsystem, create=True)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_variable_lines(self):
+        text = "\n".join(["Begin Object Class=/Script/Engine.Blueprint Name=\"BP_X\"",
+                          "   NewVariables(0)=" + t3d.var_line("Score", "int", default="10"),
+                          "   NewVariables(1)=" + t3d.var_line("Items", "array:object:/Script/Engine.Actor"),
+                          "   NewVariables(2)=" + t3d.dispatcher_var("OnPing"),
+                          "   NewVariables(3)=" + t3d.var_line("Label", "string"),
+                          "End Object"])
+        self.assertEqual(self.rb.variable_lines(text), [("Score", "int"), ("Items", "object"), ("OnPing", "mcdelegate"), ("Label", "string")])
+        self.assertEqual(self.rb.variable_lines(""), [])
+
+    def test_default_text(self):
+        f, dt = self.fake, self.rb.default_text
+
+        class Enum(f.EnumBase):
+            name = "Red"
+
+        class Struct(f.StructBase):
+            def export_text(self):
+                return "(X=1.000000,Y=2.000000)"
+
+        class Obj(f.Object):
+            def __str__(self):
+                return "<Object '/Mod/BP_A.BP_A' (0x1) Class 'Blueprint'>"
+
+        class Arr(f.Array, list):
+            pass
+
+        class St(f.Set, list):
+            pass
+
+        class Mp(f.Map, dict):
+            pass
+
+        class Nm(f.Name):
+            def __str__(self):
+                return 'a"b'
+
+        self.assertEqual(dt(True), "true")
+        self.assertEqual(dt(False), "false")
+        self.assertEqual(dt(0), "0")
+        self.assertEqual(dt(10), "10")
+        self.assertEqual(dt(2.5), "2.5")
+        self.assertEqual(dt("hello"), "hello")
+        self.assertIsNone(dt(None))
+        self.assertEqual(dt(None, nested=True), "None")
+        self.assertEqual(dt('a"b\\c', nested=True), '"a\\"b\\\\c"')
+        self.assertEqual(dt(Nm()), 'a"b')
+        self.assertEqual(dt(Nm(), nested=True), '"a\\"b"')
+        self.assertEqual(dt(Enum()), "Red")
+        self.assertEqual(dt(Struct()), "(X=1.000000,Y=2.000000)")
+        self.assertEqual(dt(Obj()), "/Mod/BP_A.BP_A")
+        self.assertEqual(dt(Arr()), "()")
+        self.assertEqual(dt(Arr([1, 2, True])), "(1,2,true)")
+        self.assertEqual(dt(Arr(["a", None])), '("a",None)')
+        self.assertEqual(dt(St([3])), "(3)")
+        self.assertEqual(dt(Mp({"k": 1})), '(("k", 1))')
+        self.assertEqual(dt(b"x"), str(b"x"))
+
+    def test_immediate_parents(self):
+        self.assertEqual(self.rb.immediate_parents([[], [0], [1, 0]]), [None, 0, 1])
+        self.assertEqual(self.rb.immediate_parents([[], [0], [1]]), [None, 0, 1])
+        self.assertEqual(self.rb.immediate_parents([]), [])
+
+    def test_non_actor_never_calls_gather(self):
+        self.setup_class_world(self.fake.Object())
+        out = self.rb.read_components(object())
+        self.assertEqual((out["status"], out["items"]), ("ok", []))
+        self.assertIn("not an Actor", out["note"])
+        self.assertIn("BP_X_C", out["note"])
+
+    def test_gather_empty_is_unavailable_through_read_all(self):
+        class Subsystem:
+            @staticmethod
+            def k2_gather_subobject_data_for_blueprint(bp):
+                return []
+
+        self.setup_class_world(type("A", (self.fake.Actor,), {})(), subsystem=Subsystem())
+        out = self.rb.read_all(object(), "")
+        self.assertEqual(out["components"]["status"], "unavailable")
+        self.assertIn("no subobject data", out["components"]["error"])
+        self.assertEqual(out["defaults"], {"status": "ok", "items": {}})
+
+    def test_read_all_never_raises(self):
+        self.setup_class_world(None)           # LIB.generated_class works, the default object is None
+        out = self.rb.read_all(object(), "")
+        self.assertEqual(out["components"]["status"], "unavailable")
+        self.assertEqual(out["defaults"]["status"], "unavailable")
+        self.assertIn("class default object is None", out["defaults"]["error"])
+
+    def test_read_defaults_soft_none_and_delegate(self):
+        class Cdo:
+            def get_editor_property(self, name):
+                if name == "Boom":
+                    raise RuntimeError("protected")
+                return {"Soft": None, "Hard": None, "Score": 10, "Flag": False}[name]
+
+        self.setup_class_world(Cdo())
+        lines = [("Soft", "softobject"), ("Hard", "object"), ("Score", "int"), ("Flag", "bool"), ("OnPing", "mcdelegate"), ("Boom", "int")]
+        items = self.rb.read_defaults(object(), lines)["items"]
+        self.assertEqual(items["Soft"]["status"], "unavailable")
+        self.assertIn("soft reference", items["Soft"]["error"])
+        self.assertEqual(items["Hard"], {"status": "ok", "default": None})
+        self.assertEqual(items["Score"], {"status": "ok", "default": "10"})
+        self.assertEqual(items["Flag"], {"status": "ok", "default": "false"})
+        self.assertEqual(items["OnPing"], {"status": "not_applicable"})
+        self.assertEqual(items["Boom"], {"status": "unavailable", "error": "RuntimeError: protected"})
+
+    def test_read_defaults_soft_container_with_none(self):
+        f = self.fake
+
+        class Arr(f.Array, list):
+            pass
+
+        class Mp(f.Map, dict):
+            pass
+
+        values = {"SoftArr": Arr([None, None]), "SoftMixed": Arr([None]), "SoftMap": Mp({"k": None}), "SoftEmpty": Arr(),
+                  "HardArr": Arr([None]), "SoftNone": None}
+
+        class Cdo:
+            def get_editor_property(self, name):
+                return values[name]
+
+        self.setup_class_world(Cdo())
+        lines = [("SoftArr", "softobject"), ("SoftMixed", "softclass"), ("SoftMap", "softobject"), ("SoftEmpty", "softobject"),
+                 ("HardArr", "object"), ("SoftNone", "softclass")]
+        items = self.rb.read_defaults(object(), lines)["items"]
+        for n in ("SoftArr", "SoftMixed", "SoftMap", "SoftNone"):
+            self.assertEqual(items[n]["status"], "unavailable", n)
+            self.assertIn("soft reference", items[n]["error"])
+        self.assertEqual(items["SoftEmpty"], {"status": "ok", "default": "()"})          # a truly empty container is known
+        self.assertEqual(items["HardArr"], {"status": "ok", "default": "(None)"})        # hard references: None means empty
+
+    def test_components_rows_parents_and_duplicates(self):
+        f = self.fake
+
+        class Cls:
+            def __init__(self, path):
+                self.path = path
+
+            def __str__(self):
+                return "<Class '%s' (0x1)>" % self.path
+
+        class Comp:
+            def __init__(self, d):
+                self.d = d
+
+            def get_class(self):
+                return Cls(self.d[1])
+
+            def __str__(self):
+                return "<Object '%s' (0x1) Class 'X'>" % self.d[5]
+
+        P = "/Mod/BP.BP_C:"
+        # handle -> (name, class path or None, handles it is attached to, inherited, root, object path)
+        world = {0: ("Actor", None, set(), False, False, P + "Actor"),
+                 1: ("DefaultSceneRoot", "/Script/Engine.SceneComponent", set(), False, True, P + "DefaultSceneRoot_GEN_VARIABLE"),
+                 2: ("Box", "/Script/Engine.BoxComponent", {1}, False, False, P + "Box_GEN_VARIABLE"),
+                 3: ("Box", "/Script/Engine.BoxComponent", {1}, False, False, P + "Box_GEN_VARIABLE"),       # the engine listed it twice
+                 4: ("Child", "/Script/Engine.StaticMeshComponent", {1, 2}, True, False, P + "Child_GEN_VARIABLE"),
+                 5: ("Child2", "/Script/Engine.StaticMeshComponent", {1, 3}, False, False, P + "Child2_GEN_VARIABLE"),   # attached to the SECOND Box handle
+                 6: ("None", "/Script/Engine.SphereComponent", {1}, True, False, P + "NativeA"),                     # native, no property: name "None"
+                 7: ("None", "/Script/Engine.CapsuleComponent", {1}, True, False, P + "NativeB")}
+
+        class Lib:
+            @staticmethod
+            def is_component(d):
+                return d[1] is not None
+
+            @staticmethod
+            def get_variable_name(d):
+                return d[0]
+
+            @staticmethod
+            def is_attached_to(d, h):
+                return h in d[2]
+
+            @staticmethod
+            def get_object_for_blueprint(d, bp):
+                return Comp(d)
+
+            @staticmethod
+            def get_object(d):
+                return Comp(d)
+
+            @staticmethod
+            def is_inherited_component(d):
+                return d[3]
+
+            @staticmethod
+            def is_native_component(d):
+                return False
+
+            @staticmethod
+            def is_default_scene_root(d):
+                return d[4]
+
+        class Subsystem:
+            @staticmethod
+            def k2_gather_subobject_data_for_blueprint(bp):
+                return list(world)
+
+            @staticmethod
+            def k2_find_subobject_data_from_handle(h):
+                return world[h]
+
+        self.setup_class_world(type("A", (f.Actor,), {})(), subsystem=Subsystem())
+        with mock.patch.object(f, "SubobjectDataBlueprintFunctionLibrary", Lib, create=True):
+            out = self.rb.read_components(object())
+        self.assertEqual(out["status"], "ok")
+        self.assertEqual([(c["name"], c["parent"]) for c in out["items"]],
+                         [("DefaultSceneRoot", None), ("Box", "DefaultSceneRoot"), ("Child", "Box"), ("Child2", "Box"),
+                          ("None", "DefaultSceneRoot"), ("None", "DefaultSceneRoot")])
+        self.assertEqual([c["class"] for c in out["items"][-2:]], ["/Script/Engine.SphereComponent", "/Script/Engine.CapsuleComponent"])
+        self.assertEqual(out["items"][1]["class"], "/Script/Engine.BoxComponent")
+        self.assertTrue(out["items"][0]["default_scene_root"])
+        self.assertTrue(out["items"][2]["inherited"])
+        self.assertFalse(out["items"][1]["inherited"])
+
+
+class BpReadToolTests(unittest.TestCase):
+    def test_bp_read_after_crash_in_live_read(self):
+        """result.json from before the live read has no `live` key: components are unavailable, the read is not an error."""
+        run = Path(tempfile.mkdtemp(prefix="abfrd"))
+        try:
+            (run / "export.t3d").write_text(BpscanTests("test_parse_structure")._export(), encoding="utf-8")
+            tools = {t[0]: t[1] for t in headless_tools.build(lambda *a, **k: None, (RuntimeError,), lambda text, prefix=None: {"problems": []},
+                                                                ROOT / "editor", [], "", list_processes=lambda: [])}
+            fake_res = {"ok": True, "result": {"file": "export.t3d", "chars": 1}, "run": str(run)}
+            with mock.patch.object(staging, "load", return_value=object()), mock.patch.object(headless, "run_commandlet", return_value=fake_res):
+                text, is_error = tools["bp_read"]({"mod": "X", "asset_path": "/X/BP_X"})
+            self.assertFalse(is_error)
+            st = json.loads(text)
+            self.assertIsNone(st["components"])
+            self.assertEqual(st["components_status"], "unavailable")
+            self.assertEqual(st["blueprint"]["name"], "BP_X")
+            d = {v["name"]: v for v in st["variables"]}
+            self.assertEqual((d["Score"]["default"], d["Score"]["default_status"]), ("10", "ok"))
+            self.assertEqual(st["defaults_status"], "partial")
+        finally:
+            shutil.rmtree(run, ignore_errors=True)
+
+    def test_bp_read_export_without_blueprint_is_an_error(self):
+        run = Path(tempfile.mkdtemp(prefix="abfrd"))
+        try:
+            (run / "export.t3d").write_text("", encoding="utf-8")
+            tools = {t[0]: t[1] for t in headless_tools.build(lambda *a, **k: None, (RuntimeError,), lambda text, prefix=None: {"problems": []},
+                                                                ROOT / "editor", [], "", list_processes=lambda: [])}
+            fake_res = {"ok": True, "result": {"file": "export.t3d", "chars": 0}, "run": str(run)}
+            with mock.patch.object(staging, "load", return_value=object()), mock.patch.object(headless, "run_commandlet", return_value=fake_res):
+                text, is_error = tools["bp_read"]({"mod": "X", "asset_path": "/X/BP_X"})
+            self.assertTrue(is_error)
+            self.assertIn("no Blueprint object", text)
+        finally:
+            shutil.rmtree(run, ignore_errors=True)
+
 
 # ---------------------------------------------------------------- safety
 
@@ -1092,6 +1470,18 @@ class StdioSmokeTests(unittest.TestCase):
         self.assertTrue(replies[3]["result"]["isError"])
         self.assertIn("staging_sync", replies[3]["result"]["content"][0]["text"])
         self.assertIn("paste_graph is the older route", replies[1]["result"]["instructions"])
+
+    def test_missing_required_argument(self):
+        reqs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "bp_read", "arguments": {"mod": "X"}}}]
+        env = dict(os.environ, ABF_HEADLESS_DIR=_TMP)
+        p = subprocess.run([sys.executable, "-I", str(ROOT / "server.py")], input="\n".join(json.dumps(r) for r in reqs) + "\n",
+                           capture_output=True, text=True, env=env, timeout=60, cwd=str(ROOT))
+        replies = {json.loads(l)["id"]: json.loads(l) for l in p.stdout.splitlines() if l.strip()}
+        res = replies[2]["result"]
+        self.assertTrue(res["isError"])
+        self.assertIn("asset_path", res["content"][0]["text"])
+        self.assertNotIn("Traceback", res["content"][0]["text"])
 
 
 if __name__ == "__main__":

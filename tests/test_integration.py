@@ -161,6 +161,16 @@ class Integration(unittest.TestCase):
                    {"op": "assert", "value": "$r1", "equals": 15},
                    {"op": "call", "target": "$x", "function": "AddScore", "args": [7], "as": "r2"},
                    {"op": "assert", "value": "$r2", "equals": 22}])
+        st = self.read(T + "BP_V")
+        d = {v["name"]: v for v in st["variables"]}
+        self.assertEqual(d["Score"]["default"], "10")
+        self.assertEqual(float(d["Speed"]["default"]), 2.5)
+        self.assertEqual(d["Label"]["default"], "hello")
+        for v in d.values():
+            self.assertEqual(v["default_status"], "ok", v)
+        self.assertEqual(st["defaults_status"], "ok")
+        self.assertEqual(st["components_status"], "ok")
+        self.assertEqual([c for c in st["components"] if not c["default_scene_root"]], [])
 
     def test_02_components(self):
         base = self.new_bp("BP_C4",
@@ -191,6 +201,13 @@ class Integration(unittest.TestCase):
                    {"op": "call", "target": "$a", "function": "HideBox"},
                    {"op": "python", "code": "result = ctx['a'].get_editor_property('LabBox').get_editor_property('visible') is False", "as": "hid"},
                    {"op": "assert", "value": "$hid", "truthy": True}])
+        st = self.read(T + "BP_C4")
+        comps = {c["name"]: c for c in st["components"]}
+        self.assertTrue({"LabMesh", "LabBox"} <= set(comps), comps)
+        self.assertEqual(comps["LabBox"]["class"], "/Script/Engine.BoxComponent")
+        self.assertEqual(comps["LabBox"]["parent"], "LabMesh")
+        self.assertFalse(comps["LabMesh"]["inherited"])
+        self.assertFalse(comps["LabBox"]["inherited"])
 
     def test_03_widget_tree(self):
         tree = {"root": {"class": "VerticalBox", "name": "RootBox", "children": [
@@ -211,6 +228,11 @@ class Integration(unittest.TestCase):
                    {"op": "call", "target": "$w", "function": "SetBody", "args": [{"text": "Changed by Blueprint"}]},
                    {"op": "python", "code": "result = str(ctx['w'].get_editor_property('BodyText').get_text())", "as": "body"},
                    {"op": "assert", "value": "$body", "equals": "Changed by Blueprint"}])
+        st = self.read(T + "WBP_W")
+        self.assertEqual(st["components"], [])
+        self.assertEqual(st["components_status"], "ok")
+        self.assertIn("not an Actor", st["components_note"])
+        self.assertTrue({"RootBox", "TitleText", "BodyText"} <= {w["name"] for w in st["widgets"]})
 
     def test_04_canvas(self):
         tree = {"root": {"class": "CanvasPanel", "name": "Root", "children": [
@@ -261,6 +283,9 @@ class Integration(unittest.TestCase):
                    {"op": "call", "target": "$d", "function": "Fire", "args": [7]},
                    {"op": "get", "target": "$d", "property": "Count", "as": "n"},
                    {"op": "assert", "value": "$n", "equals": 12}])
+        d = {v["name"]: v for v in self.read(T + "BP_D")["variables"]}
+        self.assertEqual(d["Count"]["default"], "0")
+        self.assertEqual(d["OnPing"]["default_status"], "not_applicable")
 
     def test_07_interface(self):
         io = [{"name": "In", "type": "int"}], [{"name": "Out", "type": "int"}]
@@ -356,10 +381,15 @@ class Integration(unittest.TestCase):
                    {"op": "call", "target": "$a", "function": "UseTwice", "args": [21], "as": "t"}, {"op": "assert", "value": "$t", "equals": 42}])
         st = self.read(T + "BP_N")
         self.assertEqual({v["name"]: v["type"] for v in st["variables"]}["Items"], "array:int")
+        self.assertEqual({c["name"]: c["parent"] for c in st["components"]}.get("LabBox"), "DefaultSceneRoot")
+        items = {v["name"]: v for v in st["variables"]}["Items"]
+        self.assertEqual((items["default"], items["default_status"]), ("()", "ok"))
         # remove a variable and a component
         self.apply_ok([{"asset": T + "BP_N", "remove_variables": ["Dead"], "components": [{"name": "LabBox", "remove": True}]}])
         st = self.read(T + "BP_N")
         self.assertEqual(sorted(v["name"] for v in st["variables"] if v["name"] in ("Flag", "Dead", "Items")), ["Flag", "Items"])
+        self.assertEqual(st["components_status"], "ok")
+        self.assertIsInstance(st["components"], list)
         self.assertNotIn("LabBox", [c["name"] for c in st["components"]])
         # two timeline tracks
         self.apply_ok([self.new_bp("BP_TL2", timelines=[{"name": "Two", "length": 2.0, "tracks": [
@@ -377,6 +407,14 @@ class Integration(unittest.TestCase):
         self.assertIn("BPI_U", names)
         self.game([{"op": "new", "class": T + "BP_I", "as": "i"}, {"op": "call", "target": "$i", "function": "Ping", "args": [3], "as": "p"},
                    {"op": "assert", "value": "$p", "equals": 6}])
+        # a Blueprint whose parent is not an Actor has no components: [] with a note, not unavailable
+        self.apply_ok([{"asset": T + "BP_Obj", "create": {"class": "Blueprint", "parent": "/Script/CoreUObject.Object", "if_missing": True},
+                        "variables": [{"name": "N", "type": "int", "default": "3"}]}])
+        st = self.read(T + "BP_Obj")
+        self.assertEqual(st["components"], [])
+        self.assertEqual(st["components_status"], "ok")
+        self.assertTrue(st["components_note"])
+        self.assertEqual({v["name"]: v for v in st["variables"]}["N"]["default"], "3")
 
     def test_12_rollback(self):
         def snapshot():
