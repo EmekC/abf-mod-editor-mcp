@@ -1353,6 +1353,9 @@ TOOLS = [
      S(lines=INT, contains={"type": "string", "description": "Case-insensitive regex."}, file=STR), []),
 ]
 TOOLS.extend(headless_tools.build(run_json, (RemoteError,), t3d_errors, HERE / "editor", [EDITOR_ROOT], PY_STATUS))
+if os.environ.get("ABF_ABFC_TOOLS") == "1":  # opt-in tools for abfc, see ABFC.md
+    import abfc_tools  # noqa: E402
+    TOOLS.extend(abfc_tools.build(SERVER_VERSION))
 TOOL_MAP = {t[0]: t for t in TOOLS}
 
 INSTRUCTIONS = (
