@@ -61,7 +61,7 @@ def op_compile(job):
             ad = reg.get_asset_by_object_path(str(a))
             if ad.is_valid() and str(ad.asset_class_path.asset_name) in ("Blueprint", "WidgetBlueprint", "AnimBlueprint"):
                 paths.append(p)
-    done, skipped = [], []
+    done, skipped, node_files = [], [], {}
     for p in paths:
         cls = _blueprint_like(p)
         if cls not in ("Blueprint", "WidgetBlueprint", "AnimBlueprint"):
@@ -75,7 +75,15 @@ def op_compile(job):
             continue
         unreal.BlueprintEditorLibrary.compile_blueprint(bp)
         done.append(p)
-    return {"compiled": done, "skipped": skipped}
+        if job.get("node_refs"):
+            # the compiler keeps each message on its node (ErrorMsg=): the host reads the node names from this export
+            fn = "compile_%d.t3d" % (len(done) - 1)
+            try:
+                core.export_text(bp, fn)
+                node_files[p] = fn
+            except Exception as e:
+                unreal.log_warning("ABFMCP_COMPILE node export failed for %s: %s" % (p, e))
+    return {"compiled": done, "skipped": skipped, "node_files": node_files}
 
 
 def op_export(job):

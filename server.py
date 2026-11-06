@@ -1223,7 +1223,8 @@ def t_backend_info(args):
     return _json({"protocol": BACKEND_PROTOCOL, "serverVersion": SERVER_VERSION,
                   "editorRoot": str(EDITOR_ROOT) if EDITOR_ROOT else None,
                   "headlessDir": str(paths.headless_dir()), "documentsDir": str(paths.documents_dir()),
-                  "capabilities": {"pinTypes": True, "containerTypes": {"array": True, "map": True, "set": False}},
+                  "capabilities": {"pinTypes": True, "containerTypes": {"array": True, "map": True, "set": False},
+                                   "warmSession": headless.warm_enabled(), "stageAudit": True},
                   "bpApply": {"features": list(specs.FEATURES), "nodeKinds": sorted(specs.NODE_KINDS)}})
 
 
