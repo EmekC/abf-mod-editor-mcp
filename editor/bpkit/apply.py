@@ -78,6 +78,19 @@ def _scopes(spec):
     return out
 
 
+_MEMBER_GUID = re.compile(r",?MemberGuid=[0-9A-Fa-f]+")
+
+
+def _self_events(scopes):
+    """{name: params} of every custom event the spec adds, over all scopes."""
+    out = {}
+    for _scope, _kind, _owner, nodes, _w in scopes:
+        for n in nodes:
+            if n.get("k") == "event" and n.get("name"):
+                out[n["name"]] = n.get("params") or []
+    return out
+
+
 def _fn_nodes(f, parent=None, editable=True):
     ins, outs = f.get("inputs") or [], f.get("outputs") or []
     nodes = [t3d.entry_node(f["name"], ins, parent=parent, editable=editable)]
@@ -160,6 +173,7 @@ def apply_asset(spec, mod, index=0):
         if _kind == "graph":
             _preload(env, owner)
     items, keymap, extra_vars, disp = {}, {}, [], {}
+    self_events, self_keys = _self_events(scopes), set()
     for d in spec.get("dispatchers") or []:
         disp[d["name"]] = d.get("params") or []
     for scope, _kind, _owner, nodes, _w in scopes:
@@ -169,6 +183,10 @@ def apply_asset(spec, mod, index=0):
                 continue
             cls, body = specs.NODE_KINDS[k](n, env)
             key = "n%d" % len(items)
+            if k == "call" and not n.get("class") and n["function"] in self_events:
+                # the real class lacks this event until the edit below: template it against the scratch class's own event
+                body = ['FunctionReference=(MemberName="%s",bSelfContext=True)' % n["function"]]
+                self_keys.add(key)
             items[key] = (cls, body)
             keymap[(scope, n["id"])] = key
             if k in ("get", "set") and n.get("type"):
@@ -187,10 +205,13 @@ def apply_asset(spec, mod, index=0):
             svars.append(v)
         setups = [(lambda z, n=n, p=p: assets.add_dispatcher(z, n, p)) for n, p in disp.items()]
         setups += [(lambda z, t=t, g=g: assets.add_timeline(z, t, g)) for t, g in tl_specs.values()]
-        raw = graphs.make_templates(items, svars, setups)
+        raw = graphs.make_templates(items, svars, setups, list(self_events.items()))
         cls_text = core.gen_class_text(bp)
         for sk, key in keymap.items():
             templates[sk] = t3d.retarget(raw[key], cls_text)
+            if key in self_keys:
+                # the scratch event's guid means nothing on the real class
+                templates[sk] = [_MEMBER_GUID.sub("", l) if l.startswith("FunctionReference=") else l for l in templates[sk]]
     ctx = {"env": env, "macros": {}, "bp_path": pth(bp), "scope": None}
 
     def run_edit(scope, graph, edit):

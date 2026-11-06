@@ -2,6 +2,7 @@
 
 Every graph edit is: export -> GraphModel (text) -> change -> one write_graph that swaps the node array.
 """
+import contextlib
 import ctypes
 import re
 import struct
@@ -62,9 +63,10 @@ def _rebuild_scratch_pins(bp):
     LIB.reparent_blueprint(bp, unreal.Actor)
 
 
-def make_templates(items, scratch_vars=(), setups=()):
+def make_templates(items, scratch_vars=(), setups=(), self_events=()):
     """items: {key: (class_path, body_lines)}. Returns {key: [lines]} with every pin the engine would make.
-    The scratch Blueprint (parent Actor) lives under CFG.dest and is never saved."""
+    self_events: [(name, params)] custom events the spec adds; they exist in the scratch graph so a self call to one
+    gets its pins before the real asset has the event. The scratch Blueprint (parent Actor) lives under CFG.dest and is never saved."""
     from . import assets
     _SCRATCH[0] += 1
     fac = unreal.BlueprintFactory()
@@ -78,6 +80,9 @@ def make_templates(items, scratch_vars=(), setups=()):
         LIB.compile_blueprint(z)
     g = must(LIB.find_event_graph(z), "scratch event graph")
     defs = [(c, "T_" + k, list(b) + ["NodeGuid=" + t3d.gid()]) for k, (c, b) in items.items()]
+    for i, (name, params) in enumerate(self_events):
+        c, b = specs._event({"name": name, "params": params or []}, None)
+        defs.append((c, "E_%d" % i, list(b) + ["NodeGuid=" + t3d.gid()]))
     write_graph(g, defs)
     _rebuild_scratch_pins(z)
     t = core.export_text(z, "bk_tmpl.t3d").split("\n")
@@ -166,12 +171,22 @@ def _build_node(spec, model, templates, ctx):
     node = GraphNode.from_template(cls, model.unique_name(cls), templates[key], (0, 0))
     if k == "call" and not spec.get("class"):
         # a call to the asset's own function: self context, not an external class reference
+        # (a template for an event added by the same spec already is bSelfContext and has no MemberParent: unchanged)
         node.head = [re.sub(r'FunctionReference=\(MemberParent="[^"]*",MemberName="([^"]+)"', r'FunctionReference=(MemberName="\1",bSelfContext=True', h)
                      for h in node.head]
     for pin, ts in (spec.get("pin_types") or {}).items():
         node.resolve_wildcard(pin, t3d.parse_type(ts, ctx["env"].class_text))
     node.fill_default_wildcards()
     return node
+
+
+@contextlib.contextmanager
+def _spec_error(spec_id):
+    """Prefix a SpecError with the spec id of the node it is about, so a caller can map it back to its source."""
+    try:
+        yield
+    except SpecError as e:
+        raise SpecError("[spec:%s] %s" % (spec_id, e)) from None
 
 
 def edit_graph(bp, graph, edit, templates, ctx):
@@ -216,7 +231,8 @@ def edit_graph(bp, graph, edit, templates, ctx):
             else:
                 fresh.append((spec["id"], node))
         for pin, val in (spec.get("set") or {}).items():
-            node.set_default(pin, val)
+            with _spec_error(spec["id"]):
+                node.set_default(pin, val)
         for pin, path in (spec.get("objects") or {}).items():
             node.set_default_object(pin, path if "'" in path else env_object_text(ctx["env"], path))
     fresh_ids = {i for i, _ in fresh}
@@ -227,10 +243,17 @@ def edit_graph(bp, graph, edit, templates, ctx):
         n.move(*spots[i])
     for a, b in edit.get("wires") or []:
         (na, pa), (nb, pb) = split(a), split(b)
-        model.wire(na, pa, nb, pb)
+        try:
+            model.get(na).pin(pa, "out")
+            failing = b
+        except SpecError:
+            failing = a
+        with _spec_error(failing.split(".", 1)[0]):
+            model.wire(na, pa, nb, pb)
     for ref, val in (edit.get("set") or {}).items():
         n, pin = split(ref)
-        model.get(n).set_default(pin, val)
+        with _spec_error(ref.split(".", 1)[0]):
+            model.get(n).set_default(pin, val)
     for ref, path in (edit.get("objects") or {}).items():
         n, pin = split(ref)
         model.get(n).set_default_object(pin, path if "'" in path else env_object_text(ctx["env"], path))
