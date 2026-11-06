@@ -82,6 +82,16 @@ def _member_ref(body, kind):
     return {"parent": pm.group(1) if pm else (parent or None), "name": m.group(2)}
 
 
+_T3D_ESCAPE = re.compile(r"\\(.)", re.S)
+_T3D_ESCAPES = {"n": "\n", "r": "\r", "t": "\t"}
+
+
+def unescape_t3d(text):
+    r"""Undo the escaping of a quoted T3D property value (UE ExportText writes \n \r \t \' \" and \\). One left-to-right pass,
+    so an escaped backslash followed by n stays a backslash and an n. Any other escaped character stands for itself."""
+    return _T3D_ESCAPE.sub(lambda m: _T3D_ESCAPES.get(m.group(1), m.group(1)), str(text or ""))
+
+
 def _parse_node_props(node, btxt):
     for kind, key in (("FunctionReference", "function"), ("EventReference", "event"), ("VariableReference", "variable"),
                       ("DelegateReference", "delegate"), ("MacroGraphReference", "macro")):
@@ -99,7 +109,7 @@ def _parse_node_props(node, btxt):
     node["guid"] = guid.group(1) if guid else None
     err = re.search(r'ErrorMsg="(.*)"', btxt)
     if err:
-        node["error"] = err.group(1)[:300]
+        node["error"] = unescape_t3d(err.group(1))[:2000]
     orphans = re.findall(r'PinName="([^"]+)"[^\n]*bOrphanedPin=True', btxt)
     if orphans:
         node["orphaned_pins"] = orphans
@@ -176,6 +186,18 @@ def parse_t3d(text):
             nodes.append(node)
             graphs[o["graph"] or "?"] = graphs.get(o["graph"] or "?", 0) + 1
     return {"blueprint": bp, "graphs": graphs, "nodes": nodes}
+
+
+def compiler_node_errors(text):
+    """Nodes of a post-compile Blueprint export that carry a compiler message (ErrorMsg=): [(graph, node name, message)].
+    The export escapes the text (Can\'t, a literal backslash-n between messages); it is unescaped here, and a node that holds
+    several messages (one per line) gives one entry per message, so each log error can be matched to a node on its own."""
+    out = []
+    for n in parse_t3d(text)["nodes"]:
+        for line in (n.get("error") or "").splitlines():
+            if line.strip():
+                out.append((n.get("graph"), n["name"], line))
+    return out
 
 
 def check_nodes(nodes, rules):

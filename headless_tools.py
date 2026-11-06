@@ -207,6 +207,7 @@ def build(run_json, remote_errors, t3d_errors, kit_root, forbidden, py_status, l
 
     # ---------------------------------------------------------------- staging
     def t_staging_sync(args):
+        headless.WARMS.stop_all()      # a warm editor holds the staged packages open and would not see the replaced files
         stage = staging.sync(args["mod_dir"], bool(args.get("discard_changes")), forbidden)
         return _out({"mod": stage.name, "files": stage.file_count, "staging_path": str(stage.dir),
                      "message": "Staged %s. bp_apply and the other tools work on this copy; bp_publish copies the result back." % stage.name})
@@ -245,12 +246,16 @@ def build(run_json, remote_errors, t3d_errors, kit_root, forbidden, py_status, l
         targets = {a["asset"] for a in batch["assets"]}
         target_errors = [e for e in compile_["errors"] if e["asset"] in targets]
         t3d_problems = []
+        node_errors = {}
         for i, a in enumerate(batch["assets"]):
             f = run / ("final_%d.t3d" % i)
             if f.is_file():
-                r = t3d_errors(_read(f))
+                text = _read(f)
+                r = t3d_errors(text)
                 for p in r["problems"]:
                     t3d_problems.append(dict(p, asset=a["asset"]))
+                node_errors[a["asset"]] = bpscan.compiler_node_errors(text)
+        headless.attach_node_refs(compile_["errors"] + compile_["warnings"], node_errors)
         ok = bool(res["ok"]) and not target_errors
         rolled_back = False
         if not ok and not keep_on_error:
@@ -264,7 +269,7 @@ def build(run_json, remote_errors, t3d_errors, kit_root, forbidden, py_status, l
                 shutil.copy2(src, dst)
             rolled_back = True
         out = {"ok": ok, "rolled_back": rolled_back, "assets": (res.get("result") or {}).get("assets"), "compile": compile_,
-               "problems": t3d_problems, "run": res["run"], "seconds": res["seconds"]}
+               "problems": t3d_problems, "run": res["run"], "seconds": res["seconds"], "warm": bool(res.get("warm"))}
         if not ok:
             out["error"] = (res.get("error") or ("%d compile error(s) in the edited assets" % len(target_errors)))
             if res.get("log_tail"):
@@ -312,6 +317,7 @@ def build(run_json, remote_errors, t3d_errors, kit_root, forbidden, py_status, l
         st["asset"] = path
         st["run"] = res["run"]
         st["seconds"] = res.get("seconds")
+        st["warm"] = bool(res.get("warm"))
         return _out(st)
 
     def t_bp_compile_report(args):
@@ -322,10 +328,14 @@ def build(run_json, remote_errors, t3d_errors, kit_root, forbidden, py_status, l
             bad = _in_mod(p, mod)
             if bad:
                 return _out({"error": "%s: %s" % (p, bad)})
-        res = headless.run_commandlet(stage, {"op": "compile", "asset_paths": paths_}, timeout=float(args.get("timeout_seconds") or 600))
+        res = headless.run_commandlet(stage, {"op": "compile", "asset_paths": paths_, "node_refs": args.get("node_refs") is not False},
+                                      timeout=float(args.get("timeout_seconds") or 600))
         if not res["ok"]:
             return _out({"error": res.get("error") or "compile run failed", "run": res["run"], "log_tail": res.get("log_tail")})
         c = visible_compile(headless.parse_compile_log(_read(res["log"]), mod))
+        node_errors = {a: bpscan.compiler_node_errors(_read(Path(res["run"]) / fn))
+                       for a, fn in ((res.get("result") or {}).get("node_files") or {}).items()}
+        headless.attach_node_refs(c["errors"] + c["warnings"], node_errors)
         per = {}
         for kind in ("errors", "warnings"):
             for e in c[kind]:
@@ -335,7 +345,7 @@ def build(run_json, remote_errors, t3d_errors, kit_root, forbidden, py_status, l
                     for sev, kind in (("error", "errors"), ("warning", "warnings")) for e in c[kind]]
         return _out({"clean": not c["errors"] and not bad, "unchecked": bad, "error_count": len(c["errors"]), "warning_count": len(c["warnings"]),
                      "assets": per, "messages": messages, "compiled": res["result"]["compiled"], "skipped": res["result"]["skipped"],
-                     "run": res["run"], "seconds": res["seconds"]})
+                     "run": res["run"], "seconds": res["seconds"], "warm": bool(res.get("warm"))})
 
     # ---------------------------------------------------------------- game test
     def t_bp_game_test(args):
@@ -410,6 +420,7 @@ def build(run_json, remote_errors, t3d_errors, kit_root, forbidden, py_status, l
     def t_mod_audit(args):
         mod = args["mod"]
         stage = staging.load(mod)
+        headless.WARMS.stop_all()      # before strip_tooling: a warm editor has these packages mounted (run_editor stops it too)
         staging.strip_tooling(stage)
         res = hiddendesk.run_editor(stage, {"op": "audit"}, timeout=float(args.get("timeout_seconds") or 420))
         log = _read(res["log"])
@@ -418,6 +429,7 @@ def build(run_json, remote_errors, t3d_errors, kit_root, forbidden, py_status, l
         ok = bool(res["ok"]) and audit["completed"] and audit["errors"] == 0
         out = {"ok": ok, "completed": audit["completed"], "errors": audit["errors"], "warnings": audit["warnings"],
                "audited": audit["audited"], "lines": audit["lines"][-60:], "compile": comp, "run": res["run"], "seconds": res["seconds"],
+               "audited_copy": "stage", "mounted": res.get("mounted"),
                "note": "This is the editor's own upload Asset Audit run on the staged copy without the test harness: the real gate."}
         if not ok:
             out["error"] = res.get("error") or ("the audit did not complete" if not audit["completed"] else "%d audit error(s)" % audit["errors"])
@@ -466,8 +478,9 @@ def build(run_json, remote_errors, t3d_errors, kit_root, forbidden, py_status, l
          "when they could not be read; [] means there really are none.",
          dict(mod=STR, asset_path=STR, graph=STR, include_pins=BOOL, timeout_seconds=NUM), ["mod", "asset_path"]),
         ("bp_compile_report", t_bp_compile_report,
-         "Compile staged Blueprints (all of them when asset_paths is empty) and report errors and warnings per asset. Nothing is saved.",
-         dict(mod=STR, asset_paths={"type": "array", "items": STR}, timeout_seconds=NUM), ["mod"]),
+         "Compile staged Blueprints (all of them when asset_paths is empty) and report errors and warnings per asset. Nothing is saved. "
+         "Each message gets the node (graph, node, from the compiled export) when the compiler stored it on one; node_refs=false skips that export.",
+         dict(mod=STR, asset_paths={"type": "array", "items": STR}, node_refs=BOOL, timeout_seconds=NUM), ["mod"]),
         ("bp_game_test", t_bp_game_test,
          "Run steps in a hidden game (-game -nullrhi, /Game/Maps/Empty by default): new/spawn/widget, call, get, set, find, wait, assert, python. "
          "Limits: cannot test anything injected into W_PlayerHUD_Main (no live HUD hidden); Python cannot spawn actors or create widgets in -game, "
@@ -481,8 +494,11 @@ def build(run_json, remote_errors, t3d_errors, kit_root, forbidden, py_status, l
          dict(mod=STR, assets={"type": "array", "items": STR}, max_width=INT, settle_seconds=NUM), ["mod", "assets"]),
         ("mod_audit", t_mod_audit,
          "Run the editor's own upload Asset Audit on the staged copy (without the test harness) in a hidden editor. This is the real gate and "
-         "outranks blueprint_filter_check. Depends on the same fixed Mod Browser tile position as hidden_editor_shot.",
-         dict(mod=STR, timeout_seconds=NUM), ["mod"]),
+         "outranks blueprint_filter_check. Depends on the same fixed Mod Browser tile position as hidden_editor_shot. The editor sees a private "
+         "Documents folder, so the picker can only list the staged mod; the log is checked after the click and a different mounted mod fails "
+         "the run ('picker mounted <other>') after one retry. The audit always runs on the staged copy ('audited_copy': 'stage'); the "
+         "stage argument is accepted for compatibility.",
+         dict(mod=STR, stage=BOOL, timeout_seconds=NUM), ["mod"]),
         ("bp_publish", t_bp_publish,
          "Copy the staged Content changes into the real mod. Backs up the files it replaces first (outside the mod), refuses on compile errors, "
          "modified assets in an open editor, locked files or files changed in the real mod since staging_sync, and never deletes anything. "

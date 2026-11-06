@@ -375,6 +375,11 @@ class GraphNode:
         p = self._input(pin)
         p.text = _DEFOBJ_RX.sub("", p.text)
         p.text = _insert_attr(p.text, 'DefaultObject="%s"' % object_text)
+        # SpawnActor / Create Widget: the engine types ReturnValue from the Class pin, a text import does not
+        if p.name == "Class" and self.cls.rsplit(".", 1)[-1] in ("K2Node_SpawnActorFromClass", "K2Node_CreateWidget"):
+            for rv in self.pins:
+                if rv.name == "ReturnValue" and rv.direction == "out":
+                    rv.set_type({"cat": "object", "sub": "", "obj": object_text, "container": None})
 
     # -- position
     def pos(self):

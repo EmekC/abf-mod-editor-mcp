@@ -93,6 +93,12 @@ class Integration(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # mod_audit / hidden_editor_shot made <root>/home/AppData/{Local,Roaming}: junctions to the REAL AppData. Unlink them
+        # first; a recursive delete must never get near them (older interpreters and PowerShell 5.1 follow junctions).
+        import hiddendesk
+        _removed, still = hiddendesk.remove_home()
+        if still:
+            raise RuntimeError("not deleting %s: these AppData links could not be removed, delete them by hand first: %s" % (cls.work, still))
         shutil.rmtree(cls.work, ignore_errors=True)
 
     # ------------------------------------------------------------ helpers

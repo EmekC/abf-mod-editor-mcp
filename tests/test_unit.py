@@ -171,6 +171,22 @@ class T3dTests(unittest.TestCase):
         b.set_default_object("Count", "/Script/Engine.Actor")
         self.assertIn(',DefaultObject="/Script/Engine.Actor",PersistentGuid=', b.pin("Count").text)
 
+    def test_spawn_and_create_widget_class_types_return_value(self):
+        def pin(name, direction, cat, obj):
+            return ('CustomProperties Pin (PinId=%s01,PinName="%s"%s,PinType.PinCategory="%s",PinType.PinSubCategory="",'
+                    'PinType.PinSubCategoryObject=%s,PinType.PinSubCategoryMemberReference=(),PinType.PinValueType=(),'
+                    'PinType.ContainerType=None,PinType.bIsReference=False,PersistentGuid=0,)'
+                    % (name.upper(), name, ',Direction="EGPD_Output"' if direction == "out" else "", cat, obj))
+        gen = "/Script/Engine.BlueprintGeneratedClass'/Mod/BP_X.BP_X_C'"
+        for cls in ("/Script/BlueprintGraph.K2Node_SpawnActorFromClass", "/Script/UMGEditor.K2Node_CreateWidget"):
+            node = GraphNode.from_export(cls, "N_0", [
+                pin("Class", "in", "class", '"/Script/CoreUObject.Class\'/Script/Engine.Actor\'"'),
+                pin("ReturnValue", "out", "object", '"/Script/CoreUObject.Class\'/Script/Engine.Actor\'"')])
+            node.set_default_object("Class", gen)
+            self.assertIn('PinType.PinSubCategoryObject="%s"' % gen, node.pin("ReturnValue").text)
+            self.assertIn('DefaultObject="%s"' % gen, node.pin("Class").text)
+            self.assertNotIn(gen, node.pin("Class").text.split(",DefaultObject")[0])
+
     def test_model_remove_drops_links(self):
         m, a, b = self._pair()
         m.wire("A_0", "then", "B_0", "execute")
