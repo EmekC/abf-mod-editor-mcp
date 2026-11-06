@@ -62,6 +62,24 @@ class CompileLogTests(unittest.TestCase):
         r = headless.parse_compile_log(log)
         self.assertEqual(r["warnings"], [{"asset": "/Mod/X/BP_A", "message": "Something is odd"}])
 
+    def test_final_compile_errors_ignore_the_states_before_the_last_compile(self):
+        a, b = "/Mod/X/BP_A", "/Mod/X/BP_B"
+        mark = lambda asset: "[x][0]LogPython: ABFMCP_APPLY_FINAL %s\n" % asset
+        err = lambda msg, asset: "[x][0]LogBlueprint: Error: [Compiler] %s from Source: %s.%s\n" % (msg, asset, asset.rsplit("/", 1)[1])
+        # the stage held an old error, the edit repaired it: the apply passes
+        log = err("old call to a removed event", a) + mark(a)
+        self.assertEqual(headless.final_compile_errors(log, "Mod", [a]), [])
+        # an error the last compile still reports stays
+        log = err("old", a) + mark(a) + err("still broken", a)
+        self.assertEqual([e["message"] for e in headless.final_compile_errors(log, "Mod", [a])], ["still broken"])
+        # each asset has its own mark, and a mark of BP_B is not one of BP_A
+        log = err("a1", a) + mark(a) + err("b1", b) + mark(b) + err("b2", b)
+        self.assertEqual([e["message"] for e in headless.final_compile_errors(log, "Mod", [a, b])], ["b2"])
+        self.assertEqual(headless.final_compile_errors(mark("/Mod/X/BP_AA") + err("x", a), "Mod", [a])[0]["message"], "x")
+        # scratch assets never count; a log without a mark (an older kit) is read whole
+        self.assertEqual(headless.final_compile_errors(err("s", "/Mod/_McpTmp/BP_BkScratch1"), "Mod", ["/Mod/_McpTmp/BP_BkScratch1"]), [])
+        self.assertEqual([e["message"] for e in headless.final_compile_errors(err("old", a), "Mod", [a])], ["old"])
+
 
 class ToolTableTests(unittest.TestCase):
     def test_build_returns_exactly_three_tools_with_schemas(self):

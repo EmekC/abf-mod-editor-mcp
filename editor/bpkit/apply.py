@@ -8,6 +8,7 @@ from .core import LIB, must, pth
 from .t3d import SpecError
 
 BP_CLASSES = ("Blueprint", "WidgetBlueprint")
+FINAL_MARK = "ABFMCP_APPLY_FINAL"   # headless.final_compile_errors reads the log after the last one of an asset
 
 
 class Env:
@@ -272,6 +273,7 @@ def apply_asset(spec, mod, index=0):
             exec(compile(r["code"], "<bp_apply raw python>", "exec"), {"unreal": unreal, "bp": bp, "asset_path": path, "ctx": ctx, "core": core})
         LIB.compile_blueprint(bp)
 
+    unreal.log("%s %s" % (FINAL_MARK, path))   # compile errors before this line are states the edit passed through
     LIB.compile_blueprint(bp)
     final = "final_%d.t3d" % index
     text = core.export_text(bp, final)
