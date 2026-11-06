@@ -270,9 +270,9 @@ def _restore(src, backup, rels, existed, manifest):
     return failed
 
 
-def _try_reload(editor, packages):
+def _try_reload(editor, packages, also=None):
     try:
-        return editor.reload(packages)
+        return editor.reload(packages, also)
     except Exception:
         return None
 
@@ -331,19 +331,39 @@ def publish(stage, editor, compile_gate, assets=None, dry_run=False, now=None):
     def abort(reason, message, **extra):
         """Every non-success path after prepare: give the user's editor its assets back, then refuse."""
         if state == "open":
-            _try_reload(editor, packages)
+            _try_reload(editor, packages, prep.get("referencers"))
         return _refuse(reason, message, **extra)
 
+    prep, rel_res = {}, {}
     if state == "open":
         try:
-            res = editor.prepare(packages)
+            prep = editor.prepare(packages)
         except Exception as e:
             return abort("editor error", "Refused: the open editor failed while preparing (%s); it was asked to reload the assets. "
                          "Nothing was copied." % e)
-        if res.get("refused"):
-            return _refuse("editor refused", "Refused by the open editor: %s (%s). Save or close those assets, stop Play In Editor, "
-                           "then publish again. Nothing was copied." % (", ".join(res["refused"]), res.get("reason", "")),
-                           editor_result=res)
+        if prep.get("refused"):
+            reason = str(prep.get("reason", ""))
+            if reason.startswith("Play In Editor"):
+                tail = "Stop Play In Editor, then publish again."
+            elif "unsaved" in reason:
+                tail = "Save or revert those assets, then publish again."
+            else:
+                tail = "Close the asset editors of those assets, then publish again."
+            ref_note = ""
+            if prep.get("refused_referencers"):
+                ref_note = (" (%s: loaded assets of this mod that reference the published ones; reloading them would discard those changes)"
+                            % ", ".join(prep["refused_referencers"]))
+            return _refuse("editor refused", "Refused by the open editor: %s (%s)%s. %s Nothing was copied."
+                           % (", ".join(prep["refused"]), reason, ref_note, tail), editor_result=prep, editor="open")
+        # the editor released the files (packages other objects still use stay loaded with their files closed): any file still held
+        # means the release did not work, and copying over it would fail or be undone by a later load
+        for rel in existing:
+            try:
+                open(src / rel, "r+b").close()
+            except OSError as e:
+                return abort("file locked", "Refused: %s is still held by the open editor after it released the assets (%s). Close the "
+                             "asset editor tabs of these assets or restart the Mod Editor, then publish again. Nothing was copied."
+                             % (rel, e), editor="open")
     try:
         stamp = now.strftime("%Y%m%d-%H%M%S") if hasattr(now, "strftime") else (str(now) if now else time.strftime("%Y%m%d-%H%M%S"))
         backup = root() / "backups" / name / stamp
@@ -395,7 +415,7 @@ def publish(stage, editor, compile_gate, assets=None, dry_run=False, now=None):
     except Exception as e:
         failed = _restore(src, backup, done, existed, manifest)
         if state == "open":
-            _try_reload(editor, packages)
+            _try_reload(editor, packages, prep.get("referencers"))
         if failed:
             return _refuse("copy failed", "The copy failed (%s) and the restore from the backup FAILED for: %s. The real mod may be "
                            "half-published: copy these back from %s by hand." % (e, ", ".join(failed), backup),
@@ -404,13 +424,17 @@ def publish(stage, editor, compile_gate, assets=None, dry_run=False, now=None):
                        restored=True, backup=str(backup))
     if state == "open":
         try:
-            res = editor.reload(packages)
-            bad_reload = res.get("missing") or res.get("error")
+            rel_res = editor.reload(packages, prep.get("referencers"))
+            bad_reload = rel_res.get("missing") or rel_res.get("error")
         except Exception as e:
             bad_reload = str(e)
         if bad_reload:
+            try:
+                editor.prepare(packages)    # the reload re-opened the files; release them so the restore can write
+            except Exception:
+                pass
             failed = _restore(src, backup, files, existed, manifest)
-            _try_reload(editor, packages)
+            _try_reload(editor, packages, prep.get("referencers"))
             if failed:
                 return _refuse("reload failed", "The editor could not load the new files (%s) and the restore from the backup FAILED for: %s. "
                                "Copy them back from %s by hand." % (bad_reload, ", ".join(failed), backup),
@@ -422,9 +446,32 @@ def publish(stage, editor, compile_gate, assets=None, dry_run=False, now=None):
         meta["baseline"][rel] = {"sha256": _sha(p), "size": p.stat().st_size}
     stage.save_meta(meta)
     route = "live-reload" if state == "open" else "file-copy"
-    msg = "Copied %d file(s) into %s (%s)." % (len(files), src, "the open editor reloaded them" if state == "open"
+    msg = "Copied %d file(s) into %s (%s)." % (len(files), src, "the open editor reloaded them in place; the asset editor tabs of the "
+                                              "published assets and of the assets that reference them were closed, reopen them to see the "
+                                              "change" if state == "open"
                                               else "no editor held them; they are on disk")
+    also = list(rel_res.get("reloaded_referencers") or [])
+    if also:
+        msg += " Also reloaded, unchanged on disk, because they reference the published assets: %s." % ", ".join(also)
+    skipped_dirty = list(rel_res.get("skipped_dirty") or [])
+    if skipped_dirty:
+        msg += (" NOT reloaded because they were edited during the publish and have unsaved changes (their edits were kept, so they "
+                "may still use the old classes until you save and reload them): %s." % ", ".join(skipped_dirty))
+    dirty_published = list(rel_res.get("dirty_published") or [])
+    if dirty_published:
+        msg += (" WARNING: these published assets were edited in the editor during the publish; they were reloaded from the new files, "
+                "so those unsaved edits were discarded: %s." % ", ".join(dirty_published))
+    errs = list(rel_res.get("compile_errors") or [])
+    if errs:
+        msg += (" WARNING: the editor logged %d Blueprint compile error(s) while it reloaded: %s. The files on disk are the published ones; "
+                "the errors are in the editor's in-memory state, so check the Output Log and recompile the listed Blueprints, or restart the "
+                "Mod Editor." % (len(errs), "; ".join("%s: %s" % (e.get("asset"), e.get("message")) for e in errs[:3])))
+    elif state == "open" and rel_res and rel_res.get("compile_check") not in (None, "editor log"):
+        msg += " Blueprint compile errors after the reload were not checked (%s)." % rel_res.get("compile_check")
     msg += " Backup of the previous files: %s." % backup
     if removed:
         msg += " %d file(s) are gone from staging; delete them in the Content Browser yourself, nothing was deleted in the real mod." % len(removed)
-    return {"published": files, "route": route, "backup": str(backup), "removed_in_staging": removed, "editor": state, "message": msg}
+    return {"published": files, "route": route, "backup": str(backup), "removed_in_staging": removed, "editor": state, "message": msg,
+            "reloaded_in_place": list(prep.get("kept_loaded") or []), "dirty_after": list(rel_res.get("dirty_after") or []),
+            "reloaded_referencers": also, "skipped_dirty": skipped_dirty, "dirty_published": dirty_published,
+            "compile_errors_after": errs}

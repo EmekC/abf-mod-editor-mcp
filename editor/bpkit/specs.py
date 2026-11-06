@@ -117,7 +117,7 @@ REQUIRED = {
 CREATE_CLASSES = ("Blueprint", "WidgetBlueprint", "BlueprintInterface")
 RAW_KINDS = ("graph", "tree", "tree_replace", "python")
 # bp_apply features reported by the backend_info tool
-FEATURES = ("cast_object_pin", "map_types", "pin_types")
+FEATURES = ("cast_object_pin", "map_types", "pin_types", "self_event_calls")
 _FORBIDDEN_CODE = tuple("delete_" + n for n in ("asset", "directory", "loaded_asset")) + ("reparent_" + "blueprint", "rename_asset")
 
 
