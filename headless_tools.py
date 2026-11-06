@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -110,7 +111,9 @@ def unchecked(compile_result):
 class LiveEditor:
     """Talks to the user's own editor, only when the mod is open there. Sends livepublish.py through run_json."""
 
-    def __init__(self, run_json, remote_errors, py_status, mod, source_dir=None, list_processes=None):
+    def __init__(self, run_json, remote_errors, py_status, mod, source_dir=None, list_processes=None, log_path=None, log_wait=0.5):
+        self.log_path = log_path
+        self.log_wait = log_wait
         self.run_json = run_json
         self.remote_errors = remote_errors
         self.py_status = py_status
@@ -175,10 +178,62 @@ class LiveEditor:
         return self.run_json(code, args, timeout=180)
 
     def prepare(self, packages):
-        return self._call("prepare", {"packages": packages})
+        return self._call("prepare", {"root": "/" + self.mod, "packages": packages})
 
-    def reload(self, packages):
-        return self._call("reload_assets", {"root": "/" + self.mod, "packages": packages})
+    def reload(self, packages, also=None):
+        """Reload the replaced packages plus `also` (unchanged loaded referencers), then read the Blueprint compile errors the
+        editor logged for them while it reloaded (`compile_errors`: asset and message). The log is only read, never changed;
+        `compile_check` says whether it could be read."""
+        also = list(also or [])
+        before = self._log_size()
+        out = self._call("reload_assets", {"root": "/" + self.mod, "packages": packages, "also": also})
+        if isinstance(out, dict):
+            errs, check = self._compile_errors(before, list(packages) + also)
+            out["compile_errors"] = errs
+            out["compile_check"] = check
+        return out
+
+    def _log_size(self):
+        try:
+            return self.log_path.stat().st_size if self.log_path else None
+        except OSError:
+            return None
+
+    def _compile_errors(self, offset, packages):
+        """Blueprint compile errors logged for these packages since `offset`: [{asset, message}], and how the check went."""
+        if offset is None:
+            return [], "the editor log could not be read"
+        wanted = {}
+        for n in packages:
+            parts = n.strip("/").split("/", 1)
+            if len(parts) == 2:
+                wanted["/content/" + parts[1].lower() + ".uasset"] = n
+        text = ""
+        for _ in range(4):     # the editor writes its log in the background: give the lines of the reload a moment to land
+            time.sleep(self.log_wait)
+            try:
+                with open(self.log_path, "rb") as f:
+                    f.seek(offset)
+                    text = f.read().decode("utf-8", "replace")
+            except OSError:
+                return [], "the editor log could not be read"
+            if "LogBlueprint: Error" in text:
+                break
+        found, seen = [], set()
+        for line in text.splitlines():
+            m = re.search(r"LogBlueprint: Error: \[AssetLog\] (.+?\.uasset): (?:\[Compiler\] )?(.*)$", line)
+            if not m:
+                continue
+            path = m.group(1).replace("\\", "/").lower()
+            asset = next((n for suffix, n in wanted.items() if path.endswith(suffix)), None)
+            if asset is None:
+                continue
+            msg = m.group(2).strip()[:300]
+            if (asset, msg) in seen:
+                continue
+            seen.add((asset, msg))
+            found.append({"asset": asset, "message": msg})
+        return found[:20], "editor log"
 
 
 def _out(d):
@@ -441,7 +496,8 @@ def build(run_json, remote_errors, t3d_errors, kit_root, forbidden, py_status, l
     def t_bp_publish(args):
         mod = args["mod"]
         stage = staging.load(mod)
-        editor = LiveEditor(run_json, remote_errors, py_status, mod, stage.meta().get("source_dir"), list_processes)
+        editor = LiveEditor(run_json, remote_errors, py_status, mod, stage.meta().get("source_dir"), list_processes,
+                            log_path=paths.saved_dir() / "Logs" / "AbioticFactor.log")
 
         def gate(packages):
             uassets = [p for p in packages]
@@ -502,6 +558,6 @@ def build(run_json, remote_errors, t3d_errors, kit_root, forbidden, py_status, l
         ("bp_publish", t_bp_publish,
          "Copy the staged Content changes into the real mod. Backs up the files it replaces first (outside the mod), refuses on compile errors, "
          "modified assets in an open editor, locked files or files changed in the real mod since staging_sync, and never deletes anything. "
-         "Works with the editor closed (file copy) or open (unload, copy, reload). dry_run only reports.",
+         "Works with the editor closed (file copy) or open (release the files, copy, reload in place; asset editor tabs of those assets are closed). dry_run only reports.",
          dict(mod=STR, assets={"type": "array", "items": STR}, dry_run=BOOL), ["mod"]),
     ]

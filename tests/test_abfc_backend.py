@@ -514,8 +514,146 @@ class WarmSessionTests(unittest.TestCase):
             self.assertFalse(json.loads(text)["stopped"])
 
     def test_editor_side_files_compile(self):
-        for rel in ("editor/bpkit/warm.py", "editor/warm_loop.py"):
+        for rel in ("editor/bpkit/warm.py", "editor/warm_loop.py", "editor/bpkit/livepublish.py"):
             py_compile.compile(str(ROOT / rel), cfile=str(self.tmp / "x.pyc"), doraise=True)
+
+
+class LivePublishEditorSideTests(unittest.TestCase):
+    """editor/bpkit/livepublish.py with a stubbed `unreal` module."""
+
+    def setUp(self):
+        patcher = mock.patch.dict(sys.modules, {"unreal": mock.MagicMock()})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        sys.modules.pop("bpkit.livepublish", None)
+        self.addCleanup(sys.modules.pop, "bpkit.livepublish", None)
+        import importlib
+        self.lp = importlib.import_module("bpkit.livepublish")      # fresh: it binds the stubbed `unreal` at import
+        self.u = sys.modules["unreal"]
+
+    def test_prepare_keeps_referenced_packages_loaded(self):
+        u = self.u
+        u.get_editor_subsystem.return_value.get_game_world.return_value = None
+        u.EditorLoadingAndSavingUtils.get_dirty_content_packages.return_value = []
+        u.find_package.return_value = mock.MagicMock()
+        u.EditorLoadingAndSavingUtils.unload_packages.return_value = (True, "could not unload")
+        u.find_object.side_effect = lambda outer, path: mock.MagicMock() if path == "/ModX/A.A" else None
+        out = self.lp.prepare({"packages": ["/ModX/A", "/ModX/B"]})
+        self.assertEqual(out["refused"], [])
+        self.assertEqual(out["kept_loaded"], ["/ModX/A"])
+        self.assertEqual(out["unloaded"], ["/ModX/B"])
+        # only the editor-closing loop loads assets: nothing is loaded back after unload_packages
+        self.assertEqual(u.load_asset.call_count, 2)
+
+    def test_prepare_finds_loaded_referencers_inside_the_mod_only(self):
+        u = self.u
+        u.get_editor_subsystem.return_value.get_game_world.return_value = None
+        u.EditorLoadingAndSavingUtils.get_dirty_content_packages.return_value = []
+        u.find_package.return_value = mock.MagicMock()
+        u.EditorLoadingAndSavingUtils.unload_packages.return_value = (True, "")
+        u.find_object.side_effect = lambda outer, path: mock.MagicMock()
+        u.AssetRegistryHelpers.get_asset_registry.return_value.get_referencers.return_value = [
+            "/ModX/Ref", "/ModX/A", "/Game/Other", "/ModXOther/Y", "/ModX/Ref"]
+        out = self.lp.prepare({"root": "/ModX", "packages": ["/ModX/A"]})
+        self.assertEqual(out["refused"], [])
+        self.assertEqual(out["referencers"], ["/ModX/Ref"])
+
+    def test_prepare_refuses_when_a_referencer_has_unsaved_changes(self):
+        u = self.u
+        u.get_editor_subsystem.return_value.get_game_world.return_value = None
+        dirty = mock.MagicMock()
+        dirty.get_name.return_value = "/ModX/Ref"
+        u.EditorLoadingAndSavingUtils.get_dirty_content_packages.return_value = [dirty]
+        u.find_package.return_value = mock.MagicMock()
+        u.find_object.side_effect = lambda outer, path: mock.MagicMock()
+        u.AssetRegistryHelpers.get_asset_registry.return_value.get_referencers.return_value = ["/ModX/Ref"]
+        out = self.lp.prepare({"root": "/ModX", "packages": ["/ModX/A"]})
+        self.assertEqual(out["refused"], ["/ModX/Ref"])
+        self.assertEqual(out["refused_referencers"], ["/ModX/Ref"])
+        self.assertIn("unsaved", out["reason"])
+        u.EditorLoadingAndSavingUtils.unload_packages.assert_not_called()
+
+    def test_prepare_skips_loaded_maps_as_referencers(self):
+        u = self.u
+        u.get_editor_subsystem.return_value.get_game_world.return_value = None
+        u.EditorLoadingAndSavingUtils.get_dirty_content_packages.return_value = []
+        u.find_package.return_value = mock.MagicMock()
+        u.EditorLoadingAndSavingUtils.unload_packages.return_value = (True, "")
+
+        def find(outer, path):
+            o = mock.MagicMock()
+            o.get_class.return_value.get_name.return_value = "World" if path.endswith("MapX.MapX") else "Blueprint"
+            return o
+        u.find_object.side_effect = find
+        u.AssetRegistryHelpers.get_asset_registry.return_value.get_referencers.return_value = ["/ModX/MapX", "/ModX/Ref"]
+        out = self.lp.prepare({"root": "/ModX", "packages": ["/ModX/A"]})
+        self.assertEqual(out["referencers"], ["/ModX/Ref"])
+        self.assertEqual(out["skipped_referencers"], ["/ModX/MapX"])
+
+    def test_reload_assets_reloads_referencers_after_the_published(self):
+        u = self.u
+        u.find_object.side_effect = lambda outer, path: mock.MagicMock()
+        u.EditorLoadingAndSavingUtils.get_dirty_content_packages.return_value = []
+        u.EditorLoadingAndSavingUtils.reload_packages.return_value = (True, "")
+        names = []
+
+        def load(name):
+            names.append(name)
+            a = mock.MagicMock()
+            a.get_outermost.return_value = name
+            return a
+        u.load_asset.side_effect = load
+        out = self.lp.reload_assets({"root": "/ModX", "packages": ["/ModX/A"], "also": ["/ModX/Ref", "/ModX/A"]})
+        self.assertEqual(names, ["/ModX/A", "/ModX/Ref"])
+        self.assertEqual(out["reloaded_referencers"], ["/ModX/Ref"])
+        self.assertEqual(u.EditorLoadingAndSavingUtils.reload_packages.call_args[0][0], ["/ModX/A", "/ModX/Ref"])
+
+    def test_reload_assets_skips_dirty_referencers_and_reports_dirty_published(self):
+        u = self.u
+        pa, pdirty = mock.MagicMock(), mock.MagicMock()
+        pa.get_name.return_value = "/ModX/A"
+        pdirty.get_name.return_value = "/ModX/Dirty"
+        u.EditorLoadingAndSavingUtils.get_dirty_content_packages.return_value = [pa, pdirty]
+        u.find_object.side_effect = lambda outer, path: mock.MagicMock()
+        u.EditorLoadingAndSavingUtils.reload_packages.return_value = (True, "")
+        names = []
+
+        def load(name):
+            names.append(name)
+            a = mock.MagicMock()
+            a.get_outermost.return_value = name
+            return a
+        u.load_asset.side_effect = load
+        out = self.lp.reload_assets({"root": "/ModX", "packages": ["/ModX/A"], "also": ["/ModX/Dirty", "/ModX/Ref"]})
+        self.assertEqual(names, ["/ModX/A", "/ModX/Ref"])
+        self.assertEqual(u.EditorLoadingAndSavingUtils.reload_packages.call_args[0][0], ["/ModX/A", "/ModX/Ref"])
+        self.assertEqual(out["skipped_dirty"], ["/ModX/Dirty"])
+        self.assertEqual(out["dirty_published"], ["/ModX/A"])
+        self.assertEqual(out["reloaded_referencers"], ["/ModX/Ref"])
+
+    def test_prepare_refuses_pie_without_unloading(self):
+        u = self.u
+        u.get_editor_subsystem.return_value.get_game_world.return_value = object()
+        out = self.lp.prepare({"packages": ["/ModX/A"]})
+        self.assertEqual(out["refused"], ["/ModX/A"])
+        self.assertEqual(out["reason"], "Play In Editor is running")
+        u.EditorLoadingAndSavingUtils.unload_packages.assert_not_called()
+
+    def test_reload_assets_reports_error_and_dirty(self):
+        u = self.u
+        a, z = mock.MagicMock(), mock.MagicMock()
+        a.get_name.return_value = "/ModX/A"
+        z.get_name.return_value = "/Other/Z"
+        u.EditorLoadingAndSavingUtils.get_dirty_content_packages.return_value = [a, z]
+        u.find_object.side_effect = lambda outer, path: mock.MagicMock()
+        u.EditorLoadingAndSavingUtils.reload_packages.return_value = (True, "boom")
+        out = self.lp.reload_assets({"root": "/ModX", "packages": ["/ModX/A"]})
+        self.assertIn("boom", out["error"])
+        self.assertEqual(out["dirty_after"], ["/ModX/A"])
+        self.assertEqual(out["missing"], [])
+        u.EditorLoadingAndSavingUtils.reload_packages.return_value = (True, "")
+        out = self.lp.reload_assets({"root": "/ModX", "packages": ["/ModX/A"]})
+        self.assertNotIn("error", out)
 
 
 class WarmEditorSideTests(unittest.TestCase):
