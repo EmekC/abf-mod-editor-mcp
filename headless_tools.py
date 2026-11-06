@@ -296,10 +296,13 @@ def build(run_json, remote_errors, t3d_errors, kit_root, forbidden, py_status, l
         res = headless.run_commandlet(stage, {"op": "apply", "assets": batch["assets"]}, timeout=timeout, prepare=snapshot)
         run = Path(res["run"])
         staging.strip_scratch(stage)
-        parsed = headless.parse_compile_log(_read(res["log"]), mod)
+        log_text = _read(res["log"])
+        parsed = headless.parse_compile_log(log_text, mod)
         compile_ = visible_compile(parsed)
         targets = {a["asset"] for a in batch["assets"]}
-        target_errors = [e for e in compile_["errors"] if e["asset"] in targets]
+        # errors of the edited assets are those of their last compile: the ones before it are states the edit passed through
+        target_errors = headless.final_compile_errors(log_text, mod, sorted(targets))
+        compile_["errors"] = [e for e in compile_["errors"] if e["asset"] not in targets] + target_errors
         t3d_problems = []
         node_errors = {}
         for i, a in enumerate(batch["assets"]):

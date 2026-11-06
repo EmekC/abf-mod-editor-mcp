@@ -227,6 +227,26 @@ def parse_compile_log(text, mod=None):
     return out
 
 
+APPLY_FINAL_MARK = "ABFMCP_APPLY_FINAL"     # logged by editor/bpkit/apply.py right before the compile of the finished asset
+
+
+def final_compile_errors(text, mod, assets):
+    """Compile errors of `assets` that stand after the apply: bp_apply compiles an asset many times (before the edit, after each graph),
+    and an asset that was left broken by an earlier failed build reports its old errors on the first of them even when the edit
+    repairs it. Only what the last compile (after the ABFMCP_APPLY_FINAL <asset> line) reports counts. A log without the line
+    (an older kit) is read whole."""
+    lines = text.splitlines()
+    out = []
+    for asset in assets:
+        at = -1
+        for i, line in enumerate(lines):
+            if line.rstrip().endswith(APPLY_FINAL_MARK + " " + asset):
+                at = i
+        seg = "\n".join(lines[at + 1:]) if at >= 0 else text
+        out.extend(e for e in parse_compile_log(seg, mod)["errors"] if e["asset"] == asset and "/_McpTmp/" not in (e["asset"] or ""))
+    return out
+
+
 def _norm_msg(text):
     """Compares messages by their words. Node messages arrive unescaped (bpscan.compiler_node_errors); log lines carry no escapes."""
     return " ".join(str(text or "").split())
