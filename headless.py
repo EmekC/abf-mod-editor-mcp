@@ -12,6 +12,7 @@ import secrets
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -226,6 +227,36 @@ def parse_compile_log(text, mod=None):
     return out
 
 
+def _norm_msg(text):
+    """Compares messages by their words. Node messages arrive unescaped (bpscan.compiler_node_errors); log lines carry no escapes."""
+    return " ".join(str(text or "").split())
+
+
+def attach_node_refs(entries, nodes_by_asset):
+    """The Blueprint compile log names no node (`from Source: <asset>` only), but the compiler stores each message on its node
+    (ErrorMsg=), which a post-compile T3D export shows. Give every entry of parse_compile_log that has no node the node whose
+    stored message equals the entry's message (or contains it, or is contained in it: ErrorMsg may be truncated). Each node is
+    used once, in export order, so two identical messages on two nodes get two nodes. Entries that match nothing stay as they were.
+    entries: dicts with asset and message (changed in place); nodes_by_asset: {asset: [(graph, node, message)]}.
+    Returns the number of entries that got a node."""
+    used = set()
+    n = 0
+    for e in entries:
+        if e.get("node") or e.get("asset") not in nodes_by_asset:
+            continue
+        want = _norm_msg(e.get("message"))
+        cands = [(i, g, nd, _norm_msg(m)) for i, (g, nd, m) in enumerate(nodes_by_asset[e["asset"]]) if (e["asset"], i) not in used]
+        hit = next((c for c in cands if c[3] == want), None)
+        if hit is None and len(want) >= 12:
+            hit = next((c for c in cands if len(c[3]) >= 12 and (c[3] in want or want in c[3])), None)
+        if hit is None:
+            continue
+        used.add((e["asset"], hit[0]))
+        e.update({"graph": hit[1] or None, "node": hit[2], "node_from": "export"})
+        n += 1
+    return n
+
+
 _AUDIT_DONE = re.compile(r"Asset audit complete: (\d+) Error\(s\), (\d+) Warning\(s\)")
 _AUDITING = re.compile(r"Auditing (/\S+?)(?:\.\S+)? \(")
 
@@ -305,6 +336,7 @@ def _exe():
 
 def _launch(stage, job, kind, map_path, timeout, prepare=None):
     exe = _exe()
+    WARMS.stop_all()            # a warm session holds the shared -userdir: a cold run needs it free
     with RunLock():
         run = new_run(job["op"])
         if prepare is not None:
@@ -346,11 +378,311 @@ def _launch(stage, job, kind, map_path, timeout, prepare=None):
 
 def run_commandlet(stage, job, timeout=300, prepare=None):
     """-run=pythonscript about 10 s. Exit code is ignored: the result file decides.
-    prepare(run) is called with the new run folder before the process starts."""
-    return _launch(stage, job, "cmd", None, timeout, prepare)
+    prepare(run) is called with the new run folder before the process starts.
+    With ABF_WARM_SESSION=1 the ops in WARM_OPS go to the warm session first (result key warm: true); when the warm session
+    cannot run a job, it runs cold (warm: false, warm_fallback: reason)."""
+    reason = None
+    if warm_enabled() and job.get("op") in WARM_OPS:
+        res, reason = WARMS.get(stage).submit(job, timeout, prepare)
+        if res is not None:
+            return res
+    res = _launch(stage, job, "cmd", None, timeout, prepare)
+    res["warm"] = False
+    if reason:
+        res["warm_fallback"] = reason
+    return res
 
 
 def run_game(stage, job, map_path="/Game/Maps/Empty", timeout=180):
     if not re.match(r"^/(Game|%s)/[A-Za-z0-9_/]+$" % re.escape(stage.name), map_path or ""):
         raise HeadlessError("map %r is not a plain /Game or /<Mod> package path" % (map_path,))
     return _launch(stage, job, "game", map_path, timeout)
+
+
+# ---- warm session ----------------------------------------------------------------------
+
+WARM_OPS = ("apply", "export", "compile", "reflect")     # commandlet ops; bp_game_test (-game) and mod_audit (editor) stay cold
+WARM_READY_TIMEOUT = 600.0       # seconds to wait for the warm process to report ready
+WARM_END_WAIT = 10.0             # seconds to wait for the job's end marker to reach the log file
+WARM_SLACK = 10.0                # a warm job may run this much longer than its timeout before the session is killed
+WARM_IDLE_DEFAULT = 600.0
+RELOAD_STALE_MARKERS = ("is not compatible with", "doesn't match the property")     # expected while reloaded Blueprints compile
+RELOAD_FAILED = "ABFMCP_WARM_RELOAD_FAILED"      # result error prefix written by editor/bpkit/warm.py when the reload failed
+
+
+class WarmError(HeadlessError):
+    pass
+
+
+def warm_enabled():
+    """Opt-in: the warm session is used only when the server was started with ABF_WARM_SESSION=1."""
+    return os.environ.get("ABF_WARM_SESSION") == "1"
+
+
+class WarmSession:
+    """One long-lived hidden commandlet per staged mod (editor/bpkit/warm.py is its loop). Queue protocol, all under
+    <runtime root>/warm/<mod>/: the host writes queue/<seq>-<id>.json = {"id", "job", "run"}; the loop writes <run>/result.json
+    and then <run>/warm.done; ready.json appears once the loop runs; stop.json asks it to exit. Every call is serialized by the
+    session mutex plus the shared RunLock (the session uses the same -userdir as cold runs).
+
+    submit() returns (result, None) when the warm session ran the job, or (None, reason) when the caller must run it cold.
+    Whenever the warm process is dead, silent past job timeout + 10 s, or fails to start, the process tree is killed and the job
+    falls back to cold, except an `apply` job that was already handed to a dying process: its files may be half written, so that
+    one is reported as failed (warm: true) and the caller's own rollback restores the stage."""
+
+    def __init__(self, stage, spawn=None, poll=0.1, ready_timeout=None):
+        self.stage = stage
+        self.name = stage.name
+        self.poll = poll
+        self.ready_timeout = WARM_READY_TIMEOUT if ready_timeout is None else ready_timeout
+        self._spawn = spawn or _spawn_quiet
+        self._mu = threading.RLock()
+        self.proc = None
+        self.job_obj = None
+        self.dir = None
+        self.jobs = 0
+        self.seq = 0
+        self.started_at = None
+
+    # -- state
+    def alive(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def status(self):
+        a = self.alive()
+        return {"mod": self.name, "running": a, "pid": getattr(self.proc, "pid", None) if a else None, "jobs": self.jobs,
+                "startedAt": self.started_at if a else None}
+
+    def _session_dir(self):
+        return root() / "warm" / self.name
+
+    def _kill_locked(self):
+        p, self.proc = self.proc, None
+        jo, self.job_obj = self.job_obj, None
+        if p is not None and p.poll() is None:
+            try:
+                p.kill()
+            except OSError:
+                pass
+            try:
+                p.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                pass
+        if jo is not None:
+            jo.close()                                    # kills a leftover tree (CrashReportClient, shader workers)
+
+    # -- start / stop
+    def _start_locked(self):
+        """Start the process when it is not alive. Returns the seconds it took (0.0 when it was already running)."""
+        if self.alive():
+            return 0.0
+        self._kill_locked()
+        exe = _exe()
+        d = self._session_dir()
+        shutil.rmtree(d, ignore_errors=True)
+        (d / "queue").mkdir(parents=True)
+        shutil.copyfile(paths.HERE / "editor" / "warm_loop.py", d / "warm_loop.py")
+        staging.set_uplugin(self.stage, "mount")
+        env = child_env(d, d / "warm.json")
+        env["ABF_MCP_WARM_DIR"] = _fwd(d)
+        env["ABF_MCP_STAGE_DIR"] = _fwd(self.stage.dir)
+        env.setdefault("ABF_WARM_IDLE_SECONDS", str(int(WARM_IDLE_DEFAULT)))
+        args = [exe, "-run=pythonscript", "-script=" + str(d / "warm_loop.py"), "-unattended", "-nosplash", "-nullrhi", "-nopause",
+                "-plugin=" + _fwd(self.stage.uplugin_path), "-userdir=" + _fwd(root() / "ud"), "-abslog=" + str(d / "editor.log")]
+        t0 = time.time()
+        self.dir = d
+        self.job_obj = KillOnCloseJob()
+        try:
+            self.proc = self._spawn(args, env)
+        except OSError as e:
+            self._kill_locked()
+            raise WarmError("could not start the warm session: %s" % e)
+        handle = getattr(self.proc, "_handle", None)
+        if handle is not None:
+            self.job_obj.assign(int(handle))
+        while not (d / "ready.json").is_file():
+            if not self.alive():
+                self._kill_locked()
+                raise WarmError("the warm process exited before it was ready (see %s)" % (d / "editor.log"))
+            if time.time() - t0 > self.ready_timeout:
+                self._kill_locked()
+                raise WarmError("the warm process was not ready after %.0f s (see %s)" % (self.ready_timeout, d / "editor.log"))
+            time.sleep(self.poll)
+        self.started_at = time.strftime("%Y-%m-%dT%H:%M:%S")
+        self.jobs = 0
+        return time.time() - t0
+
+    def start(self):
+        """Start (or confirm) the session. Takes the run lock because the process uses the shared -userdir."""
+        with self._mu:
+            if self.alive():
+                return self.status()
+            with RunLock():
+                self._start_locked()
+            return self.status()
+
+    def stop(self, grace=20.0):
+        """Ask the loop to exit, kill it after `grace` seconds. Returns True when a live process was stopped."""
+        with self._mu:
+            was = self.alive()
+            if was and self.dir is not None:
+                try:
+                    (self.dir / "stop.json").write_text("{}", encoding="utf-8")
+                except OSError:
+                    pass
+                t0 = time.time()
+                while self.alive() and time.time() - t0 < grace:
+                    time.sleep(self.poll)
+            self._kill_locked()
+            return was
+
+    # -- jobs
+    def _log_from(self, offset):
+        try:
+            with open(self.dir / "editor.log", "rb") as f:
+                f.seek(offset)
+                return f.read().decode("utf-8", errors="replace")
+        except OSError:
+            return ""
+
+    def _log_size(self):
+        try:
+            return (self.dir / "editor.log").stat().st_size
+        except OSError:
+            return 0
+
+    def _cut_log(self, run, jid, offset):
+        """Copy this job's part of the session log (BEGIN..END marker lines) to <run>/editor.log. The log reaches the file
+        asynchronously, so wait (bounded) for the END marker. Returns (end_found, reload_errors): without the END marker the copy
+        may be cut off and must not be trusted; reload_errors are the reload-phase error lines that are not stale-class noise."""
+        end = "ABFMCP_WARM_END " + jid
+        t0 = time.time()
+        text = self._log_from(offset)
+        while end not in text and time.time() - t0 < WARM_END_WAIT and self.alive():
+            time.sleep(self.poll)
+            text = self._log_from(offset)
+        found = end in text
+        reload_errors = []
+        lines = text.splitlines()
+        begin = "ABFMCP_WARM_BEGIN " + jid
+        i = next((k for k, l in enumerate(lines) if begin in l), 0)
+        j = next((k for k in range(i, len(lines)) if end in lines[k]), len(lines) - 1)
+        # What the editor logs while it reloads the staged packages (warm.reload_mod) is not the job's output: a reloaded
+        # Blueprint compiles against the class of a package that is replaced a moment later and logs stale-class errors
+        # ("X is not compatible with X", "doesn't match the property") that never occur in a cold process. The job's own
+        # compile runs after the reload and logs its real result, so only the lines from the reload marker on are the
+        # job's log. The reload part is kept apart for diagnosis.
+        r = next((k for k in range(i, j + 1) if "ABFMCP_WARM_RELOAD " in lines[k]), None)
+        if r is not None and r > i + 1:
+            (run / "reload.log").write_text("\n".join(lines[i + 1:r]) + "\n", encoding="utf-8")
+            # errors of the reload phase that are not the known stale-class noise are real (e.g. a package that failed to load)
+            reload_errors = [scrub(re.sub(r"^\[[^\]]*\]\[[^\]]*\]", "", l).strip()) for l in lines[i + 1:r]
+                             if re.search(r"\bError\b", l) and not any(k in l for k in RELOAD_STALE_MARKERS)][:20]
+            lines = lines[:i + 1] + lines[r:]
+            j -= r - i - 1
+        (run / "editor.log").write_text("\n".join(lines[i:j + 1]) + "\n", encoding="utf-8")
+        return found, reload_errors
+
+    def submit(self, job, timeout, prepare=None):
+        with self._mu:
+            with RunLock():
+                t_start = time.time()
+                try:
+                    start_seconds = self._start_locked()
+                except WarmError as e:
+                    return None, str(e)
+                run = new_run(job["op"])
+                if prepare is not None:
+                    prepare(run)
+                jid = run.name
+                job_path = run / "job.json"
+                job = dict(job, mod=self.name, run=_fwd(run), log=str(run / "editor.log"))
+                job_path.write_text(json.dumps(job), encoding="utf-8")
+                offset = self._log_size()
+                self.seq += 1
+                entry = self.dir / "queue" / ("%06d-%s.json" % (self.seq, jid))
+                tmp = entry.with_suffix(".tmp")
+                tmp.write_text(json.dumps({"id": jid, "job": _fwd(job_path), "run": _fwd(run)}), encoding="utf-8")
+                os.replace(str(tmp), str(entry))
+                t0 = time.time()
+                deadline = t0 + timeout + WARM_SLACK
+                state = "done"
+                while not (run / "warm.done").is_file():
+                    if not self.alive():
+                        state = "died"
+                        break
+                    if time.time() > deadline:
+                        state = "timeout"
+                        break
+                    time.sleep(self.poll)
+                if state == "done":
+                    found, reload_errors = self._cut_log(run, jid, offset)
+                    self.jobs += 1
+                    extra = {"warm": True, "total_seconds": round(time.time() - t_start, 1)}
+                    if start_seconds:
+                        extra["warm_start_seconds"] = round(start_seconds, 1)
+                    if reload_errors:
+                        extra["reload_errors"] = reload_errors
+                    res = _finish(run, job_path, None, False, time.time() - t0, extra)
+                    if str(res.get("error") or "").startswith(RELOAD_FAILED):
+                        # the packages could not be reloaded and the job did not run: the process holds stale state, so it
+                        # goes and the job runs cold (nothing was written, even for an apply)
+                        self._kill_locked()
+                        return None, "warm reload failed: %s" % str(res["error"])[len(RELOAD_FAILED):].lstrip(": ")[:300]
+                    if not found:
+                        # the editor.log copy may be cut off, so parse_compile_log could miss errors and a run pass wrongly
+                        self._kill_locked()
+                        if job["op"] != "apply":
+                            return None, "warm log incomplete (no end marker after %.0f s)" % WARM_END_WAIT
+                        res["ok"] = False
+                        res["warm_failed"] = "warm log incomplete"
+                        res["error"] = ("warm log incomplete: the job's end marker never reached the log; the staged files may be "
+                                        "changed (the caller restores them)")
+                    return res, None
+                # the process is dead or stuck: nothing more can be learned from it
+                self._kill_locked()
+                self._cut_log(run, jid, offset)
+                reason = ("the warm process died during the job" if state == "died"
+                          else "the warm job exceeded %.0f s (timeout + %.0f s)" % (timeout + WARM_SLACK, WARM_SLACK))
+                have_result = (run / "result.json").is_file()
+                if have_result or job["op"] == "apply":
+                    # a result exists (export writes one early), or an apply may have half-written files: report, never rerun
+                    res = _finish(run, job_path, None, state == "timeout", time.time() - t0,
+                                  {"warm": True, "warm_failed": reason})
+                    if not have_result:
+                        res["error"] = "%s; the staged files may be partly written (the caller restores them)" % reason
+                    return res, None
+                return None, reason
+
+
+class WarmRegistry:
+    """The warm sessions of this server process, one per staged mod."""
+
+    def __init__(self):
+        self.sessions = {}
+        self.factory = WarmSession
+
+    def get(self, stage):
+        s = self.sessions.get(stage.name)
+        if s is None:
+            s = self.factory(stage)
+            self.sessions[stage.name] = s
+        s.stage = stage
+        return s
+
+    def stop_all(self):
+        """Stop every live session; True when one was stopped."""
+        any_ = False
+        for s in list(self.sessions.values()):
+            if s.alive():
+                any_ = s.stop() or any_
+        return any_
+
+    def status(self, mod=None):
+        rows = [s.status() for n, s in sorted(self.sessions.items()) if mod in (None, n)]
+        first = next((r for r in rows if r["running"]), rows[0] if rows else None)
+        base = first or {"running": False, "pid": None, "jobs": 0, "startedAt": None, "mod": mod}
+        return dict(base, sessions=rows)
+
+
+WARMS = WarmRegistry()

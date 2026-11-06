@@ -15,6 +15,8 @@ import json
 import os
 import re
 import secrets
+import stat
+import subprocess
 import time
 from pathlib import Path
 
@@ -24,6 +26,7 @@ import wininput
 
 PICKER_TILE_SLATE = (946, 200)     # first recent-mod tile; measured at 125% DPI in a 1495x1078 px window
 PICKER_TILE_RATIO = (1183 / 1495, 250 / 1078)
+PICKER_TILE_PRIVATE = (489 / 1495, 250 / 1078)   # first (only) tile when the Documents redirect is on: the list is one column from x=425; measured live
 SETTINGS_SECTION = "[/Script/AbioticFactorEditorCooked.AbioticFactorModEditorSettings]"
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -127,6 +130,8 @@ def _picker_candidates(win):
         s = user32.GetDpiForWindow(win[0]) / 96.0
     except Exception:
         s = 1.0
+    if os.environ.get("ABF_PICKER_HOME", "1") != "0":
+        cands.append((left + PICKER_TILE_PRIVATE[0] * w, top + PICKER_TILE_PRIVATE[1] * h))
     cands.append((left + PICKER_TILE_SLATE[0] * s, top + PICKER_TILE_SLATE[1] * s))
     cands.append((left + PICKER_TILE_RATIO[0] * w, top + PICKER_TILE_RATIO[1] * h))
     return [(int(x), int(y)) for x, y in cands]
@@ -147,13 +152,114 @@ def _post_click_sequence(hwnd, wx, wy):
         time.sleep(0.4)
 
 
+_REGISTERED = re.compile(r"Registered mod plugin '([^']+)'")
+
+
+def registered_mods(log_text):
+    """Mod names the editor registered, in log order (one line per mounted mod)."""
+    out = []
+    for m in _REGISTERED.finditer(log_text or ""):
+        if m.group(1) not in out:
+            out.append(m.group(1))
+    return out
+
+
+def wrong_mount(log_text, mod):
+    """The first mod the picker mounted that is not `mod` (None when none or only `mod` was mounted)."""
+    for name in registered_mods(log_text):
+        if name != mod:
+            return name
+    return None
+
+
+def redirect_home(env):
+    """Point the editor's Documents folder (resolved from %USERPROFILE%) at a private empty one, so the Mod Browser
+    can only list the recent entry we write and never the user's own projects. ABF_PICKER_HOME=0 turns this off."""
+    if os.environ.get("ABF_PICKER_HOME", "1") == "0":
+        return env
+    home = headless.root() / "home"
+    (home / "Documents" / "Abiotic Factor Mods").mkdir(parents=True, exist_ok=True)
+    for sub, real in (("Local", env.get("LOCALAPPDATA")), ("Roaming", env.get("APPDATA"))):
+        _junction(home / "AppData" / sub, real)
+    env = dict(env)
+    env["USERPROFILE"] = str(home)
+    return env
+
+
+def _is_link(path):
+    """True for a symlink or a Windows junction (any reparse point), without following it."""
+    try:
+        st = os.lstat(str(path))
+    except OSError:
+        return False
+    return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & 0x400)      # FILE_ATTRIBUTE_REPARSE_POINT
+
+
+def remove_home(home=None):
+    """Remove the links redirect_home made (<runtime root>/home/AppData/{Local,Roaming}) and nothing else. Each one is a
+    junction to the user's REAL AppData folder, and with the default runtime root (inside %LOCALAPPDATA%) the Local link even
+    makes a directory cycle. So a recursive delete (shutil.rmtree on an old interpreter, PowerShell 5.1 Remove-Item -Recurse)
+    of the runtime root or of `home` could wipe the real AppData: call this first. os.rmdir on a junction removes only the
+    link and never looks inside. A link that cannot be removed is left and listed in the returned list of paths that are
+    still links, so the caller can refuse the recursive delete. Returns (removed, still_links)."""
+    home = Path(home) if home is not None else headless.root() / "home"
+    removed, still = [], []
+    for sub in ("Local", "Roaming"):
+        link = home / "AppData" / sub
+        if not _is_link(link):
+            continue
+        try:
+            os.rmdir(str(link))
+        except OSError:
+            try:
+                os.unlink(str(link))
+            except OSError:
+                still.append(str(link))
+                continue
+        removed.append(str(link))
+    return removed, still
+
+
+def _junction(link, target):
+    """AppData Local and Roaming of the private home point at the real ones: without them the editor stalls at startup
+    (after the Zen line, nothing more is logged) because the profile paths it resolves do not exist. Best effort.
+    The links are junctions to the REAL AppData: never delete <runtime root>/home recursively (see remove_home). With the
+    default runtime root inside %LOCALAPPDATA% the Local link makes a cycle (Local/<root>/home/AppData/Local/...)."""
+    link = Path(link)
+    if not target or not os.path.isdir(target) or link.exists():
+        return
+    link.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True, timeout=20, check=False)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _read_log(path):
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
 def run_editor(stage, job, timeout=420):
     """Run job['op'] (shots, audit, live_publish_test) in an editor on a hidden desktop. Same shape as
-    headless.run_commandlet, plus "shots": [png paths]."""
+    headless.run_commandlet, plus "shots": [png paths], "mounted": the mod the picker opened. When the picker opened a
+    different mod, the run fails with reason "picker mounted <other> ..." after one retry."""
+    out = _run_editor_once(stage, job, timeout)
+    if not out.get("ok") and str(out.get("error") or "").startswith("picker mounted "):
+        out = _run_editor_once(stage, job, timeout)
+    if out.get("ok"):
+        out["mounted"] = stage.name
+    return out
+
+
+def _run_editor_once(stage, job, timeout=420):
     exe = headless._exe()
     abfmods = sorted(stage.dir.glob("*.abfmod"))
     if not abfmods:
         raise headless.HeadlessError("the staged mod has no .abfmod file; the Mod Browser picker needs one to open it")
+    headless.WARMS.stop_all()       # a warm session shares -userdir and has the staged packages mounted (set_uplugin, strip_tooling)
     with headless.RunLock():
         run = headless.new_run(job["op"])
         job_path = run / "job.json"
@@ -163,7 +269,7 @@ def run_editor(stage, job, timeout=420):
         staging.set_uplugin(stage, "picker")
         userdir = str(headless.root() / "ud").replace("\\", "/")
         write_recent_mod(headless.root() / "ud", abfmods[0])
-        env = headless.child_env(run, job_path)
+        env = redirect_home(headless.child_env(run, job_path))
         env_block = "".join("%s=%s\0" % (k, v) for k, v in env.items()) + "\0"
         cmd = '"%s" -userdir=%s -nosplash -nopause "-ExecCmds=py %s" -abslog=%s' % (
             exe, userdir, str(run / "abf_job.py").replace("\\", "/"), log)
@@ -217,9 +323,15 @@ def run_editor(stage, job, timeout=420):
                             for _ in range(200):
                                 if (run / "mounted").exists() or kernel32.WaitForSingleObject(pi.hProcess, 0) == 0:
                                     break
+                                if wrong_mount(_read_log(log), stage.name):
+                                    break
                                 time.sleep(0.1)
-                            if (run / "mounted").exists():
+                            if (run / "mounted").exists() or wrong_mount(_read_log(log), stage.name):
                                 break
+                        other = wrong_mount(_read_log(log), stage.name)
+                        if other and not (run / "mounted").exists():
+                            picker_error = "picker mounted %s instead of %s" % (other, stage.name)
+                            break
                         if not (run / "mounted").exists() and kernel32.WaitForSingleObject(pi.hProcess, 0) != 0:
                             fail = run / "picker_fail.png"
                             try:
