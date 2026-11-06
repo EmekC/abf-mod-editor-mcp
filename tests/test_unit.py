@@ -602,10 +602,16 @@ class HeadlessTests(unittest.TestCase):
 # ---------------------------------------------------------------- staging
 
 class FakeEditor:
-    def __init__(self, state="closed", refused=None, real=None, missing=None, on_prepare=None, prepare_raises=None, detail=""):
+    def __init__(self, state="closed", refused=None, real=None, missing=None, on_prepare=None, prepare_raises=None, detail="",
+                 kept_loaded=None, reload_error=None, dirty_after=None, reason="modified assets", referencers=None,
+                 refused_referencers=None, compile_errors=None, skipped_dirty=None, dirty_published=None):
         self.st, self.refused, self.calls, self.real, self.missing = state, refused, [], real, missing
         self.on_prepare, self.prepare_raises, self.detail = on_prepare, prepare_raises, detail
+        self.kept_loaded, self.reload_error, self.dirty_after, self.reason = kept_loaded, reload_error, dirty_after, reason
+        self.referencers, self.refused_referencers, self.compile_errors = referencers, refused_referencers, compile_errors
+        self.skipped_dirty, self.dirty_published = skipped_dirty, dirty_published
         self.seen = {}
+        self.also_seen = []
 
     def state(self, mod):
         self.calls.append("state")
@@ -620,14 +626,20 @@ class FakeEditor:
         if self.real:
             self.seen["at_prepare"] = (self.real / "Content" / "A.uasset").read_bytes()
         if self.refused:
-            return {"refused": self.refused, "reason": "modified assets"}
-        return {"refused": []}
+            return {"refused": self.refused, "reason": self.reason, "refused_referencers": self.refused_referencers or []}
+        return {"refused": [], "kept_loaded": self.kept_loaded or [], "referencers": self.referencers or []}
 
-    def reload(self, packages):
+    def reload(self, packages, also=None):
         self.calls.append("reload")
+        self.also_seen.append(list(also or []))
         if self.real:
             self.seen["at_reload"] = (self.real / "Content" / "A.uasset").read_bytes()
-        return {"missing": self.missing or [], "loaded": packages}
+        out = {"missing": self.missing or [], "loaded": packages, "dirty_after": self.dirty_after or [],
+               "reloaded_referencers": list(also or []), "compile_errors": self.compile_errors or [], "compile_check": "editor log",
+               "skipped_dirty": self.skipped_dirty or [], "dirty_published": self.dirty_published or []}
+        if self.reload_error:
+            out["error"] = self.reload_error
+        return out
 
 
 def make_fake_mod(base):
@@ -778,7 +790,107 @@ class StagingTests(unittest.TestCase):
         self.assertEqual(r["refused"], "reload failed")
         self.assertTrue(r["restored"])
         self.assertEqual((self.real / "Content" / "A.uasset").read_bytes(), b"A-original" * 50)
-        self.assertEqual(ed.calls, ["state", "prepare", "reload", "reload"])
+        self.assertEqual(ed.calls, ["state", "prepare", "reload", "prepare", "reload"])
+
+    def test_live_kept_loaded_publishes_in_place(self):
+        self.stage_write("Content/A.uasset", b"edited")
+        ed = FakeEditor("open", real=self.real, kept_loaded=["/Fake/A"], dirty_after=["/Fake/Other"])
+        r = staging.publish(self.stage, ed, self.gate_ok)
+        self.assertEqual(r["route"], "live-reload")
+        self.assertEqual(r["reloaded_in_place"], ["/Fake/A"])
+        self.assertEqual(r["dirty_after"], ["/Fake/Other"])
+        self.assertEqual(ed.calls, ["state", "prepare", "reload"])
+        self.assertEqual((self.real / "Content" / "A.uasset").read_bytes(), b"edited")
+
+    def test_reload_error_restores(self):
+        self.stage_write("Content/A.uasset", b"edited")
+        ed = FakeEditor("open", real=self.real, reload_error="reload_packages: boom")
+        r = staging.publish(self.stage, ed, self.gate_ok)
+        self.assertEqual(r["refused"], "reload failed")
+        self.assertTrue(r["restored"])
+        self.assertEqual((self.real / "Content" / "A.uasset").read_bytes(), b"A-original" * 50)
+        self.assertEqual(ed.calls, ["state", "prepare", "reload", "prepare", "reload"])
+
+    @unittest.skipUnless(sys.platform == "win32", "needs Windows share modes")
+    def test_open_lock_after_prepare_refuses_and_reloads(self):
+        self.stage_write("Content/A.uasset", b"edited")
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.CreateFileW.restype = ctypes.c_void_p
+        k.CreateFileW.argtypes = [ctypes.c_wchar_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_void_p]
+        k.CloseHandle.argtypes = [ctypes.c_void_p]
+        held = []
+
+        def lock():
+            held.append(k.CreateFileW(str(self.real / "Content" / "A.uasset"), 0xC0000000, 0, None, 3, 0x80, None))
+
+        backups_before = sorted((staging.root() / "backups" / "Fake").glob("*")) if (staging.root() / "backups" / "Fake").exists() else []
+        ed = FakeEditor("open", on_prepare=lock)
+        try:
+            r = staging.publish(self.stage, ed, self.gate_ok)
+        finally:
+            for h in held:
+                k.CloseHandle(h)
+        self.assertEqual(r["refused"], "file locked")
+        self.assertEqual(r["editor"], "open")
+        self.assertEqual(ed.calls, ["state", "prepare", "reload"])
+        self.assertEqual((self.real / "Content" / "A.uasset").read_bytes(), b"A-original" * 50)
+        backups_after = sorted((staging.root() / "backups" / "Fake").glob("*")) if (staging.root() / "backups" / "Fake").exists() else []
+        self.assertEqual(backups_after, backups_before)
+
+    def test_refusal_message_names_the_reason(self):
+        self.stage_write("Content/A.uasset", b"edited")
+        r = staging.publish(self.stage, FakeEditor("open", refused=["/Fake/A"], reason="Play In Editor is running"), self.gate_ok)
+        self.assertEqual(r["refused"], "editor refused")
+        self.assertIn("Stop Play In Editor", r["message"])
+        r = staging.publish(self.stage, FakeEditor("open", refused=["/Fake/A"], reason="modified assets (unsaved changes)"), self.gate_ok)
+        self.assertIn("Save or revert", r["message"])
+        self.assertNotIn("Play In Editor", r["message"])
+
+    def test_referencers_are_reloaded_with_the_published_files(self):
+        self.stage_write("Content/A.uasset", b"edited")
+        ed = FakeEditor("open", real=self.real, kept_loaded=["/Fake/A"], referencers=["/Fake/Ref"])
+        r = staging.publish(self.stage, ed, self.gate_ok)
+        self.assertEqual(r["route"], "live-reload")
+        self.assertEqual(ed.also_seen, [["/Fake/Ref"]])
+        self.assertEqual(r["reloaded_referencers"], ["/Fake/Ref"])
+        self.assertIn("/Fake/Ref", r["message"])
+        self.assertEqual(r["compile_errors_after"], [])
+        self.assertEqual(ed.calls, ["state", "prepare", "reload"])
+
+    def test_dirty_edits_during_the_publish_are_reported_in_the_message(self):
+        self.stage_write("Content/A.uasset", b"edited")
+        ed = FakeEditor("open", real=self.real, kept_loaded=["/Fake/A"], referencers=["/Fake/Ref"],
+                        skipped_dirty=["/Fake/Ref"], dirty_published=["/Fake/A"])
+        r = staging.publish(self.stage, ed, self.gate_ok)
+        self.assertEqual(r["route"], "live-reload")
+        self.assertEqual(r["skipped_dirty"], ["/Fake/Ref"])
+        self.assertEqual(r["dirty_published"], ["/Fake/A"])
+        self.assertIn("NOT reloaded", r["message"])
+        self.assertIn("discarded", r["message"])
+        self.assertIn("that reference them were closed", r["message"])
+
+    def test_compile_errors_after_the_reload_are_reported_not_restored(self):
+        self.stage_write("Content/A.uasset", b"edited")
+        errs = [{"asset": "/Fake/Ref", "message": "cannot connect"}]
+        ed = FakeEditor("open", real=self.real, referencers=["/Fake/Ref"], compile_errors=errs)
+        r = staging.publish(self.stage, ed, self.gate_ok)
+        self.assertEqual(r["route"], "live-reload")
+        self.assertEqual(r["compile_errors_after"], errs)
+        self.assertIn("WARNING", r["message"])
+        self.assertIn("cannot connect", r["message"])
+        self.assertEqual((self.real / "Content" / "A.uasset").read_bytes(), b"edited")
+        self.assertEqual(ed.calls, ["state", "prepare", "reload"])
+
+    def test_unsaved_referencer_refuses_up_front(self):
+        self.stage_write("Content/A.uasset", b"edited")
+        ed = FakeEditor("open", real=self.real, refused=["/Fake/Ref"], refused_referencers=["/Fake/Ref"],
+                        reason="modified assets (unsaved changes)")
+        r = staging.publish(self.stage, ed, self.gate_ok)
+        self.assertEqual(r["refused"], "editor refused")
+        self.assertIn("/Fake/Ref", r["message"])
+        self.assertIn("reference the published ones", r["message"])
+        self.assertIn("Save or revert", r["message"])
+        self.assertEqual((self.real / "Content" / "A.uasset").read_bytes(), b"A-original" * 50)
 
     @unittest.skipUnless(sys.platform == "win32", "needs Windows share modes")
     def test_lock_probe_refuses(self):
@@ -966,6 +1078,28 @@ class StagingTests(unittest.TestCase):
 class LiveEditorTests(unittest.TestCase):
     def make(self, procs, run_json):
         return headless_tools.LiveEditor(run_json, (RuntimeError,), "STATUS", "Fake", None, procs)
+
+    def test_compile_errors_are_read_from_the_log_written_since_the_reload(self):
+        tmp = Path(tempfile.mkdtemp(prefix="abflog"))
+        self.addCleanup(shutil.rmtree, str(tmp), True)
+        log = tmp / "Editor.log"
+        log.write_text("LogBlueprint: Error: [AssetLog] C:\\Old\\Mods\\ModX\\Content\\Sub\\BP_B.uasset: [Compiler] old\n",
+                       encoding="utf-8")
+
+        def run_json(code, args, timeout=None):
+            with open(log, "a", encoding="utf-8") as f:
+                f.write("LogBlueprint: Error: [AssetLog] C:\\Mods\\ModX\\Content\\Sub\\BP_B.uasset: [Compiler] cannot connect\n" * 3)
+                f.write("LogBlueprint: Error: [AssetLog] C:\\Mods\\ModX\\Content\\Sub\\BP_Unrelated.uasset: [Compiler] other\n")
+                f.write("LogTemp: Warning: not an error\n")
+            return {"loaded": ["/ModX/Sub/BP_A"], "missing": []}
+        ed = headless_tools.LiveEditor(run_json, (RuntimeError,), "STATUS", "ModX", None, lambda: [], log_path=log, log_wait=0)
+        out = ed.reload(["/ModX/Sub/BP_A"], ["/ModX/Sub/BP_B"])
+        self.assertEqual(out["compile_errors"], [{"asset": "/ModX/Sub/BP_B", "message": "cannot connect"}])
+        self.assertEqual(out["compile_check"], "editor log")
+        ed.log_path = tmp / "missing.log"
+        out = ed.reload(["/ModX/Sub/BP_A"])
+        self.assertEqual(out["compile_errors"], [])
+        self.assertIn("could not be read", out["compile_check"])
 
     def test_no_process_is_closed_and_nothing_is_called(self):
         called = []
@@ -1509,6 +1643,123 @@ class ReadbackTests(unittest.TestCase):
         self.assertTrue(out["items"][0]["default_scene_root"])
         self.assertTrue(out["items"][2]["inherited"])
         self.assertFalse(out["items"][1]["inherited"])
+
+
+class SelfEventCallTests(unittest.TestCase):
+    """bpkit.graphs / bpkit.apply with a stubbed `unreal`: a self call to a custom event the same spec adds."""
+    MODS = ("core", "assets", "graphs", "apply")
+    CLS = "/Script/Engine.BlueprintGeneratedClass'/Mod/BP_X.BP_X_C'"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.fake = types.ModuleType("unreal")
+        cls.fake.__getattr__ = lambda name: mock.MagicMock(name="unreal." + name)
+        cls.patch = mock.patch.dict(sys.modules, {"unreal": cls.fake})
+        cls.patch.start()
+        for n in cls.MODS:
+            sys.modules.pop("bpkit." + n, None)
+        import bpkit
+        cls.pkg = bpkit
+        cls.saved_attrs = {n: getattr(bpkit, n) for n in cls.MODS if hasattr(bpkit, n)}
+        cls.core = importlib.import_module("bpkit.core")
+        cls.graphs = importlib.import_module("bpkit.graphs")
+        cls.apply = importlib.import_module("bpkit.apply")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.patch.stop()
+        for n in cls.MODS:
+            sys.modules.pop("bpkit." + n, None)
+            if hasattr(cls.pkg, n):
+                delattr(cls.pkg, n)
+        for n, v in cls.saved_attrs.items():
+            setattr(cls.pkg, n, v)
+
+    def test_make_templates_writes_custom_events(self):
+        g = self.graphs
+        written = []
+        export = ('   Begin Object Name="T_n0"\n      FunctionReference=(MemberName="NewEv",bSelfContext=True,MemberGuid=0123ABCD)\n'
+                  '      NodePosX=0\n   End Object\n')
+        items = {"n0": ("/Script/BlueprintGraph.K2Node_CallFunction", ['FunctionReference=(MemberName="NewEv",bSelfContext=True)'])}
+        with mock.patch.object(g, "write_graph", lambda graph, defs: written.extend(defs)), \
+                mock.patch.object(g, "_rebuild_scratch_pins"), mock.patch.object(g.core, "tools"), \
+                mock.patch.object(g.core, "export_text", return_value=export):
+            out = g.make_templates(items, (), (), [("NewEv", [{"name": "Count", "type": "int"}])])
+        self.assertEqual([d[1] for d in written], ["T_n0", "E_0"])
+        cls, _name, lines = written[1]
+        self.assertTrue(cls.endswith("K2Node_CustomEvent"))
+        self.assertIn('CustomFunctionName="NewEv"', lines)
+        self.assertTrue(any('PinName="Count"' in l for l in lines))
+        self.assertTrue(any(l.startswith("NodeGuid=") for l in lines))
+        self.assertEqual(list(out), ["n0"])
+        self.assertEqual(out["n0"][0], 'FunctionReference=(MemberName="NewEv",bSelfContext=True,MemberGuid=0123ABCD)')
+
+    def _apply(self, nodes):
+        a, g = self.apply, self.graphs
+        seen = {}
+
+        class FakeEnv:
+            def __init__(self, bp):
+                self.timeline_guids = {}
+
+            def class_text(self, path):
+                return path
+
+            def self_class_text(self):
+                return SelfEventCallTests.CLS
+
+        bp = mock.MagicMock()
+        bp.get_class.return_value.get_name.return_value = "Blueprint"
+        bp.__str__ = lambda self: "Blueprint'/Mod/BP_X.BP_X'"
+
+        def make_templates(items, svars, setups, self_events=()):
+            seen["items"], seen["self_events"] = dict(items), list(self_events)
+            return {k: ["FunctionReference=(MemberName=\"NewEv\",bSelfContext=True,MemberGuid=0123ABCD)"] if "bSelfContext" in b[0]
+                    else ["FunctionReference=(MemberParent=\"x\",MemberName=\"Other\")"] for k, (c, b) in items.items()}
+
+        def edit_graph(bp_, graph, edit, templates, ctx):
+            seen["templates"] = dict(templates)
+            return {}
+
+        spec = {"asset": "/Mod/BP_X", "graphs": [{"graph": "EventGraph", "add": nodes, "wires": []}]}
+        with mock.patch.object(a, "_resolve", return_value=(bp, False)), mock.patch.object(a, "Env", FakeEnv), \
+                mock.patch.object(a.assets, "variable_lines", return_value=[]), mock.patch.object(a.assets, "component_vars", return_value=[]), \
+                mock.patch.object(a.core, "gen_class_text", return_value=self.CLS), mock.patch.object(a.core, "export_text", return_value=""), \
+                mock.patch.object(a.graphs, "make_templates", make_templates), mock.patch.object(a.graphs, "edit_graph", edit_graph), \
+                mock.patch.object(a.graphs, "find_graph"):
+            a.apply_asset(spec, "Mod")
+        return seen
+
+    def test_apply_templates_self_call_to_new_event(self):
+        seen = self._apply([
+            {"id": "e", "k": "event", "name": "NewEv", "params": [{"name": "Count", "type": "int"}]},
+            {"id": "c1", "k": "call", "function": "NewEv"},
+            {"id": "c2", "k": "call", "function": "Other"},
+        ])
+        self.assertEqual(seen["self_events"], [("NewEv", [{"name": "Count", "type": "int"}])])
+        bodies = {k: b for k, (c, b) in seen["items"].items()}
+        self.assertTrue(any(b == ['FunctionReference=(MemberName="NewEv",bSelfContext=True)'] for b in bodies.values()))
+        self.assertTrue(any(b == ['FunctionReference=(MemberParent="%s",MemberName="Other")' % self.CLS] for b in bodies.values()))
+        t = seen["templates"]
+        self.assertEqual(t[("graph:0", "c1")], ['FunctionReference=(MemberName="NewEv",bSelfContext=True)'])   # MemberGuid stripped
+        self.assertEqual(t[("graph:0", "c2")], ['FunctionReference=(MemberParent="x",MemberName="Other")'])   # not self: untouched
+
+    def test_wiring_error_names_the_spec(self):
+        g = self.graphs
+        model = GraphModel()
+        model.add(GraphNode.from_export("/Script/BlueprintGraph.K2Node_CustomEvent", "K2Node_CustomEvent_0", [
+            "NodePosX=0", t3d.pin_line("then", "exec", "out", pin_id="AAAA0001")]))
+        model.add(GraphNode.from_export("/Script/BlueprintGraph.K2Node_CallFunction", "K2Node_CallFunction_0", ["NodePosX=0"]))
+        graph = mock.MagicMock()
+        graph.get_name.return_value = "EventGraph"
+        with mock.patch.object(g, "load_graph_model", return_value=model), mock.patch.object(g, "write_graph"):
+            with self.assertRaises(SpecError) as cm:
+                g.edit_graph(mock.MagicMock(), graph, {"wires": [["K2Node_CustomEvent_0.then", "K2Node_CallFunction_0.execute"]]}, {}, {})
+        self.assertIn("[spec:K2Node_CallFunction_0]", str(cm.exception))
+        self.assertIn("no pin 'execute'", str(cm.exception))
+
+    def test_feature_is_advertised(self):
+        self.assertIn("self_event_calls", specs.FEATURES)
 
 
 class BpReadToolTests(unittest.TestCase):
