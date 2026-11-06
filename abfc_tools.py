@@ -1,7 +1,8 @@
 """Opt-in tools for abfc (https://github.com/EmekC/abf-mod-editor-mcp, see ABFC.md). Registered by server.py only when
 ABF_ABFC_TOOLS=1. build() returns tuples in server.TOOLS form: (name, fn, description, properties, required).
 
-Two tools: abfc_extensions (host only, no editor) and reflect (hidden commandlet on the staging copy, read only).
+Three tools: abfc_extensions (host only, no editor), reflect (hidden commandlet on the staging copy, read only) and
+warm_session (start, stop or inspect the long-lived hidden commandlet that serves commandlet jobs when ABF_WARM_SESSION=1).
 backend_info is not defined here; abfc reads it from the backend when the backend has it.
 """
 import json
@@ -72,6 +73,25 @@ def build(server_version):
                      "counts": counts,
                      "filter": {"content_version": meta.get("content_version"), "rules": [[v, k] for k, v in sorted(rules.items())]}})
 
+    def t_warm_session(args):
+        action = args.get("action")
+        if action not in ("start", "stop", "status"):
+            return _out({"error": "action must be start, stop or status"})
+        if not headless.warm_enabled():
+            return _out({"error": "warm sessions are off: start the server with ABF_WARM_SESSION=1", "running": False})
+        mod = args.get("mod")
+        try:
+            if action == "start":
+                if not mod:
+                    return _out({"error": "start needs mod (the staged mod to keep a warm editor for)"})
+                return _out(headless.WARMS.get(staging.load(mod)).start())
+            if action == "stop":
+                stopped = headless.WARMS.stop_all()
+                return _out(dict(headless.WARMS.status(mod), stopped=stopped))
+            return _out(headless.WARMS.status(mod))
+        except headless.HeadlessError as e:
+            return _out({"error": str(e), "running": False})
+
     return [
         ("abfc_extensions", t_abfc_extensions,
          "Read-only, needs no editor: abfc extension features of this server (enabled with ABF_ABFC_TOOLS=1).",
@@ -80,4 +100,9 @@ def build(server_version):
          "Read-only, hidden editor on the staging copy: enumerate functions, properties, struct fields, ancestors and cast pins of classes "
          "(/Script, /Game, mod) into <run>/reflect.json, and return the Blueprint filter rules. Never loads /Game assets as assets.",
          {"mod": STR, "classes": STR_LIST, "structs": STR_LIST, "cast_targets": STR_LIST, "timeout_seconds": NUM}, ["mod", "classes"]),
+        ("warm_session", t_warm_session,
+         "Start, stop or inspect the warm session: one hidden commandlet kept alive on the staging copy that serves bp_apply, bp_read, "
+         "bp_compile_report and reflect without a new editor start per call (needs ABF_WARM_SESSION=1). Returns {running, pid, jobs, startedAt}. "
+         "bp_game_test, mod_audit and hidden_editor_shot always run cold and stop a running session first (they share its -userdir).",
+         {"action": {"type": "string", "enum": ["start", "stop", "status"]}, "mod": STR}, ["action"]),
     ]
