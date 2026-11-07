@@ -114,6 +114,17 @@ def _preload(env, node):
 def apply_asset(spec, mod, index=0):
     path = spec["asset"]
     report = {"asset": path, "created": False, "node_ids": {}, "nodes": 0, "links": 0}
+    if (spec.get("create") or {}).get("class") == "UserDefinedStruct":
+        # no Blueprint compile, no export of nodes; the object is None when an identical struct already exists
+        from . import structs
+        if unreal.EditorAssetLibrary.does_asset_exist(path) and not spec["create"].get("if_missing"):
+            raise RuntimeError("%s already exists; pass create.if_missing to check it" % path)
+        obj, info = structs.set_fields(path, spec["struct_fields"])
+        report.update(info)
+        report["created"] = obj is not None
+        if obj is not None:
+            report["object_path"] = pth(obj)
+        return report, obj
     bp, created = _resolve(spec, mod)
     report["created"] = created
     env = Env(bp)

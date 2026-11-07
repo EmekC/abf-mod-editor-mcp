@@ -1084,6 +1084,30 @@ class StageAuditPickerTests(unittest.TestCase):
         self.assertIsNone(self.hd.wrong_mount(only, "TestModXyz34"))
         self.assertIsNone(self.hd.wrong_mount("", "TestModXyz34"))
 
+    def test_login_stuck_needs_a_login_window_and_no_mod_browser(self):
+        ls = self.hd.login_stuck
+        self.assertEqual(ls([], None, 100.0, 60), (None, False))
+        self.assertEqual(ls(["Unreal Editor"], None, 100.0, 60), (None, False))
+        self.assertEqual(ls(["Unreal Editor"], 50.0, 100.0, 60), (None, False))      # state ended: the clock restarts
+
+    def test_login_stuck_first_sighting_then_grace(self):
+        ls = self.hd.login_stuck
+        self.assertEqual(ls(["Logging In"], None, 100.0, 60), (100.0, False))
+        self.assertEqual(ls(["Logging In"], 100.0, 159.0, 60), (100.0, False))
+        self.assertEqual(ls(["Logging In"], 100.0, 160.0, 60), (100.0, True))
+        self.assertEqual(ls(["Logging In"], 100.0, 500.0, 60), (100.0, True))
+        self.assertEqual(ls(["Logging In"], None, 100.0, 0), (100.0, True))
+
+    def test_login_stuck_resets_when_the_mod_browser_shows(self):
+        ls = self.hd.login_stuck
+        self.assertEqual(ls(["Logging In", "Mod Browser"], 100.0, 500.0, 60), (None, False))
+
+    def test_login_stuck_is_case_insensitive_and_ignores_other_titles(self):
+        ls = self.hd.login_stuck
+        self.assertEqual(ls(["", "Epic Games - LOGGING IN...", "AbioticFactor"], 10.0, 100.0, 60), (10.0, True))
+        self.assertEqual(ls(["", "mod browser", "logging in"], 10.0, 100.0, 60), (None, False))
+        self.assertEqual(ls(["", None, "x"], None, 5.0, 60), (None, False))
+
     def test_redirect_home_points_userprofile_at_a_private_documents_folder(self):
         with mock.patch.dict(os.environ, {"ABF_PICKER_HOME": "1"}):
             env = self.hd.redirect_home({"USERPROFILE": "C:\\real", "LOCALAPPDATA": "x"})
