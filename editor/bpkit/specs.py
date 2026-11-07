@@ -114,10 +114,13 @@ REQUIRED = {
     "timeline": ("name",), "message": ("function", "interface"), "macro": ("name", "inputs", "outputs"),
     "node": ("class", "props"),
 }
-CREATE_CLASSES = ("Blueprint", "WidgetBlueprint", "BlueprintInterface")
+CREATE_CLASSES = ("Blueprint", "WidgetBlueprint", "BlueprintInterface", "UserDefinedStruct")
 RAW_KINDS = ("graph", "tree", "tree_replace", "python")
 # bp_apply features reported by the backend_info tool
-FEATURES = ("cast_object_pin", "map_types", "pin_types", "self_event_calls")
+FEATURES = ("cast_object_pin", "map_types", "pin_types", "self_event_calls", "set_types", "struct_fields")
+# keys that make no sense on a UserDefinedStruct asset
+_STRUCT_FORBIDDEN_KEYS = ("variables", "remove_variables", "components", "dispatchers", "timelines", "widget_tree", "animations",
+                          "macros", "functions", "remove_functions", "interfaces", "graphs", "raw")
 _FORBIDDEN_CODE = tuple("delete_" + n for n in ("asset", "directory", "loaded_asset")) + ("reparent_" + "blueprint", "rename_asset")
 
 
@@ -137,6 +140,39 @@ def _check_params(problems, where, items):
             problems.append("%s[%d] needs name and type" % (where, i))
         else:
             _check_type(problems, "%s[%d] (%s)" % (where, i, p["name"]), p["type"])
+
+
+def check_struct_fields(w, a):
+    """Problems of a UserDefinedStruct asset spec: create.class UserDefinedStruct with struct_fields (and nothing else)."""
+    problems = []
+    fields = a.get("struct_fields")
+    if not isinstance(fields, list) or not fields:
+        return [w + ": a UserDefinedStruct needs struct_fields: [{name, friendly, guid, type}, ...] (at least one)"]
+    for key in _STRUCT_FORBIDDEN_KEYS:
+        if a.get(key):
+            problems.append("%s: a UserDefinedStruct cannot have %r" % (w, key))
+    seen = set()
+    for i, f in enumerate(fields):
+        fw = "%s.struct_fields[%d]" % (w, i)
+        if not isinstance(f, dict) or not all(isinstance(f.get(k), str) and f.get(k) for k in ("name", "friendly", "guid", "type")):
+            problems.append(fw + " needs name, friendly, guid and type (strings)")
+            continue
+        m = t3d.STRUCT_MEMBER_RX.match(f["name"])
+        if not m:
+            problems.append("%s: name %r must be <Field>_<index>_<32 hex GUID> (upper case)" % (fw, f["name"]))
+        else:
+            if m.group(3) != f["guid"]:
+                problems.append("%s: guid %r is not the 32-hex suffix of the name %r" % (fw, f["guid"], f["name"]))
+            if m.group(1) != f["friendly"]:
+                problems.append("%s: friendly %r is not the field part of the name %r" % (fw, f["friendly"], f["name"]))
+        if f["name"] in seen:
+            problems.append("%s: duplicate name %r" % (fw, f["name"]))
+        seen.add(f["name"])
+        try:
+            t3d.struct_var_line(f)
+        except SpecError as e:
+            problems.append("%s (%s): %s" % (fw, f["name"], e))
+    return problems
 
 
 def _find_key(obj, key):
@@ -240,6 +276,12 @@ def validate(batch, mod):
         if create is not None:
             if not isinstance(create, dict) or create.get("class") not in CREATE_CLASSES:
                 problems.append("%s.create.class must be one of %s" % (w, "|".join(CREATE_CLASSES)))
+        is_struct = isinstance(create, dict) and create.get("class") == "UserDefinedStruct"
+        if is_struct:
+            problems.extend(check_struct_fields(w, a))
+            continue
+        if "struct_fields" in a:
+            problems.append(w + ": struct_fields is only valid with create.class UserDefinedStruct")
         for i, v in enumerate(a.get("variables") or []):
             if not isinstance(v, dict) or not v.get("name") or "type" not in v:
                 problems.append("%s.variables[%d] needs name and type" % (w, i))

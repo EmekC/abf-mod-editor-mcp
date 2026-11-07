@@ -11,17 +11,18 @@ from .core import CFG, LIB, must, pth, addr, rd
 
 FACTORIES = {"Blueprint": ("BlueprintFactory", "Blueprint", "/Script/Engine.Actor"),
              "WidgetBlueprint": ("WidgetBlueprintFactory", "WidgetBlueprint", "/Script/UMG.UserWidget"),
-             "BlueprintInterface": ("BlueprintInterfaceFactory", "Blueprint", "/Script/CoreUObject.Object")}
+             "BlueprintInterface": ("BlueprintInterfaceFactory", "Blueprint", "/Script/CoreUObject.Object"),
+             "UserDefinedStruct": ("StructureFactory", "UserDefinedStruct", None)}
 
 
 def new_asset(path, create):
-    """create = {"class": Blueprint|WidgetBlueprint|BlueprintInterface, "parent": class path, "if_missing": bool}."""
+    """create = {"class": Blueprint|WidgetBlueprint|BlueprintInterface|UserDefinedStruct, "parent": class path, "if_missing": bool}."""
     kind = create["class"]
     if kind not in FACTORIES:
         raise RuntimeError("cannot create a %s" % kind)
     fac_name, asset_cls, default_parent = FACTORIES[kind]
     fac = getattr(unreal, fac_name)()
-    if kind != "BlueprintInterface":
+    if kind not in ("BlueprintInterface", "UserDefinedStruct"):
         parent = must(unreal.load_class(None, create.get("parent") or default_parent), "parent class " + str(create.get("parent")))
         fac.set_editor_property("parent_class", parent)
     folder, name = path.rsplit("/", 1)

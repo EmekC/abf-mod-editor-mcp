@@ -110,8 +110,70 @@ class T3dTests(unittest.TestCase):
             with self.assertRaises(SpecError, msg=repr(bad)):
                 t3d.parse_type(bad)
 
+    def test_set_type(self):
+        s = t3d.parse_type("set:name")
+        self.assertEqual((s["cat"], s["container"], s.get("value")), ("name", "Set", None))
+        self.assertEqual(t3d.parse_type("set:real")["sub"], "double")
+        v = t3d.var_line("Tags", "set:name", guid="G")
+        self.assertIn('VarType=(PinCategory="name",ContainerType=Set)', v)
+        self.assertIn("PinType.ContainerType=Set", t3d.pin_line("S", "set:int"))
+        self.assertIn('PinType.PinValueType=(),PinType.ContainerType=Set', t3d.pin_line("S", "set:int"))
+        for bad in ("set:array:int", "set:exec", "set:", "set:object:/Script/Engine.Actor", "set:map:name:int", "set:banana"):
+            with self.assertRaises(SpecError, msg=repr(bad)):
+                t3d.parse_type(bad)
+
+    G1, G2 = "A" * 32, "0123456789ABCDEF0123456789ABCDEF"
+
+    def _sf(self, name, type_, guid):
+        field, idx = name, 0
+        return {"name": "%s_%d_%s" % (field, idx, guid), "friendly": field, "guid": guid, "type": type_}
+
+    def test_struct_var_line_types(self):
+        cases = {
+            "int": ('Category="int"', "0"), "int64": ('Category="int64"', "0"), "bool": ('Category="bool"', "False"),
+            "float": ('Category="real",SubCategory="float"', "0.0"), "double": ('Category="real",SubCategory="double"', "0.0"),
+            "name": ('Category="name"', "None"), "string": ('Category="string"', ""), "text": ('Category="text"', ""),
+            "byte": ('Category="byte"', "0"),
+            "object:/Script/Engine.Actor": ('Category="object",SubCategoryObject="/Script/Engine.Actor"', "None"),
+            "class:/Script/Engine.Actor": ('Category="class",SubCategoryObject="/Script/Engine.Actor"', "None"),
+            "struct:/Script/CoreUObject.Vector": ('Category="struct",SubCategoryObject="/Script/CoreUObject.Vector"', ""),
+            "struct:/TestMod/S_X.S_X": ('Category="struct",SubCategoryObject="/TestMod/S_X.S_X"', ""),
+            "enum:/Script/Engine.ETimelineDirection": ('Category="byte",SubCategoryObject="/Script/Engine.ETimelineDirection"', ""),
+        }
+        for typ, (attrs, default) in cases.items():
+            f = {"name": "F_0_" + self.G1, "friendly": "F", "guid": self.G1, "type": typ}
+            self.assertEqual(t3d.struct_var_line(f), '(VarName="F_0_%s",VarGuid=%s,FriendlyName="F",DefaultValue="%s",%s,CurrentDefaultValue="%s")'
+                             % (self.G1, self.G1, default, attrs, default), typ)
+        f = {"name": "F_0_" + self.G1, "friendly": "F", "guid": self.G1, "type": "object:/TestMod/BP_X"}
+        self.assertIn('SubCategoryObject="/TestMod/BP_X.BP_X_C"', t3d.struct_var_line(f))
+        for bad in ("array:int", "map:name:int", "set:int", "exec", "banana"):
+            with self.assertRaises(SpecError, msg=bad):
+                t3d.struct_var_line({"name": "F_0_" + self.G1, "friendly": "F", "guid": self.G1, "type": bad})
+
+    def test_struct_signature(self):
+        fields = [self._sf("Count", "int", self.G1), dict(self._sf("Label", "name", self.G2), name="Label_1_" + self.G2),
+                  dict(self._sf("Ratio", "float", self.G2), name="Ratio_2_" + self.G2)]
+        lines = [t3d.struct_var_line(f) for f in fields]
+        sig = t3d.struct_signature("\n".join(lines))
+        self.assertEqual([n for n, _ in sig], ["Count_0_" + self.G1, "Label_1_" + self.G2, "Ratio_2_" + self.G2])
+        self.assertEqual(sig[2][1], "Category=real;SubCategory=float;Object=")
+        # an engine export (indented VariablesDescriptions lines, other attributes, noise around) gives the same signature
+        export = "Begin Object Class=/Script/UnrealEd.UserDefinedStructEditorData Name=\"E\"\n" + "".join(
+            "      VariablesDescriptions(%d)=%s\n" % (i, l.replace('DefaultValue=""', 'DefaultValue="0"')) for i, l in enumerate(lines)) + \
+            "      Status=UDSS_UpToDate\n   End Object\n"
+        self.assertEqual(t3d.struct_signature(export), sig)
+        # a different type, name or order is a different signature
+        self.assertNotEqual(t3d.struct_signature("\n".join(lines[:2])), sig)
+        self.assertNotEqual(t3d.struct_signature("\n".join(reversed(lines))), sig)
+        other = dict(fields[0], type="int64")
+        self.assertNotEqual(t3d.struct_signature(t3d.struct_var_line(other)), t3d.struct_signature(lines[0]))
+        obj = dict(fields[0], type="object:/Script/Engine.Actor")
+        engine_form = t3d.struct_var_line(obj).replace('SubCategoryObject="/Script/Engine.Actor"', "SubCategoryObject=Class'\"/Script/Engine.Actor\"'")
+        self.assertEqual(t3d.struct_signature(engine_form), t3d.struct_signature(t3d.struct_var_line(obj)))
+        self.assertEqual(t3d.struct_signature("nothing here"), [])
+
     def test_type_refusals(self):
-        for bad in ("struct:", "struct", "object:", "set:int", "map:int", "array:array:int", "banana", "", None):
+        for bad in ("struct:", "struct", "object:", "map:int", "array:array:int", "banana", "", None):
             with self.assertRaises(SpecError, msg=repr(bad)):
                 t3d.parse_type(bad)
 
@@ -307,6 +369,15 @@ class T3dTests(unittest.TestCase):
         self.assertFalse(n.pin("TargetArray").is_wildcard())
         n.link("TargetArray", "X", "1")
         self.assertEqual(n.pin("TargetArray").links(), [("X", "1")])
+
+    def test_resolve_wildcard_set(self):
+        wild_set = WILD_MAP.replace('PinName="TargetMap"', 'PinName="TargetSet"').replace(
+            'PinType.PinValueType=(TerminalCategory="wildcard"),PinType.ContainerType=Map', 'PinType.PinValueType=(),PinType.ContainerType=Set')
+        n = GraphNode.from_template("/Script/BlueprintGraph.K2Node_CallFunction", "K2Node_CallFunction_9002", [wild_set, WILD_ONE], (0, 0))
+        n.resolve_wildcard("TargetSet", t3d.parse_type("set:name"))
+        self.assertIn('PinType.PinCategory="name",PinType.PinSubCategory="",PinType.PinSubCategoryObject=None,'
+                      'PinType.PinSubCategoryMemberReference=(),PinType.PinValueType=(),PinType.ContainerType=Set',
+                      n.pin("TargetSet").text)
 
     def test_resolve_wildcard_map_and_object(self):
         n = GraphNode.from_template("/Script/BlueprintGraph.K2Node_CallFunction", "K2Node_CallFunction_9001", [WILD_MAP, WILD_ONE], (0, 0))
@@ -510,12 +581,49 @@ class SpecTests(unittest.TestCase):
         self.assertTrue(any("unknown node id" in p for p in self.problems(lambda a: a["functions"][0]["wires"].append(["zz.then", "s.execute"]))))
         self.assertTrue(any("not \"id.pin\"" in p for p in self.problems(lambda a: a["functions"][0]["wires"].append(["zz", "s.execute"]))))
         self.assertTrue(any("struct" in p for p in self.problems(lambda a: a["variables"].append({"name": "V", "type": "struct:"}))))
-        self.assertTrue(any("set types" in p or "set" in p for p in self.problems(lambda a: a["variables"].append({"name": "V", "type": "set:int"}))))
+        self.assertTrue(any("set" in p for p in self.problems(lambda a: a["variables"].append({"name": "V", "type": "set:array:int"}))))
+        self.assertEqual([p for p in self.problems(lambda a: a["variables"].append({"name": "V", "type": "set:int"})) if "set" in p], [])
 
     def test_create_class_and_missing_keys(self):
         self.assertTrue(any("create.class" in p for p in self.problems(lambda a: a["create"].update({"class": "Material"}))))
         self.assertTrue(any("needs 'function'" in p
                             for p in self.problems(lambda a: a["graphs"][0]["add"].append({"id": "q", "k": "call"}))))
+
+    UDS = {"assets": [{"asset": "/Mod/Folder/S_X", "create": {"class": "UserDefinedStruct", "if_missing": True},
+                       "struct_fields": [{"name": "Count_0_" + "A" * 32, "friendly": "Count", "guid": "A" * 32, "type": "int"},
+                                         {"name": "Label_1_" + "B" * 32, "friendly": "Label", "guid": "B" * 32, "type": "name"}]}]}
+
+    def uds_problems(self, mutate):
+        batch = json.loads(json.dumps(self.UDS))
+        mutate(batch["assets"][0])
+        return specs.validate(batch, "Mod")
+
+    def test_struct_fields_spec(self):
+        self.assertEqual(specs.validate(self.UDS, "Mod"), [])
+        self.assertIn("struct_fields", specs.FEATURES)
+        self.assertIn("UserDefinedStruct", specs.CREATE_CLASSES)
+
+        def field(**kw):
+            def m(a):
+                a["struct_fields"][0].update(kw)
+            return m
+        for bad in ("Count", "Count_0", "Count_0_" + "a" * 32, "Count_x_" + "A" * 32, "0Count_0_" + "A" * 32, "Count_0_" + "A" * 31):
+            self.assertTrue(self.uds_problems(field(name=bad)), bad)
+        self.assertTrue(any("guid" in p for p in self.uds_problems(field(guid="C" * 32))))
+        self.assertTrue(any("friendly" in p for p in self.uds_problems(field(friendly="Other"))))
+        self.assertTrue(any("duplicate" in p for p in self.uds_problems(lambda a: a["struct_fields"].append(dict(a["struct_fields"][0])))))
+        for t in ("array:int", "map:name:int", "set:name", "exec", "banana"):
+            self.assertTrue(self.uds_problems(field(type=t)), t)
+        self.assertTrue(self.uds_problems(lambda a: a.update(struct_fields=[])))
+        self.assertTrue(self.uds_problems(lambda a: a.pop("struct_fields")))
+        self.assertTrue(self.uds_problems(lambda a: a["struct_fields"][1].pop("friendly")))
+        self.assertTrue(any("variables" in p for p in self.uds_problems(lambda a: a.update(variables=[{"name": "V", "type": "int"}]))))
+        self.assertTrue(any("graphs" in p for p in self.uds_problems(lambda a: a.update(graphs=[{"graph": "EventGraph"}]))))
+        self.assertTrue(any("raw" in p for p in self.uds_problems(lambda a: a.update(raw=[{"kind": "python", "code": "pass"}]))))
+
+    def test_struct_fields_need_uds_create(self):
+        fields = self.UDS["assets"][0]["struct_fields"]
+        self.assertTrue(any("struct_fields" in p for p in self.problems(lambda a: a.update(struct_fields=fields))))
 
     def test_raw_python_guard(self):
         self.assertTrue(any("delete_asset" in p for p in self.problems(lambda a: a.update(raw=[{"kind": "python", "code": "unreal.EditorAssetLibrary.delete_asset('x')"}]))))
@@ -1957,6 +2065,7 @@ class StdioSmokeTests(unittest.TestCase):
         self.assertEqual(info["protocol"], 1)
         self.assertIs(info["capabilities"]["pinTypes"], True)
         self.assertIs(info["capabilities"]["containerTypes"]["map"], True)
+        self.assertIs(info["capabilities"]["containerTypes"]["set"], True)
         self.assertIn("pin_types", info["bpApply"]["features"])
         self.assertEqual(os.path.normcase(info["headlessDir"]), os.path.normcase(_TMP))
         self.assertTrue(replies[3]["result"]["isError"])
