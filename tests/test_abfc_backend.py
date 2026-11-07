@@ -35,6 +35,7 @@ def tearDownModule():
 
 import abfc_tools  # noqa: E402
 import headless  # noqa: E402
+import paths  # noqa: E402
 from bpkit import reflectparse  # noqa: E402
 
 
@@ -94,6 +95,8 @@ class ToolTableTests(unittest.TestCase):
         self.assertEqual(reflect[4], ["mod", "classes"])
         for k in ("classes", "structs", "cast_targets"):
             self.assertEqual(reflect[3][k]["type"], "array")
+        self.assertEqual(reflect[3]["meta"]["type"], "boolean")
+        self.assertNotIn("meta", reflect[4])
         self.assertEqual(tools[0][3], {})
 
     def test_abfc_extensions_shape(self):
@@ -855,13 +858,16 @@ class WarmEditorSideTests(unittest.TestCase):
 
 
 class BackendInfoCapabilityTests(unittest.TestCase):
-    def capabilities(self, warm):
+    def capabilities(self, warm, abfc_tools=False):
         reqs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
                 {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "backend_info", "arguments": {}}}]
         env = dict(os.environ, ABF_HEADLESS_DIR=_TMP)
         env.pop("ABF_WARM_SESSION", None)
+        env.pop("ABF_ABFC_TOOLS", None)
         if warm:
             env["ABF_WARM_SESSION"] = "1"
+        if abfc_tools:
+            env["ABF_ABFC_TOOLS"] = "1"
         p = subprocess.run([sys.executable, "-I", str(ROOT / "server.py")], input="\n".join(json.dumps(r) for r in reqs) + "\n",
                            capture_output=True, text=True, env=env, timeout=60, cwd=str(ROOT))
         replies = {json.loads(l)["id"]: json.loads(l) for l in p.stdout.splitlines() if l.strip()}
@@ -872,6 +878,127 @@ class BackendInfoCapabilityTests(unittest.TestCase):
         caps = self.capabilities(True)
         self.assertIs(caps["warmSession"], True)
         self.assertIs(caps["pinTypes"], True)
+
+    def test_reflect_flag_follows_abfc_tools(self):
+        self.assertIs(self.capabilities(False)["reflect"], False)
+        self.assertIs(self.capabilities(False, abfc_tools=True)["reflect"], True)
+
+    def test_fixed_capabilities(self):
+        caps = self.capabilities(False)
+        self.assertIs(caps["compileErrorNodeRefs"], True)
+        self.assertIs(caps["functionLocals"], False)
+        self.assertIs(caps["userPureFunctions"], False)
+        self.assertIn("UserDefinedStruct", caps["createKinds"])
+        for k in ("gameTest", "audit", "publish"):
+            self.assertIs(caps[k], True)
+
+
+class EngineVersionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="abfengver"))
+        self.addCleanup(shutil.rmtree, str(self.tmp), True)
+        (self.tmp / "Engine" / "Build").mkdir(parents=True)
+
+    def test_reads_build_version(self):
+        (self.tmp / "Engine" / "Build" / "Build.version").write_text(
+            '{"MajorVersion":5,"MinorVersion":4,"PatchVersion":4}', encoding="utf-8")
+        self.assertEqual(paths.engine_version(self.tmp), "5.4.4")
+
+    def test_none_for_missing_root_file_or_bad_json(self):
+        self.assertIsNone(paths.engine_version(None))
+        self.assertIsNone(paths.engine_version(self.tmp))
+        (self.tmp / "Engine" / "Build" / "Build.version").write_text("{not json", encoding="utf-8")
+        self.assertIsNone(paths.engine_version(self.tmp))
+        (self.tmp / "Engine" / "Build" / "Build.version").write_text('{"MajorVersion":5}', encoding="utf-8")
+        self.assertIsNone(paths.engine_version(self.tmp))
+
+
+class ReflectMetaSwitchTests(unittest.TestCase):
+    """abfc_tools.reflect: the `meta` job key comes from the argument, else from ABF_REFLECT_META."""
+
+    def run_reflect(self, args, env=None):
+        jobs = []
+
+        def fake(stage, job, timeout=None):
+            jobs.append(job)
+            return {"ok": True, "run": str(_TMP), "seconds": 1, "result": {"counts": {}, "meta": "skipped"}}
+
+        reflect = abfc_tools.build("x")[1][1]
+        env_patch = {"ABF_REFLECT_META": env} if env is not None else {}
+        with mock.patch.dict(os.environ, env_patch), \
+                mock.patch.object(abfc_tools.headless, "run_commandlet", side_effect=fake), \
+                mock.patch.object(abfc_tools.staging, "load", return_value=object()), \
+                mock.patch.object(abfc_tools.staging, "strip_scratch"), \
+                mock.patch.object(abfc_tools.bpscan, "load_filter", return_value=({}, {})):
+            if env is None:
+                os.environ.pop("ABF_REFLECT_META", None)
+            text, is_err = reflect(dict({"mod": "Mod", "classes": ["/Script/Engine.Actor"]}, **args))
+        self.assertFalse(is_err, text)
+        return jobs[0], json.loads(text)
+
+    def test_default_reads_meta(self):
+        job, out = self.run_reflect({})
+        self.assertIs(job["meta"], True)
+        self.assertEqual(out["meta"], "skipped")     # echoes the editor-side result
+
+    def test_argument_false_skips(self):
+        self.assertIs(self.run_reflect({"meta": False})[0]["meta"], False)
+
+    def test_env_zero_skips_without_argument(self):
+        self.assertIs(self.run_reflect({}, env="0")[0]["meta"], False)
+
+    def test_env_other_value_reads(self):
+        self.assertIs(self.run_reflect({}, env="1")[0]["meta"], True)
+
+    def test_argument_true_wins_over_env(self):
+        self.assertIs(self.run_reflect({"meta": True}, env="0")[0]["meta"], True)
+
+
+class ReflectRunOrderTests(unittest.TestCase):
+    """editor/bpkit/reflect.py with a stubbed `unreal`: function metadata is read after the template runs and can be skipped."""
+
+    def setUp(self):
+        patcher = mock.patch.dict(sys.modules, {"unreal": mock.MagicMock()})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        from bpkit import reflect
+        self.reflect = reflect
+        self.tmp = Path(tempfile.mkdtemp(prefix="abfreflect"))
+        self.addCleanup(shutil.rmtree, str(self.tmp), True)
+
+    def run_job(self, extra):
+        calls = []
+        r = self.reflect
+        r.unreal.load_class.return_value = mock.MagicMock()
+
+        def templates(items, errors, what):
+            calls.append(("templates", what))
+            return {}
+
+        def collect(get_tag, items):
+            calls.append(("meta",))
+            return {}
+
+        with mock.patch.object(r, "_templates", side_effect=templates), \
+                mock.patch.object(r.rp, "collect_function_meta", side_effect=collect), \
+                mock.patch.object(r, "_function_index", return_value={}), \
+                mock.patch.object(r, "_ancestors", return_value=[]):
+            res = r.run(dict({"run": str(self.tmp), "classes": ["/Script/Engine.Actor"]}, **extra))
+        written = json.loads((self.tmp / "reflect.json").read_text(encoding="utf-8"))
+        return calls, res, written
+
+    def test_meta_is_read_after_the_function_templates(self):
+        calls, res, written = self.run_job({})
+        self.assertIn(("meta",), calls)
+        self.assertGreater(calls.index(("meta",)), calls.index(("templates", "function")))
+        self.assertEqual(calls.index(("meta",)), len(calls) - 1)    # after every template run
+        self.assertEqual((res["meta"], written["meta"]), ("read", "read"))
+
+    def test_meta_false_skips_the_read(self):
+        calls, res, written = self.run_job({"meta": False})
+        self.assertNotIn(("meta",), calls)
+        self.assertIn(("templates", "function"), calls)
+        self.assertEqual((res["meta"], written["meta"]), ("skipped", "skipped"))
 
 
 NODE_T3D = (

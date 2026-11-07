@@ -6,6 +6,7 @@ warm_session (start, stop or inspect the long-lived hidden commandlet that serve
 backend_info is not defined here; abfc reads it from the backend when the backend has it.
 """
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -59,9 +60,11 @@ def build(server_version):
                 return _out({"error": bad})
         if not (classes or structs or casts):
             return _out({"error": "nothing to reflect (classes, structs and cast_targets are all empty)"})
+        want_meta = args["meta"] if isinstance(args.get("meta"), bool) else os.environ.get("ABF_REFLECT_META", "1") != "0"
         stage = staging.load(mod)
         try:
-            res = headless.run_commandlet(stage, {"op": "reflect", "classes": classes, "structs": structs, "cast_targets": casts},
+            res = headless.run_commandlet(stage, {"op": "reflect", "classes": classes, "structs": structs, "cast_targets": casts,
+                                                  "meta": want_meta},
                                           timeout=float(args.get("timeout_seconds") or 900))
         finally:
             staging.strip_scratch(stage)
@@ -70,7 +73,7 @@ def build(server_version):
         rules, meta = bpscan.load_filter()
         counts = (res.get("result") or {}).get("counts") or {}
         return _out({"ok": True, "run": res["run"], "seconds": res["seconds"], "file": str(Path(res["run"]) / "reflect.json"),
-                     "counts": counts,
+                     "counts": counts, "meta": (res.get("result") or {}).get("meta"),
                      "filter": {"content_version": meta.get("content_version"), "rules": [[v, k] for k, v in sorted(rules.items())]}})
 
     def t_warm_session(args):
@@ -98,8 +101,10 @@ def build(server_version):
          {}, []),
         ("reflect", t_reflect,
          "Read-only, hidden editor on the staging copy: enumerate functions, properties, struct fields, ancestors and cast pins of classes "
-         "(/Script, /Game, mod) into <run>/reflect.json, and return the Blueprint filter rules. Never loads /Game assets as assets.",
-         {"mod": STR, "classes": STR_LIST, "structs": STR_LIST, "cast_targets": STR_LIST, "timeout_seconds": NUM}, ["mod", "classes"]),
+         "(/Script, /Game, mod) into <run>/reflect.json, and return the Blueprint filter rules. Never loads /Game assets as assets. "
+         "meta=false (or env ABF_REFLECT_META=0) skips the function tooltip/display-name read.",
+         {"mod": STR, "classes": STR_LIST, "structs": STR_LIST, "cast_targets": STR_LIST, "timeout_seconds": NUM,
+          "meta": {"type": "boolean"}}, ["mod", "classes"]),
         ("warm_session", t_warm_session,
          "Start, stop or inspect the warm session: one hidden commandlet kept alive on the staging copy that serves bp_apply, bp_read, "
          "bp_compile_report and reflect without a new editor start per call (needs ABF_WARM_SESSION=1). Returns {running, pid, jobs, startedAt}. "

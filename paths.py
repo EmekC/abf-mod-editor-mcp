@@ -61,6 +61,17 @@ def hook_installed():
         return False
 
 
+def engine_version(root):
+    """Engine version "major.minor.patch" from <root>/Engine/Build/Build.version; None when root is None or the file is unreadable."""
+    if root is None:
+        return None
+    try:
+        v = json.loads((Path(root) / "Engine" / "Build" / "Build.version").read_text(encoding="utf-8-sig"))
+        return "%d.%d.%d" % (v["MajorVersion"], v["MinorVersion"], v["PatchVersion"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
 def _valid_root(p):
     p = Path(p)
     return p if (p / EDITOR_EXE_REL).is_file() else None
