@@ -53,6 +53,31 @@ def _object_ref(kind, path):
     return class_ref(path, "/Script/Engine.BlueprintGeneratedClass")
 
 
+META_FIELDS = (("tooltip", "ToolTip"), ("category", "Category"), ("keywords", "Keywords"))
+
+
+def _meta_text(value):
+    """T3D string-literal body: backslash and quote escaped, newline as backslash-n, carriage return dropped."""
+    return str(value).replace("\r", "").replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+def function_meta_prop(meta, seed, prop="MetaData"):
+    """`MetaData=(ToolTip=NSLOCTEXT(...),Category=...,Keywords=...)` for a custom event node (only the non-empty fields).
+
+    `meta` is {tooltip, category, keywords}; `seed` (the event name) makes the NSLOCTEXT keys stable across runs.
+    Returns None when every field is empty."""
+    parts = []
+    for key, field in META_FIELDS:
+        value = (meta or {}).get(key)
+        if value is None or str(value).replace("\r", "").strip() == "":
+            continue
+        loc_key = hashlib.md5((seed + ":" + field).encode("utf-8")).hexdigest().upper()
+        parts.append('%s=NSLOCTEXT("", "%s", "%s")' % (field, loc_key, _meta_text(value)))
+    if not parts:
+        return None
+    return "%s=(%s)" % (prop, ",".join(parts))
+
+
 _CLASSLIKE = ("object", "class", "softobject", "softclass", "interface")
 
 

@@ -176,6 +176,24 @@ class ReflectParseTests(unittest.TestCase):
         self.assertTrue(reflectparse.SKIP_FUNCTION("OnHit__DelegateSignature"))
         self.assertFalse(reflectparse.SKIP_FUNCTION("DoIt"))
 
+    def test_function_meta_shape(self):
+        tags = {"ToolTip": " Does it. ", "DisplayName": ""}
+
+        def route(fn, tag):
+            if fn == "bad":
+                raise RuntimeError("no metadata")
+            return tags[tag]
+
+        self.assertEqual(reflectparse.read_function_meta(route, "ok"), {"tooltip": "Does it.", "displayName": None})
+        self.assertEqual(reflectparse.read_function_meta(route, "bad"), {"tooltip": None, "displayName": None})
+
+    def test_function_meta_time_cap(self):
+        ticks = iter([0.0, 1.0, 25.0, 26.0])   # start, first check, second check (over budget), spare
+        got = reflectparse.collect_function_meta(lambda fn, tag: tag + ":" + fn, [("a", "fa"), ("b", "fb")], budget=20.0,
+                                                 clock=lambda: next(ticks))
+        self.assertEqual(got["a"], {"tooltip": "ToolTip:fa", "displayName": "DisplayName:fa"})
+        self.assertEqual(got["b"], {"tooltip": None, "displayName": None})
+
 
 class StdioOptInTests(unittest.TestCase):
     def tool_names(self, opt_in):
