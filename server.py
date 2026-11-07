@@ -38,7 +38,7 @@ import staging   # noqa: E402
 from bpkit import specs  # noqa: E402
 
 SERVER_NAME = "abiotic-mod-editor"
-SERVER_VERSION = "2.3.0"
+SERVER_VERSION = "2.4.0"
 BACKEND_PROTOCOL = 1
 
 EDITOR_ROOT = paths.find_editor_root()          # None when no Mod Editor install was found
@@ -1221,10 +1221,14 @@ def t_read_editor_log(args):
 
 def t_backend_info(args):
     return _json({"protocol": BACKEND_PROTOCOL, "serverVersion": SERVER_VERSION,
+                  "engineVersion": paths.engine_version(EDITOR_ROOT),
                   "editorRoot": str(EDITOR_ROOT) if EDITOR_ROOT else None,
                   "headlessDir": str(paths.headless_dir()), "documentsDir": str(paths.documents_dir()),
                   "capabilities": {"pinTypes": True, "containerTypes": {"array": True, "map": True, "set": True},
-                                   "warmSession": headless.warm_enabled(), "stageAudit": True},
+                                   "warmSession": headless.warm_enabled(), "stageAudit": True,
+                                   "reflect": os.environ.get("ABF_ABFC_TOOLS") == "1", "compileErrorNodeRefs": True,
+                                   "functionLocals": False, "userPureFunctions": False,
+                                   "createKinds": list(specs.CREATE_CLASSES), "gameTest": True, "audit": True, "publish": True},
                   "bpApply": {"features": list(specs.FEATURES), "nodeKinds": sorted(specs.NODE_KINDS)}})
 
 
@@ -1239,7 +1243,9 @@ TOOLS = [
      S(wait_seconds=NUM), []),
     ("backend_info", t_backend_info,
      "Read-only, needs no editor: backend protocol number, server version, paths and capabilities (for tools such as abfc). "
-     "capabilities.pinTypes: bp_apply node specs accept pin_types.", S(), []),
+     "Also engineVersion (from the editor install, null if unknown). capabilities: pinTypes (bp_apply node specs accept pin_types), "
+    "containerTypes, warmSession, stageAudit, reflect (the reflect tool is registered), compileErrorNodeRefs, functionLocals, "
+    "userPureFunctions, createKinds (asset kinds bp_apply can create), gameTest, audit, publish.", S(), []),
     ("launch_editor", t_launch_editor,
      "Start the Mod Editor and wait until it is reachable. It opens on the Mod Browser picker; then use open_mod.",
      S(wait_seconds=NUM), []),

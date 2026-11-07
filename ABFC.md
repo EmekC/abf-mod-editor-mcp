@@ -1,39 +1,42 @@
 # abfc extensions
 
-Additions for [abfc](https://github.com/EmekC/abfc) (TypeScript to Blueprint compiler), protocol 1. They are additive: nothing
-in the existing tools changes except extra keys in three results (below).
+Additions for [abfc](https://github.com/EmekC/abfc) (TypeScript to Blueprint compiler). This document describes backend protocol 1 as
+of server version 2.4.0 (abfc's minimum). The additions are additive: nothing in the existing tools changes except extra keys in the
+results below.
+
+`backend_info` is a core tool (always registered, no editor needed); see the section on it below.
 
 ## Opt-in: `ABF_ABFC_TOOLS=1`
 
-Three tools are registered only when the server starts with `ABF_ABFC_TOOLS=1` (abfc sets it when it spawns the server).
-Without the variable the tool list is exactly the stock one. None of them is named `backend_info`; that tool belongs to the
-wildcard-pins branch and is read by abfc when present.
+Three tools are registered only when the server starts with `ABF_ABFC_TOOLS=1` (abfc sets it when it spawns the server):
+`abfc_extensions`, `reflect` and `warm_session`. Without the variable the tool list is exactly the stock one.
 
 ### `abfc_extensions` (no arguments, no editor)
 
 ```json
-{ "extProtocol": 1, "serverVersion": "2.3.0", "python": "3.11.9",
+{ "extProtocol": 1, "serverVersion": "2.4.0", "python": "3.11.9",
   "features": ["reflect", "compile_node_refs", "bp_read_seconds"] }
 ```
 
 ### `reflect`
 
-`reflect(mod, classes, structs = [], cast_targets = [], timeout_seconds = 900)`. Hidden editor on the staging copy, read only.
+`reflect(mod, classes, structs = [], cast_targets = [], meta = true, timeout_seconds = 900)`. Hidden editor on the staging copy, read only.
 Paths must be `/Script/...`, `/Game/...` or `/<mod>/...` (anything else is refused on the host before an editor starts).
 Classes are loaded with `unreal.load_class` (never `load_asset`, never an export of a `/Game` asset). Returns:
 
 ```json
 { "ok": true, "run": "<run folder>", "seconds": 41.2, "file": "<run>/reflect.json",
-  "counts": { "classes": 2, "functions": 310, "properties": 120, "structs": 1, "errors": 0 },
+  "counts": { "classes": 2, "functions": 310, "properties": 120, "structs": 1, "errors": 0 }, "meta": "read",
   "filter": { "content_version": "...", "rules": [["Allow", "<key>"], ["Block", "<key>"]] } }
 ```
 
 or `{ "error", "run", "log_tail" }`. `<run>/reflect.json`:
 
 ```json
-{ "engineVersion": "...",
+{ "engineVersion": "...", "meta": "read",
   "classes": { "<path>": { "meta": "<class of the class object>", "ancestors": ["<native ancestor class paths>"],
-                           "functions": [{ "name": "...", "pins": [Pin] }],
+                           "functions": [{ "name": "...", "pins": [Pin],
+                                           "meta": { "tooltip": "<text or null>", "displayName": "<text or null>" } }],
                            "properties": [{ "name": "...", "pins": [Pin] }],
                            "castPin": "<cast result output pin name or null>" } },
   "structs": { "<path>": { "fields": [Pin] } },
@@ -44,6 +47,35 @@ A `Pin` is `{ name, dir: "in"|"out", category, subCategory, subCategoryObject (i
 Classes that appear only in `cast_targets` get an entry with empty member lists, their `castPin` and `"castOnly": true`.
 Per-member failures go to `errors` and do not abort the run. `ExecuteUbergraph_*` and `*__DelegateSignature` functions are skipped.
 Blueprint parent chains are not walkable from Python, so `ancestors` lists native wrapper classes only.
+
+**Function metadata and the `meta` switch.** The top-level `meta` of the result and of `reflect.json` is `"read"` or `"skipped"`.
+When it is read (the default), each function entry gets `meta: { tooltip, displayName }` from the `ToolTip` and `DisplayName` tags
+(`unreal.EditorAssetLibrary.get_metadata_tag`; a tag that is missing or unreadable gives `null`). The read happens after every template
+run, because it is the part of `reflect` that once crashed the hidden editor (one access violation, not reproduced). It is skipped with
+the argument `meta: false`, or, when the argument is absent, with the environment variable `ABF_REFLECT_META=0` on the server; the
+argument wins over the variable. Skipped means every function has `meta: null`.
+
+## `backend_info` (2.4.0)
+
+Core tool, no editor needed, no arguments. Keys:
+
+- `protocol`: backend protocol number (`1`).
+- `serverVersion`: this server's version (`"2.4.0"`).
+- `engineVersion`: `Major.Minor.Patch` from `<editor root>/Engine/Build/Build.version`, `null` when the file is missing or unreadable.
+- `editorRoot`, `headlessDir`, `documentsDir`: the paths the server uses (`editorRoot` is `null` when no editor install was found).
+- `capabilities.pinTypes`: `bp_apply` node specs accept `pin_types` (wildcard pin resolution in one pass).
+- `capabilities.containerTypes`: `{ array, map, set }`, which container types the type grammar accepts.
+- `capabilities.warmSession`: `true` exactly when `ABF_WARM_SESSION=1`.
+- `capabilities.stageAudit`: `mod_audit` audits the staged copy.
+- `capabilities.reflect`: `true` exactly when `ABF_ABFC_TOOLS=1` (the `reflect` tool is registered).
+- `capabilities.compileErrorNodeRefs`: compile messages carry `node` and `graph` (`bp_compile_report`, `bp_apply`).
+- `capabilities.functionLocals`: `false`; `bp_apply` cannot add local variables to a function graph.
+- `capabilities.userPureFunctions`: `false`; `bp_apply` cannot mark a user function pure.
+- `capabilities.createKinds`: the asset kinds `bp_apply` can create (`Blueprint`, `WidgetBlueprint`, `BlueprintInterface`, `UserDefinedStruct`).
+- `capabilities.gameTest`: `bp_game_test` is available.
+- `capabilities.audit`: `mod_audit` is available.
+- `capabilities.publish`: `bp_publish` is available.
+- `bpApply.features`, `bpApply.nodeKinds`: the `bp_apply` feature flags and node kinds this build understands.
 
 ## Additive keys in existing tools
 
@@ -122,17 +154,11 @@ Opt-in, off by default. With `ABF_WARM_SESSION=1` the server keeps one hidden `-
 
 ## Backend contract abfc relies on (summary)
 
-abfc reads `backend_info` when the backend has it (the wildcard-pins branch): `protocol`, `capabilities.pinTypes`,
-`capabilities.containerTypes` (kept for diagnostics only), `bpApply.features` (`pin_types`, `cast_object_pin`, `map_types`) and
-`bpApply.nodeKinds`. `pinTypes` is on only when the tool lists `pin_types`; otherwise (including a backend without `backend_info`)
-abfc uses a two-phase route: apply, read the rolled-back `final_<i>.t3d`, patch the wildcard pins, re-apply as a raw graph.
-Everything `backend_info` does not report comes from `tools/list`, from `abfc_extensions` and from a static bp_apply protocol-1
-baseline inside abfc. A backend without `backend_info` is not an error for abfc (warning ABFC4012).
-
-## Applying together with the wildcard-pins branch
-
-This branch edits `server.py` (one block after `TOOLS.extend(headless_tools.build(...))`), `editor/bpkit/jobs.py`, `headless.py` and
-`headless_tools.py`, and adds `abfc_tools.py`, `editor/bpkit/reflect.py`, `editor/bpkit/reflectparse.py`, `tests/test_abfc_backend.py`
-and this file. The wildcard-pins branch edits `README.md`, `editor/bpkit/graphs.py`, `editor/bpkit/specs.py`, `editor/bpkit/t3d.py`,
-`server.py` and `tests/test_unit.py`. Only `server.py` overlaps, in separate hunks, so both apply with plain `git apply` in either order.
-The wildcard branch's smoke test asserts the stock tool count, which is why the tools here are opt-in.
+abfc needs protocol >= 1 (a lower number is its error ABFC4001) and warns below server version 2.4.0 (ABFC4014). It reads
+`backend_info`: `protocol`, `serverVersion`, `engineVersion`, `capabilities` (`pinTypes`, `containerTypes` for diagnostics,
+`warmSession`, `stageAudit`, `compileErrorNodeRefs`, and the other keys above) and `bpApply.features` (`pin_types`, `cast_object_pin`,
+`map_types`, `set_types`, `struct_fields`, `event_meta`, `self_event_calls`) and `bpApply.nodeKinds`. `pinTypes` is on only when the
+tool lists `pin_types`; otherwise (including a backend without `backend_info`) abfc uses a two-phase route: apply, read the rolled-back
+`final_<i>.t3d`, patch the wildcard pins, re-apply as a raw graph. Everything `backend_info` does not report comes from `tools/list`
+(for example whether `reflect` is registered), from `abfc_extensions` and from a static `bp_apply` protocol-1 baseline inside abfc. A
+backend without `backend_info` is not an error for abfc (warning ABFC4012).

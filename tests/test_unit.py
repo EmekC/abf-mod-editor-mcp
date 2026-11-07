@@ -2099,7 +2099,7 @@ class StdioSmokeTests(unittest.TestCase):
         p = subprocess.run([sys.executable, "-I", str(ROOT / "server.py")], input="\n".join(json.dumps(r) for r in reqs) + "\n",
                            capture_output=True, text=True, env=env, timeout=60, cwd=str(ROOT))
         replies = {json.loads(l)["id"]: json.loads(l) for l in p.stdout.splitlines() if l.strip()}
-        self.assertEqual(replies[1]["result"]["serverInfo"]["version"], "2.3.0")
+        self.assertEqual(replies[1]["result"]["serverInfo"]["version"], "2.4.0")
         names = [t["name"] for t in replies[2]["result"]["tools"]]
         self.assertEqual(len(names), 43)
         for n in ("staging_sync", "staging_status", "bp_apply", "bp_read", "bp_compile_report", "bp_game_test",
@@ -2109,6 +2109,11 @@ class StdioSmokeTests(unittest.TestCase):
         self.assertFalse(bi.get("isError"))
         info = json.loads(bi["content"][0]["text"])
         self.assertEqual(info["protocol"], 1)
+        self.assertTrue(info["engineVersion"] is None or isinstance(info["engineVersion"], str))
+        for key in ("pinTypes", "containerTypes", "warmSession", "stageAudit", "reflect", "compileErrorNodeRefs", "functionLocals",
+                    "userPureFunctions", "createKinds", "gameTest", "audit", "publish"):
+            self.assertIn(key, info["capabilities"])
+        self.assertIn("UserDefinedStruct", info["capabilities"]["createKinds"])
         self.assertIs(info["capabilities"]["pinTypes"], True)
         self.assertIs(info["capabilities"]["containerTypes"]["map"], True)
         self.assertIs(info["capabilities"]["containerTypes"]["set"], True)

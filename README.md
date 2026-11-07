@@ -8,6 +8,8 @@ Pure Python, no packages, Windows only (the editor is Windows only). Not affilia
 
 New to this? There's a step-by-step setup and usage guide on mod.io: [Use an AI assistant with the Mod Editor (MCP setup guide)](https://mod.io/g/abiotic-factor/r/use-an-ai-assistant-with-the-mod-editor-mcp-setup-guide).
 
+Changes per version are listed in [CHANGELOG.md](CHANGELOG.md).
+
 ## Requirements
 
 - Windows 10/11
@@ -43,7 +45,7 @@ The server uses remote execution first and the bridge second, opens a fresh conn
 
 | Group | Tools |
 | --- | --- |
-| Status and launch | `editor_status` (call first), `backend_info` (protocol, version, paths, capabilities; no editor needed), `launch_editor`, `open_mod` (drives the picker's Browse… dialog, since the command line can't open a mod) |
+| Status and launch | `editor_status` (call first), `backend_info` (protocol, version, paths, capabilities; no editor needed; capabilities for abfc, see [ABFC.md](ABFC.md)), `launch_editor`, `open_mod` (drives the picker's Browse… dialog, since the command line can't open a mod) |
 | Python | `run_python`, `evaluate_python`, `run_python_file` (`args` → `ARGS` inside the script) |
 | Mod data | `list_mods`, `list_mod_templates`, `find_assets`, `get_row`, `set_row` (plain values, Python expressions, or whole export text), `create_row_asset` (any of the 72 `*ModRowAsset` classes, optionally copied from a base-game row or another mod row), `delete_asset`, `save_assets`, `compile_blueprint`, `validate_assets` |
 | Base-game data | `get_game_row` — list or read any row the game exposes through its `<Kind>HandleFunctionLibrary` (gear_item, weapon_item, recipe, buff_debuff, npc, pet, trait, …) |

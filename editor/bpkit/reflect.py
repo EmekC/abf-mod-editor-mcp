@@ -135,12 +135,7 @@ def run(job):
         defaults_items["d%d" % len(defaults_items)] = (DEFAULTS, [rp.class_pin_line(pname, meta)])
         key_info["d%d" % (len(defaults_items) - 1)] = (p, "defaults", None)
 
-    # function metadata (tooltip, display name) from the UFunction's metadata tags; None where unreadable or over the time cap
-    metas = rp.collect_function_meta(lambda f, tag: unreal.EditorAssetLibrary.get_metadata_tag(f, tag), meta_items)
-
-    for key, pins in _templates(call_items, errors, "function").items():
-        p, _slot, n = key_info[key]
-        result_classes[p]["functions"].append({"name": n, "pins": pins, "meta": metas.get((p, n))})
+    call_pins = _templates(call_items, errors, "function")
 
     # properties: the output pins of a GetClassDefaults node name the readable properties; one VariableGet each gives the pins
     get_items = {}
@@ -182,12 +177,23 @@ def run(job):
     for key, pins in _templates(struct_items, errors, "struct").items():
         result_structs[key_info[key][0]] = {"fields": [x for x in pins if x["dir"] == "out" and x["category"] != "exec"]}
 
-    out = {"engineVersion": unreal.SystemLibrary.get_engine_version(), "classes": result_classes,
-           "structs": result_structs, "errors": errors}
+    # function metadata (tooltip, display name) from the UFunction's metadata tags, read after every template run (a crash seen
+    # once during the function-template chunk is worked around by this order); None where unreadable, over the time cap or skipped
+    want_meta = job.get("meta", True) is not False
+    if want_meta:
+        metas = rp.collect_function_meta(lambda f, tag: unreal.EditorAssetLibrary.get_metadata_tag(f, tag), meta_items)
+    else:
+        metas = {}
+    for key, pins in call_pins.items():
+        p, _slot, n = key_info[key]
+        result_classes[p]["functions"].append({"name": n, "pins": pins, "meta": metas.get((p, n))})
+
+    out = {"engineVersion": unreal.SystemLibrary.get_engine_version(), "meta": "read" if want_meta else "skipped",
+           "classes": result_classes, "structs": result_structs, "errors": errors}
     with open(os.path.join(job["run"], "reflect.json"), "w", encoding="utf-8") as f:
         json.dump(out, f, indent=1, default=str)
     counts = {"classes": len(result_classes),
               "functions": sum(len(c["functions"]) for c in result_classes.values()),
               "properties": sum(len(c["properties"]) for c in result_classes.values()),
               "structs": len(result_structs), "errors": len(errors)}
-    return {"file": "reflect.json", "counts": counts}
+    return {"file": "reflect.json", "counts": counts, "meta": out["meta"]}
