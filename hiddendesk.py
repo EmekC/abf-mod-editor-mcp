@@ -28,6 +28,7 @@ PICKER_TILE_SLATE = (946, 200)     # first recent-mod tile; measured at 125% DPI
 PICKER_TILE_RATIO = (1183 / 1495, 250 / 1078)
 PICKER_TILE_PRIVATE = (489 / 1495, 250 / 1078)   # first (only) tile when the Documents redirect is on: the list is one column from x=425; measured live
 SETTINGS_SECTION = "[/Script/AbioticFactorEditorCooked.AbioticFactorModEditorSettings]"
+LOGIN_GRACE_ENV = "ABF_LOGIN_GRACE"     # seconds an Epic "Logging In" window may stay without a Mod Browser (default 60)
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -254,6 +255,16 @@ def run_editor(stage, job, timeout=420):
     return out
 
 
+def login_stuck(titles, seen_at, now, grace):
+    """(seen_at, stuck): a "Logging In" window with no "Mod Browser" window for at least `grace` seconds.
+    seen_at is when that state was first seen (None when it does not hold); pure, so the host loop stays simple."""
+    low = [str(t).lower() for t in titles]
+    if any("logging in" in t for t in low) and not any("mod browser" in t for t in low):
+        seen_at = seen_at if seen_at is not None else now
+        return seen_at, now - seen_at >= grace
+    return None, False
+
+
 def _run_editor_once(stage, job, timeout=420):
     exe = headless._exe()
     abfmods = sorted(stage.dir.glob("*.abfmod"))
@@ -288,6 +299,7 @@ def _run_editor_once(stage, job, timeout=420):
         shots, done_tags = [], set()
         code = wt.DWORD(1)
         timed_out, picker_error, picker_done = False, None, False
+        login_seen, grace = None, float(os.environ.get(LOGIN_GRACE_ENV, "60"))
         try:
             ok = kernel32.CreateProcessW(None, buf, None, None, False, 0x400, ctypes.create_unicode_buffer(env_block), None,
                                          ctypes.byref(si), ctypes.byref(pi))
@@ -307,6 +319,19 @@ def _run_editor_once(stage, job, timeout=420):
                 wins = _windows(desk, pi.dwProcessId)
                 if not picker_done and not (run / "mounted").exists():
                     pk = [w for w in wins if "Mod Browser" in w[1]]
+                    if not pk:
+                        login_seen, stuck = login_stuck([w[1] for w in wins], login_seen, time.time(), grace)
+                        if stuck:
+                            shot = run / "login_stuck.png"
+                            try:
+                                lw = [w for w in wins if "logging in" in str(w[1]).lower()][0]
+                                _capture(lw[0], shot, int(job.get("max_width", 1600)))
+                            except Exception:
+                                pass
+                            picker_error = ("the hidden Mod Editor showed only an Epic 'Logging In' window for %d s and never opened the Mod Browser, "
+                                            "so the staged mod was not mounted and nothing was audited (screenshot: %s). Sign in to Epic once in a "
+                                            "normal Mod Editor session (or wait for the Epic services), then run the audit again." % (int(grace), shot))
+                            break
                     if pk:
                         picker_done = True
                         (run / "picker_windows.json").write_text(json.dumps([[str(w[0]), w[1], w[2], w[3], w[4], w[5]] for w in wins]), encoding="utf-8")

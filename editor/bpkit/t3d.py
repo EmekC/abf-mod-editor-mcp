@@ -81,7 +81,11 @@ def parse_type(t, class_text=None):
         cat, sub = _SIMPLE[key]
         return {"cat": cat, "sub": sub, "obj": None, "container": "Map", "value": v}
     if head == "set":
-        raise SpecError("%s types are not supported (arrays and maps only): %s" % (head, t))
+        elem = t[4:]
+        if elem not in _SIMPLE or elem == "exec":
+            raise SpecError("set types are set:<type> with a simple element type (int int64 bool byte name string text real double float): %s" % t)
+        cat, sub = _SIMPLE[elem]
+        return {"cat": cat, "sub": sub, "obj": None, "container": "Set"}
     if t in _SIMPLE:
         cat, sub = _SIMPLE[t]
         return {"cat": cat, "sub": sub, "obj": None, "container": None}
@@ -96,7 +100,7 @@ def parse_type(t, class_text=None):
     if head in _OBJ_KINDS:
         raise SpecError("type %r needs a path, e.g. %s:/Script/Engine.Actor" % (head, head))
     raise SpecError("unknown type %r (exec int int64 bool byte name string text real double float "
-                    "object:<path> class:<path> softobject:<path> softclass:<path> interface:<path> struct:<path> enum:<path> array:<type> map:<key>:<type>)" % t)
+                    "object:<path> class:<path> softobject:<path> softclass:<path> interface:<path> struct:<path> enum:<path> array:<type> map:<key>:<type> set:<type>)" % t)
 
 
 def _direction(d):
@@ -179,6 +183,71 @@ def dispatcher_var(name, guid=None):
         name, guid or gid(), name, DISPATCHER_PROPERTY_FLAGS)
 
 
+# ---- UserDefinedStruct members -----------------------------------------------------
+
+STRUCT_MEMBER_RX = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)_(\d+)_([0-9A-F]{32})$")
+_STRUCT_DEFAULTS = {"int": "0", "int64": "0", "byte": "0", "bool": "False", "real": "0.0", "name": "None",
+                    "string": "", "text": "", "object": "None", "class": "None", "softobject": "None", "softclass": "None",
+                    "interface": "None", "struct": ""}
+
+
+def _struct_type(type_str):
+    """(TYPE attrs text, default text) of a UserDefinedStruct member of the given type. No containers, no exec."""
+    t = parse_type(type_str)
+    if t["container"]:
+        raise SpecError("struct members cannot be containers: %s" % type_str)
+    if t["cat"] == "exec":
+        raise SpecError("struct members cannot be exec: %s" % type_str)
+    s = 'Category="%s"' % t["cat"]
+    if t["sub"]:
+        s += ',SubCategory="%s"' % t["sub"]
+    default = _STRUCT_DEFAULTS.get(t["cat"], "")
+    if t["obj"]:
+        path = re.search(r"'([^']*)'", t["obj"]).group(1)
+        last = path.rsplit("/", 1)[-1]
+        if "." not in last and not path.startswith("/Script/") and t["cat"] in ("object", "class", "softobject", "softclass", "interface"):
+            path = "%s.%s_C" % (path, last)
+        s += ',SubCategoryObject="%s"' % path
+        if t["cat"] == "byte":
+            default = ""
+    return s, default
+
+
+def struct_var_line(field):
+    """Element text of UserDefinedStructEditorData.VariablesDescriptions for field {name, friendly, guid, type}."""
+    attrs, default = _struct_type(field["type"])
+    return '(VarName="%s",VarGuid=%s,FriendlyName="%s",DefaultValue="%s",%s,CurrentDefaultValue="%s")' % (
+        field["name"], field["guid"], field["friendly"], default, attrs, default)
+
+
+_SIG_NAME_RX = re.compile(r'^\(VarName="([^"]+)"')
+_SIG_ATTR_RX = {k: re.compile(r'[,(]%s="([^"]*)"' % k) for k in ("Category", "SubCategory")}
+_SIG_OBJ_RX = re.compile(r"[,(]SubCategoryObject=([^,)]*)")
+_SIG_PATH_RX = re.compile(r"/[^\s\"']+")
+
+
+def struct_signature(text):
+    """Ordered [(VarName, normalized type)] of the members in `text`: VariablesDescriptions(i)=(...) lines of an export,
+    or bare (VarName=...) element lines (as struct_var_line renders them)."""
+    out = []
+    for line in text.split("\n"):
+        s = line.strip()
+        if s.startswith("VariablesDescriptions("):
+            s = s[s.index("=") + 1:]
+        m = _SIG_NAME_RX.match(s)
+        if not m:
+            continue
+        parts = []
+        for k in ("Category", "SubCategory"):
+            a = _SIG_ATTR_RX[k].search(s)
+            parts.append("%s=%s" % (k, a.group(1) if a else ""))
+        o = _SIG_OBJ_RX.search(s)
+        p = _SIG_PATH_RX.search(o.group(1)) if o else None
+        parts.append("Object=%s" % (p.group(0) if p else ""))
+        out.append((m.group(1), ";".join(parts)))
+    return out
+
+
 # ---- pins and nodes -----------------------------------------------------------
 
 _PIN_PREFIX = "CustomProperties Pin ("
@@ -195,7 +264,7 @@ _PINTYPE_RX = re.compile(r'PinType\.PinCategory="[^"]*",PinType\.PinSubCategory=
 _CAT_RX = re.compile(r'PinType\.PinCategory="([^"]*)"')
 _CONTAINER_RX = re.compile(r'PinType\.ContainerType=(\w+)')
 _CONTAINER_HINT = {"None": "a single-value pin (give a type without array:/map:)", "Array": "an array pin (give array:<type>)",
-                   "Map": "a map pin (give map:<key>:<type>)", "Set": "a set pin (set types are not supported)"}
+                   "Map": "a map pin (give map:<key>:<type>)", "Set": "a set pin (give set:<type>)"}
 DEFAULT_WILDCARDS = {"K2Node_DynamicCast": {"Object": "object:/Script/CoreUObject.Object"}}
 _POS_RX = {"x": re.compile(r"^NodePosX=(-?\d+)"), "y": re.compile(r"^NodePosY=(-?\d+)")}
 
