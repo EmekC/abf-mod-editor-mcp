@@ -608,6 +608,90 @@ class LivePublishEditorSideTests(unittest.TestCase):
         self.assertEqual(out["referencers"], ["/ModX/Ref"])
         self.assertEqual(out["skipped_referencers"], ["/ModX/MapX"])
 
+    def _prepare_stubs(self, referencers, dirty=()):
+        """Stubbed editor for `prepare`: no PIE, the given dirty package names, everything loaded, and an asset registry whose
+        get_referencers answers from the `referencers` dict (package -> list of packages)."""
+        u = self.u
+        u.get_editor_subsystem.return_value.get_game_world.return_value = None
+        dirty_pkgs = []
+        for n in dirty:
+            d = mock.MagicMock()
+            d.get_name.return_value = n
+            dirty_pkgs.append(d)
+        u.EditorLoadingAndSavingUtils.get_dirty_content_packages.return_value = dirty_pkgs
+        u.find_package.return_value = mock.MagicMock()
+        u.EditorLoadingAndSavingUtils.unload_packages.return_value = (True, "")
+
+        def find(outer, path):
+            o = mock.MagicMock()
+            o.get_class.return_value.get_name.return_value = "World" if path.rsplit(".", 1)[-1].startswith("Map") else "Blueprint"
+            return o
+        u.find_object.side_effect = find
+        u.AssetRegistryHelpers.get_asset_registry.return_value.get_referencers.side_effect = lambda p, opts: referencers.get(p, [])
+
+    def test_prepare_finds_transitive_referencers_in_breadth_first_order(self):
+        self._prepare_stubs({"/ModX/A": ["/ModX/B"], "/ModX/B": ["/ModX/C", "/Game/Other"], "/ModX/C": ["/ModX/A"]})
+        out = self.lp.prepare({"root": "/ModX", "packages": ["/ModX/A"]})
+        self.assertEqual(out["refused"], [])
+        self.assertEqual(out["referencers"], ["/ModX/B", "/ModX/C"])
+
+    def test_prepare_refuses_when_a_transitive_referencer_has_unsaved_changes(self):
+        self._prepare_stubs({"/ModX/A": ["/ModX/B"], "/ModX/B": ["/ModX/C"]}, dirty=["/ModX/C"])
+        out = self.lp.prepare({"root": "/ModX", "packages": ["/ModX/A"]})
+        self.assertEqual(out["refused"], ["/ModX/C"])
+        self.assertEqual(out["refused_referencers"], ["/ModX/C"])
+        self.u.EditorLoadingAndSavingUtils.unload_packages.assert_not_called()
+
+    def test_prepare_does_not_expand_a_skipped_map(self):
+        self._prepare_stubs({"/ModX/A": ["/ModX/MapX", "/ModX/B"], "/ModX/MapX": ["/ModX/Z"], "/ModX/B": []})
+        out = self.lp.prepare({"root": "/ModX", "packages": ["/ModX/A"]})
+        self.assertEqual(out["referencers"], ["/ModX/B"])
+        self.assertEqual(out["skipped_referencers"], ["/ModX/MapX"])
+
+    def test_prepare_stops_at_200_referencers(self):
+        self._prepare_stubs({"/ModX/A": ["/ModX/R%03d" % i for i in range(250)]})
+        out = self.lp.prepare({"root": "/ModX", "packages": ["/ModX/A"]})
+        self.assertEqual(len(out["referencers"]), 200)
+        self.assertEqual(out["referencers"][0], "/ModX/R000")
+
+    def _reload_stubs(self, dependencies):
+        """Stubbed editor for `reload_assets`: nothing dirty, every package loads, get_dependencies answers from the
+        `dependencies` dict. Returns the list of package names in the order load_asset was called."""
+        u = self.u
+        u.find_object.side_effect = lambda outer, path: mock.MagicMock()
+        u.EditorLoadingAndSavingUtils.get_dirty_content_packages.return_value = []
+        u.EditorLoadingAndSavingUtils.reload_packages.return_value = (True, "")
+        u.AssetRegistryHelpers.get_asset_registry.return_value.get_dependencies.side_effect = lambda p, opts: dependencies.get(p, [])
+        names = []
+
+        def load(name):
+            names.append(name)
+            a = mock.MagicMock()
+            a.get_outermost.return_value = name
+            return a
+        u.load_asset.side_effect = load
+        return names
+
+    def test_reload_assets_reloads_dependencies_before_their_dependents(self):
+        names = self._reload_stubs({"/ModX/R": ["/ModX/W", "/Game/Base"], "/ModX/W": ["/ModX/A"], "/ModX/A": []})
+        out = self.lp.reload_assets({"root": "/ModX", "packages": ["/ModX/R", "/ModX/A"], "also": ["/ModX/W"]})
+        self.assertEqual(names, ["/ModX/A", "/ModX/W", "/ModX/R"])
+        self.assertEqual(self.u.EditorLoadingAndSavingUtils.reload_packages.call_args[0][0], ["/ModX/A", "/ModX/W", "/ModX/R"])
+        self.assertEqual(out["loaded"], ["/ModX/A", "/ModX/W", "/ModX/R"])
+        self.assertEqual(out["reloaded_referencers"], ["/ModX/W"])
+
+    def test_reload_assets_keeps_input_order_on_a_dependency_cycle(self):
+        names = self._reload_stubs({"/ModX/A": ["/ModX/B"], "/ModX/B": ["/ModX/A"]})
+        self.lp.reload_assets({"root": "/ModX", "packages": ["/ModX/A"], "also": ["/ModX/B"]})
+        self.assertEqual(names, ["/ModX/A", "/ModX/B"])
+
+    def test_reload_assets_survives_a_registry_error_in_get_dependencies(self):
+        names = self._reload_stubs({})
+        self.u.AssetRegistryHelpers.get_asset_registry.return_value.get_dependencies.side_effect = RuntimeError("no registry")
+        out = self.lp.reload_assets({"root": "/ModX", "packages": ["/ModX/A"], "also": ["/ModX/B"]})
+        self.assertEqual(names, ["/ModX/A", "/ModX/B"])
+        self.assertEqual(out["reloaded_referencers"], ["/ModX/B"])
+
     def test_reload_assets_reloads_referencers_after_the_published(self):
         u = self.u
         u.find_object.side_effect = lambda outer, path: mock.MagicMock()
@@ -648,6 +732,22 @@ class LivePublishEditorSideTests(unittest.TestCase):
         self.assertEqual(out["skipped_dirty"], ["/ModX/Dirty"])
         self.assertEqual(out["dirty_published"], ["/ModX/A"])
         self.assertEqual(out["reloaded_referencers"], ["/ModX/Ref"])
+
+    def test_recompile_compiles_blueprints_dependencies_first_and_saves_nothing(self):
+        u = self.u
+
+        class FakeBlueprint:
+            pass
+        u.Blueprint = FakeBlueprint
+        u.find_object.side_effect = lambda outer, path: FakeBlueprint() if "Data" not in path else object()
+        u.EditorLoadingAndSavingUtils.get_dirty_content_packages.return_value = []
+        u.AssetRegistryHelpers.get_asset_registry.return_value.get_dependencies.side_effect = (
+            lambda p, opts: {"/ModX/R": ["/ModX/W"], "/ModX/W": []}.get(p, []))
+        out = self.lp.recompile({"root": "/ModX", "packages": ["/ModX/R", "/ModX/Data", "/ModX/W"]})
+        self.assertEqual(out["compiled"], ["/ModX/W", "/ModX/R"])
+        self.assertEqual(out["skipped"], ["/ModX/Data"])
+        self.assertEqual(u.BlueprintEditorLibrary.compile_blueprint.call_count, 2)
+        u.EditorAssetLibrary.save_loaded_asset.assert_not_called()
 
     def test_prepare_refuses_pie_without_unloading(self):
         u = self.u
