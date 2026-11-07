@@ -53,8 +53,9 @@ def _templates(items, errors, what):
     return out
 
 
-def _function_index(wanted):
-    """{class path name: [function names]} in one pass over all fields (UFunctions show up with python type 'Struct')."""
+def _function_index(wanted, objs=None):
+    """{class path name: [function names]} in one pass over all fields (UFunctions show up with python type 'Struct').
+    When `objs` is a dict it also receives {(class path name, function name): UFunction}."""
     found = {}
     for f in unreal.ObjectIterator(unreal.Field):
         try:
@@ -64,6 +65,8 @@ def _function_index(wanted):
             key = outer.get_path_name() if outer else ""
             if key in wanted:
                 found.setdefault(key, []).append(f.get_name())
+                if objs is not None:
+                    objs[(key, f.get_name())] = f
         except Exception:
             continue
     return found
@@ -109,10 +112,12 @@ def run(job):
         except Exception as e:
             errors.append("class %s: %s" % (p, str(e)[:200]))
 
-    funcs_by_outer = _function_index({v[1] for k, v in loaded.items() if k in classes_in})
+    func_objs = {}
+    funcs_by_outer = _function_index({v[1] for k, v in loaded.items() if k in classes_in}, func_objs)
 
     result_classes = {}
     call_items, key_info = {}, {}
+    meta_items = []   # [((class path, function name), UFunction)]
     defaults_items = {}
     for p in classes_in:
         if p not in loaded:
@@ -125,12 +130,17 @@ def run(job):
             key = "f%d" % len(call_items)
             call_items[key] = (CALL, rp.call_body(ct, n))
             key_info[key] = (p, "functions", n)
+            if (pname, n) in func_objs:
+                meta_items.append(((p, n), func_objs[(pname, n)]))
         defaults_items["d%d" % len(defaults_items)] = (DEFAULTS, [rp.class_pin_line(pname, meta)])
         key_info["d%d" % (len(defaults_items) - 1)] = (p, "defaults", None)
 
+    # function metadata (tooltip, display name) from the UFunction's metadata tags; None where unreadable or over the time cap
+    metas = rp.collect_function_meta(lambda f, tag: unreal.EditorAssetLibrary.get_metadata_tag(f, tag), meta_items)
+
     for key, pins in _templates(call_items, errors, "function").items():
         p, _slot, n = key_info[key]
-        result_classes[p]["functions"].append({"name": n, "pins": pins})
+        result_classes[p]["functions"].append({"name": n, "pins": pins, "meta": metas.get((p, n))})
 
     # properties: the output pins of a GetClassDefaults node name the readable properties; one VariableGet each gives the pins
     get_items = {}

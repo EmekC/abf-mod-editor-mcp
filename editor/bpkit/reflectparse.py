@@ -123,3 +123,35 @@ def cast_pin(pins):
 
 def SKIP_FUNCTION(name):
     return name.startswith("ExecuteUbergraph_") or name.endswith("__DelegateSignature")
+
+
+META_BUDGET_SECONDS = 20.0
+
+
+def read_function_meta(read_tag, fn):
+    """{"tooltip": str|None, "displayName": str|None} of one UFunction; read_tag(fn, tag) -> str (the engine route is
+    unreal.EditorAssetLibrary.get_metadata_tag). A failing or empty read gives None."""
+    out = {}
+    for key, tag in (("tooltip", "ToolTip"), ("displayName", "DisplayName")):
+        try:
+            v = read_tag(fn, tag)
+            v = str(v).strip() if v is not None else ""
+            out[key] = v or None
+        except Exception:
+            out[key] = None
+    return out
+
+
+def collect_function_meta(read_tag, items, budget=META_BUDGET_SECONDS, clock=None):
+    """items: [(key, fn)] -> {key: meta}. Once the whole pass has run longer than `budget` seconds the remaining
+    functions get a meta with both fields None."""
+    import time
+    clock = clock or time.monotonic
+    start = clock()
+    out = {}
+    for key, fn in items:
+        if clock() - start > budget:
+            out[key] = {"tooltip": None, "displayName": None}
+        else:
+            out[key] = read_function_meta(read_tag, fn)
+    return out

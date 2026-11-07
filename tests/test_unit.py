@@ -541,6 +541,52 @@ class SpecTests(unittest.TestCase):
     def test_valid_sample_passes(self):
         self.assertEqual(specs.validate(self.GOOD, "Mod"), [])
 
+    def test_event_meta_prop_text_and_escaping(self):
+        text = t3d.function_meta_prop({"tooltip": 'Say "hi"\nsecond \\ line\r', "category": "My Cat", "keywords": "a b"}, "Go")
+        key = lambda field: hashlib.md5(("Go:" + field).encode("utf-8")).hexdigest().upper()
+        self.assertEqual(text, 'MetaData=(ToolTip=NSLOCTEXT("", "%s", "Say \\"hi\\"\\nsecond \\\\ line"),'
+                               'Category=NSLOCTEXT("", "%s", "My Cat"),Keywords=NSLOCTEXT("", "%s", "a b"))'
+                         % (key("ToolTip"), key("Category"), key("Keywords")))
+        self.assertNotIn("\n", text)
+        self.assertNotIn("\r", text)
+        # only non-empty fields, stable keys, custom property name
+        only_cat = t3d.function_meta_prop({"tooltip": "", "category": "C", "keywords": "  "}, "Go", prop="FunctionMetaData")
+        self.assertEqual(only_cat, 'FunctionMetaData=(Category=NSLOCTEXT("", "%s", "C"))' % key("Category"))
+        self.assertEqual(t3d.function_meta_prop({"tooltip": "T"}, "Go"), t3d.function_meta_prop({"tooltip": "T"}, "Go"))
+        self.assertNotEqual(t3d.function_meta_prop({"tooltip": "T"}, "Go"), t3d.function_meta_prop({"tooltip": "T"}, "Other"))
+        self.assertIsNone(t3d.function_meta_prop({}, "Go"))
+        self.assertIsNone(t3d.function_meta_prop({"tooltip": " "}, "Go"))
+
+    def test_event_node_gets_meta_prop(self):
+        env = None
+        node = {"id": "x", "k": "event", "name": "Go", "meta": {"tooltip": "Does it"}}
+        cls, body = specs.NODE_KINDS["event"](node, env)
+        self.assertEqual(body[0], 'CustomFunctionName="Go"')
+        self.assertEqual(body[-1], t3d.function_meta_prop({"tooltip": "Does it"}, "Go"))
+        self.assertTrue(body[-1].startswith('MetaData=(ToolTip=NSLOCTEXT("", "'))
+        cls, plain = specs.NODE_KINDS["event"]({"id": "x", "k": "event", "name": "Go"}, env)
+        self.assertEqual(plain, ['CustomFunctionName="Go"'])
+        cls, empty = specs.NODE_KINDS["event"]({"id": "x", "k": "event", "name": "Go", "meta": {"tooltip": ""}}, env)
+        self.assertEqual(empty, ['CustomFunctionName="Go"'])
+
+    def test_event_meta_validation(self):
+        def event(meta):
+            def m(a):
+                a["graphs"][0]["add"].append({"id": "ev", "k": "event", "name": "Go", "meta": meta})
+            return m
+        self.assertIn("event_meta", specs.FEATURES)
+        self.assertEqual(list(specs.FEATURES), sorted(specs.FEATURES))
+        self.assertEqual(self.problems(event({"tooltip": "T", "category": "C", "keywords": "K"})), [])
+        self.assertTrue(any("meta must be an object" in p for p in self.problems(event("text"))))
+        self.assertTrue(any("unknown key 'summary'" in p for p in self.problems(event({"summary": "x"}))))
+        self.assertTrue(any("tooltip must be a string" in p for p in self.problems(event({"tooltip": 5}))))
+        self.assertTrue(any("longer than 2000" in p for p in self.problems(event({"tooltip": "x" * 2001}))))
+        self.assertEqual(self.problems(event({"tooltip": "x" * 2000})), [])
+
+        def on_call(a):
+            a["graphs"][0]["add"].append({"id": "c", "k": "call", "function": "F", "meta": {"tooltip": "T"}})
+        self.assertTrue(any("meta is only offered for k=event" in p for p in self.problems(on_call)))
+
     def test_pin_types_validation(self):
         def add(extra):
             def m(a):

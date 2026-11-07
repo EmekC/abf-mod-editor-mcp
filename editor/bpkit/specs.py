@@ -42,8 +42,13 @@ def _var(kind):
 
 def _event(node, env):
     _req(node, "name")
-    return BP + "K2Node_CustomEvent", ['CustomFunctionName="%s"' % node["name"]] + [
+    props = ['CustomFunctionName="%s"' % node["name"]] + [
         t3d.user_pin(p["name"], p["type"], "out") for p in node.get("params") or []]
+    if node.get("meta"):
+        meta_prop = t3d.function_meta_prop(node["meta"], node["name"])
+        if meta_prop:
+            props.append(meta_prop)
+    return BP + "K2Node_CustomEvent", props
 
 
 def _override(node, env):
@@ -117,7 +122,9 @@ REQUIRED = {
 CREATE_CLASSES = ("Blueprint", "WidgetBlueprint", "BlueprintInterface", "UserDefinedStruct")
 RAW_KINDS = ("graph", "tree", "tree_replace", "python")
 # bp_apply features reported by the backend_info tool
-FEATURES = ("cast_object_pin", "map_types", "pin_types", "self_event_calls", "set_types", "struct_fields")
+FEATURES = ("cast_object_pin", "event_meta", "map_types", "pin_types", "self_event_calls", "set_types", "struct_fields")
+EVENT_META_KEYS = ("tooltip", "category", "keywords")
+EVENT_META_MAX = 2000
 # keys that make no sense on a UserDefinedStruct asset
 _STRUCT_FORBIDDEN_KEYS = ("variables", "remove_variables", "components", "dispatchers", "timelines", "widget_tree", "animations",
                           "macros", "functions", "remove_functions", "interfaces", "graphs", "raw")
@@ -140,6 +147,19 @@ def _check_params(problems, where, items):
             problems.append("%s[%d] needs name and type" % (where, i))
         else:
             _check_type(problems, "%s[%d] (%s)" % (where, i, p["name"]), p["type"])
+
+
+def _check_event_meta(problems, where, meta):
+    if not isinstance(meta, dict):
+        problems.append("%s must be an object {tooltip, category, keywords}" % where)
+        return
+    for key, value in meta.items():
+        if key not in EVENT_META_KEYS:
+            problems.append("%s: unknown key %r (known: %s)" % (where, key, ", ".join(EVENT_META_KEYS)))
+        elif not isinstance(value, str):
+            problems.append("%s.%s must be a string" % (where, key))
+        elif len(value) > EVENT_META_MAX:
+            problems.append("%s.%s is longer than %d characters" % (where, key, EVENT_META_MAX))
 
 
 def check_struct_fields(w, a):
@@ -233,6 +253,11 @@ def _check_graph_nodes(problems, where, nodes, wires, reserved, existing_ok):
                         problems.append(pw + ": exec is not a data type")
                     else:
                         _check_type(problems, pw, ts)
+        if "meta" in n:
+            if k != "event":
+                problems.append("%s: meta is only offered for k=event" % w)
+            else:
+                _check_event_meta(problems, w + ".meta", n["meta"])
         if k in ("get", "set") and n.get("type"):
             _check_type(problems, w + ".type", n["type"])
     for i, wr in enumerate(wires or []):
