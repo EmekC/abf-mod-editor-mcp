@@ -14,7 +14,7 @@ Three tools are registered only when the server starts with `ABF_ABFC_TOOLS=1` (
 ### `abfc_extensions` (no arguments, no editor)
 
 ```json
-{ "extProtocol": 1, "serverVersion": "2.4.0", "python": "3.11.9",
+{ "extProtocol": 1, "serverVersion": "2.5.0", "python": "3.11.9",
   "features": ["reflect", "compile_node_refs", "bp_read_seconds"] }
 ```
 
@@ -60,7 +60,7 @@ argument wins over the variable. Skipped means every function has `meta: null`.
 Core tool, no editor needed, no arguments. Keys:
 
 - `protocol`: backend protocol number (`1`).
-- `serverVersion`: this server's version (`"2.4.0"`).
+- `serverVersion`: this server's version (`"2.5.0"`).
 - `engineVersion`: `Major.Minor.Patch` from `<editor root>/Engine/Build/Build.version`, `null` when the file is missing or unreadable.
 - `editorRoot`, `headlessDir`, `documentsDir`: the paths the server uses (`editorRoot` is `null` when no editor install was found).
 - `capabilities.pinTypes`: `bp_apply` node specs accept `pin_types` (wildcard pin resolution in one pass).
@@ -75,6 +75,7 @@ Core tool, no editor needed, no arguments. Keys:
 - `capabilities.gameTest`: `bp_game_test` is available.
 - `capabilities.audit`: `mod_audit` is available.
 - `capabilities.publish`: `bp_publish` is available.
+- `capabilities.classManagerRows` (2.5.0): `bp_apply` accepts the asset-spec key `class_manager_row` (below).
 - `bpApply.features`, `bpApply.nodeKinds`: the `bp_apply` feature flags and node kinds this build understands.
 
 ## Additive keys in existing tools
@@ -91,6 +92,26 @@ Core tool, no editor needed, no arguments. Keys:
 - Compile entries (`headless.parse_compile_log`, also in `bp_apply` and `mod_audit` results): an entry with a source is
   `{ asset, message, source, graph, node }`; without a source it stays exactly `{ asset, message }`. Messages are deduplicated by
   severity, asset, text and source, so the same text on two different nodes is kept twice.
+
+## Class-manager rows: `class_manager_row` in a `bp_apply` asset spec (2.5.0)
+
+```json
+{ "asset": "/ExampleMod/Feature/BPC_Director",
+  "class_manager_row": { "asset_path": "/ExampleMod/DataTables/DT_ClassManager/EntityDirector_Feature",
+                         "class_path": "/ExampleMod/Feature/BPC_Director.BPC_Director_C" } }
+```
+
+- Validation (before anything launches): both values are required strings matching `/Folder/.../Name`; `class_path` ends in
+  `.<Name>_C`; both must start with `/<mod>/` (`/Game` and other roots are refused); no other keys; not valid on a
+  `UserDefinedStruct` spec.
+- Execution: in the same run, after every asset of the batch is applied, compiled and saved, the row asset is loaded or, when
+  missing, created as a `ClassManagerModRowAsset` (a data asset; its `row_name` is set to the asset name). Only the class reference
+  of the row (`row.object_class`, set to the loaded generated class) is written; every other field keeps its value (a new row has
+  the defaults of a fresh `ClassManagerData`: empty gameplay tag, release group `CORE`; `override_existing_row` stays `false`).
+  The row is saved only when it was created or its class reference differed.
+- Result: `rows: [{ asset, created, changed }]` (in the order of the specs that carry the key; `[]` otherwise). Any failure is an
+  error of the whole call, and the staged files, including the row asset, are rolled back like any other failed `bp_apply`.
+- A staged row asset is published by `bp_publish` like any other changed or added file when it is named in `assets`.
 
 ## `mod_audit` on the stage (`backend_info.capabilities.stageAudit`)
 
@@ -157,7 +178,7 @@ Opt-in, off by default. With `ABF_WARM_SESSION=1` the server keeps one hidden `-
 abfc needs protocol >= 1 (a lower number is its error ABFC4001) and warns below server version 2.4.0 (ABFC4014). It reads
 `backend_info`: `protocol`, `serverVersion`, `engineVersion`, `capabilities` (`pinTypes`, `containerTypes` for diagnostics,
 `warmSession`, `stageAudit`, `compileErrorNodeRefs`, and the other keys above) and `bpApply.features` (`pin_types`, `cast_object_pin`,
-`map_types`, `set_types`, `struct_fields`, `event_meta`, `self_event_calls`) and `bpApply.nodeKinds`. `pinTypes` is on only when the
+`map_types`, `set_types`, `struct_fields`, `event_meta`, `self_event_calls`, `class_manager_row`) and `bpApply.nodeKinds`. `pinTypes` is on only when the
 tool lists `pin_types`; otherwise (including a backend without `backend_info`) abfc uses a two-phase route: apply, read the rolled-back
 `final_<i>.t3d`, patch the wildcard pins, re-apply as a raw graph. Everything `backend_info` does not report comes from `tools/list`
 (for example whether `reflect` is registered), from `abfc_extensions` and from a static `bp_apply` protocol-1 baseline inside abfc. A

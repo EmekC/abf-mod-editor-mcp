@@ -48,7 +48,13 @@ def op_apply(job):
         if not unreal.EditorAssetLibrary.save_loaded_asset(bp, False):
             raise RuntimeError("could not save " + core.pth(bp))
         saved += 1
-    return {"assets": reports, "saved": saved}
+    rows = []
+    for spec in job["assets"]:  # after the saves: a row references the generated class, which must exist on disk first
+        row = spec.get("class_manager_row")
+        if row:
+            from . import rows as rows_mod
+            rows.append(rows_mod.ensure_class_manager_row(row["asset_path"], row["class_path"]))
+    return {"assets": reports, "saved": saved, "rows": rows}
 
 
 def op_compile(job):

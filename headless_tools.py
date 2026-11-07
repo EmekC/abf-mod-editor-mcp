@@ -305,6 +305,11 @@ def build(run_json, remote_errors, t3d_errors, kit_root, forbidden, py_status, l
         if problems:
             return {"ok": False, "error": "invalid spec", "problems": problems}
         stems = ["Content/" + a["asset"][len("/%s/" % mod):] for a in batch["assets"]]
+        for a in batch["assets"]:   # a row asset is part of the edit: snapshot it, and roll it back with the rest
+            row = a.get("class_manager_row")
+            stem = "Content/" + row["asset_path"][len("/%s/" % mod):] if row else None
+            if stem and stem not in stems:
+                stems.append(stem)
         existing = {}
 
         def snapshot(run):
@@ -349,7 +354,8 @@ def build(run_json, remote_errors, t3d_errors, kit_root, forbidden, py_status, l
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, dst)
             rolled_back = True
-        out = {"ok": ok, "rolled_back": rolled_back, "assets": (res.get("result") or {}).get("assets"), "compile": compile_,
+        out = {"ok": ok, "rolled_back": rolled_back, "assets": (res.get("result") or {}).get("assets"),
+               "rows": (res.get("result") or {}).get("rows") or [], "compile": compile_,
                "problems": t3d_problems, "run": res["run"], "seconds": res["seconds"], "warm": bool(res.get("warm"))}
         if not ok:
             out["error"] = (res.get("error") or ("%d compile error(s) in the edited assets" % len(target_errors)))
@@ -550,7 +556,7 @@ def build(run_json, remote_errors, t3d_errors, kit_root, forbidden, py_status, l
          dict(mod=STR), ["mod"]),
         ("bp_apply", t_bp_apply,
          "Create or edit Blueprints headlessly on the staged copy, with no editor window and no mouse or keyboard. A JSON batch of asset specs: "
-         "variables, functions, nodes and wires, components, widget tree, macros, dispatchers, interfaces, timelines, widget animations, raw T3D. "
+         "variables, functions, nodes and wires, components, widget tree, macros, dispatchers, interfaces, timelines, widget animations, raw T3D, and class_manager_row (create or update the class-manager row of the asset's class). "
          "Generated nodes are placed below existing ones. Compile errors roll the staged files back (unless keep_on_error). See the README spec reference.",
          dict(mod=STR, assets={"type": "array", "items": OBJ}, spec_file=STR, keep_on_error=BOOL, timeout_seconds=NUM), ["mod"]),
         ("bp_read", t_bp_read,

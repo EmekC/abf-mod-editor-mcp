@@ -122,12 +122,15 @@ REQUIRED = {
 CREATE_CLASSES = ("Blueprint", "WidgetBlueprint", "BlueprintInterface", "UserDefinedStruct")
 RAW_KINDS = ("graph", "tree", "tree_replace", "python")
 # bp_apply features reported by the backend_info tool
-FEATURES = ("cast_object_pin", "event_meta", "map_types", "pin_types", "self_event_calls", "set_types", "struct_fields")
+FEATURES = ("cast_object_pin", "class_manager_row", "event_meta","map_types", "pin_types", "self_event_calls", "set_types", "struct_fields")
 EVENT_META_KEYS = ("tooltip", "category", "keywords")
 EVENT_META_MAX = 2000
 # keys that make no sense on a UserDefinedStruct asset
 _STRUCT_FORBIDDEN_KEYS = ("variables", "remove_variables", "components", "dispatchers", "timelines", "widget_tree", "animations",
-                          "macros", "functions", "remove_functions", "interfaces", "graphs", "raw")
+                          "macros", "functions", "remove_functions", "interfaces", "graphs", "raw", "class_manager_row")
+_ROW_ASSET_RX = re.compile(r"^/[A-Za-z0-9_]+(/[A-Za-z0-9_]+)+$")
+_ROW_CLASS_RX = re.compile(r"^/[A-Za-z0-9_]+(/[A-Za-z0-9_]+)+\.[A-Za-z0-9_]+_C$")
+_ROW_KEYS = ("asset_path", "class_path")
 _FORBIDDEN_CODE = tuple("delete_" + n for n in ("asset", "directory", "loaded_asset")) + ("reparent_" + "blueprint", "rename_asset")
 
 
@@ -192,6 +195,29 @@ def check_struct_fields(w, a):
             t3d.struct_var_line(f)
         except SpecError as e:
             problems.append("%s (%s): %s" % (fw, f["name"], e))
+    return problems
+
+
+def check_class_manager_row(w, row, mod):
+    """Problems of an asset spec's class_manager_row: {asset_path, class_path}, both inside the mod, never /Game."""
+    if not isinstance(row, dict):
+        return [w + ".class_manager_row must be an object {asset_path, class_path}"]
+    problems = []
+    for key in row:
+        if key not in _ROW_KEYS:
+            problems.append("%s.class_manager_row: unknown key %r (known: %s)" % (w, key, ", ".join(_ROW_KEYS)))
+    prefix = "/%s/" % mod
+    for key, rx, shape in (("asset_path", _ROW_ASSET_RX, "/<Mod>/Folder/RowName"), ("class_path", _ROW_CLASS_RX, "/<Mod>/Folder/BP_X.BP_X_C")):
+        value = row.get(key)
+        kw = "%s.class_manager_row.%s" % (w, key)
+        if not isinstance(value, str) or not value:
+            problems.append("%s is required (a string like %s)" % (kw, shape))
+        elif value.startswith("/Game/") or value == "/Game":
+            problems.append(kw + ": /Game is base content and is never edited")
+        elif not rx.match(value):
+            problems.append("%s: %r is not a path like %s" % (kw, value, shape))
+        elif not value.startswith(prefix):
+            problems.append("%s: must start with %s (other roots are refused)" % (kw, prefix))
     return problems
 
 
@@ -307,6 +333,8 @@ def validate(batch, mod):
             continue
         if "struct_fields" in a:
             problems.append(w + ": struct_fields is only valid with create.class UserDefinedStruct")
+        if "class_manager_row" in a:
+            problems.extend(check_class_manager_row(w, a["class_manager_row"], mod))
         for i, v in enumerate(a.get("variables") or []):
             if not isinstance(v, dict) or not v.get("name") or "type" not in v:
                 problems.append("%s.variables[%d] needs name and type" % (w, i))

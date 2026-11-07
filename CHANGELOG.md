@@ -2,6 +2,19 @@
 
 All notable changes to abf-mod-editor-mcp. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.5.0] - Unreleased
+
+### Added
+
+- `bp_apply` asset-spec key `class_manager_row: { asset_path, class_path }`: loads or creates the class-manager row asset
+  (`ClassManagerModRowAsset`, row name equal to the asset name) and sets its class reference to the generated class of the asset,
+  without touching other fields. The result gains `rows: [{ asset, created, changed }]`; a failure rolls back the staged row file
+  with the rest of the call. `bpApply.features` lists `class_manager_row`, and `backend_info.capabilities.classManagerRows` is `true`.
+
+### Changed
+
+- `SERVER_VERSION` is `2.5.0`.
+
 ## [2.4.0] - 2026-11-07
 
 ### Added

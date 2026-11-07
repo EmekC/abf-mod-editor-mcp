@@ -1385,5 +1385,186 @@ class StageAuditPickerTests(unittest.TestCase):
         self.assertIs(BackendInfoCapabilityTests().capabilities(False)["stageAudit"], True)
 
 
+class ClassManagerRowSpecTests(unittest.TestCase):
+    """The class_manager_row asset-spec key: validation on the host, no editor."""
+    ROW = "/TestMod/DataTables/DT_ClassManager/EntityDirector_Test"
+    CLS = "/TestMod/Feature/BPC_Test.BPC_Test_C"
+
+    def validate(self, row, **extra):
+        from bpkit import specs
+        spec = {"asset": "/TestMod/Feature/BPC_Test", "class_manager_row": row}
+        spec.update(extra)
+        return specs.validate({"assets": [spec]}, "TestMod")
+
+    def good(self):
+        return {"asset_path": self.ROW, "class_path": self.CLS}
+
+    def test_good_entry_is_accepted(self):
+        self.assertEqual(self.validate(self.good()), [])
+
+    def test_feature_is_listed_in_sorted_order(self):
+        from bpkit import specs
+        self.assertIn("class_manager_row", specs.FEATURES)
+        self.assertEqual(list(specs.FEATURES), sorted(specs.FEATURES))
+
+    def test_game_paths_are_refused(self):
+        self.assertTrue(any("/Game" in p for p in self.validate(dict(self.good(), asset_path="/Game/DataTables/Row"))))
+        self.assertTrue(any("/Game" in p for p in self.validate(dict(self.good(), class_path="/Game/Feature/BP_X.BP_X_C"))))
+
+    def test_other_mod_roots_are_refused(self):
+        self.assertTrue(any("must start with /TestMod/" in p for p in self.validate(dict(self.good(), asset_path="/OtherMod/Tables/Row"))))
+        self.assertTrue(any("must start with /TestMod/" in p for p in self.validate(dict(self.good(), class_path="/OtherMod/Feature/BP_X.BP_X_C"))))
+
+    def test_bad_class_path_shapes(self):
+        for bad in ("/TestMod/Feature/BPC_Test", "/TestMod/Feature/BPC_Test.BPC_Test", "/TestMod/Feature/BPC Test.BPC_Test_C",
+                    "TestMod/Feature/BPC_Test.BPC_Test_C"):
+            self.assertTrue(self.validate(dict(self.good(), class_path=bad)), bad)
+
+    def test_bad_asset_path_shapes(self):
+        for bad in ("/TestMod", "/TestMod/Row.Row", "/TestMod/Tables/Row/", "/TestMod/Tables/Ro-w", "TestMod/Tables/Row"):
+            self.assertTrue(self.validate(dict(self.good(), asset_path=bad)), bad)
+
+    def test_missing_keys_and_wrong_types(self):
+        self.assertTrue(any("asset_path is required" in p for p in self.validate({"class_path": self.CLS})))
+        self.assertTrue(any("class_path is required" in p for p in self.validate({"asset_path": self.ROW})))
+        self.assertTrue(any("must be an object" in p for p in self.validate("nope")))
+        self.assertTrue(any("unknown key" in p for p in self.validate(dict(self.good(), extra=1))))
+        self.assertTrue(self.validate(dict(self.good(), asset_path=5)))
+
+    def test_not_valid_on_a_struct_spec(self):
+        from bpkit import specs
+        spec = {"asset": "/TestMod/Feature/S_X", "create": {"class": "UserDefinedStruct"}, "class_manager_row": self.good(),
+                "struct_fields": [{"name": "A_0_" + "0" * 32, "friendly": "A", "guid": "0" * 32, "type": "int"}]}
+        self.assertTrue(any("class_manager_row" in p for p in specs.validate({"assets": [spec]}, "TestMod")))
+
+    def test_backend_info_reports_the_capability(self):
+        caps = BackendInfoCapabilityTests().capabilities(False)
+        self.assertIs(caps["classManagerRows"], True)
+
+    def test_server_version_is_2_5_0(self):
+        text = (ROOT / "server.py").read_text(encoding="utf-8")
+        self.assertIn('SERVER_VERSION = "2.5.0"', text)
+
+
+class ClassManagerRowEditorSideTests(unittest.TestCase):
+    """editor/bpkit/rows.py with a stubbed `unreal` module."""
+
+    ROW = "/TestMod/DataTables/DT_ClassManager/EntityDirector_Test"
+    CLS = "/TestMod/Feature/BPC_Test.BPC_Test_C"
+
+    class Cls:
+        def __init__(self, path):
+            self.path = path
+
+        def get_path_name(self):
+            return self.path
+
+    class RowData:
+        def __init__(self, cls=None):
+            self.props = {"object_class": cls, "gameplay_tag": "", "release_group": 0}
+
+        def get_editor_property(self, key):
+            return self.props[key]
+
+        def set_editor_property(self, key, value):
+            self.props[key] = value
+
+    def setUp(self):
+        patcher = mock.patch.dict(sys.modules, {"unreal": mock.MagicMock()})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        import bpkit
+        import importlib
+        for short in ("core", "rows"):
+            name = "bpkit." + short
+            sys.modules.pop(name, None)
+            if hasattr(bpkit, short):
+                delattr(bpkit, short)        # `from . import core` would otherwise return the module bound to an older stub
+            self.addCleanup(sys.modules.pop, name, None)
+            self.addCleanup(lambda s=short: hasattr(bpkit, s) and delattr(bpkit, s))
+        self.rows = importlib.import_module("bpkit.rows")
+        self.u = sys.modules["unreal"]
+        outer = self
+
+        class FakeRowAsset:
+            def __init__(self, row):
+                self.props = {"row": row, "row_name": None}
+                self.saved = False
+
+            def get_editor_property(self, key):
+                return self.props[key]
+
+            def set_editor_property(self, key, value):
+                self.props[key] = value
+
+            def get_class(self):
+                return mock.MagicMock()
+
+        self.FakeRowAsset = FakeRowAsset
+        self.u.ClassManagerModRowAsset = FakeRowAsset
+        self.u.load_class.return_value = self.Cls(self.CLS)
+        self.u.EditorAssetLibrary.save_loaded_asset.return_value = True
+        self.outer = outer
+
+    def test_missing_row_is_created_with_name_and_class(self):
+        u = self.u
+        u.EditorAssetLibrary.does_asset_exist.return_value = False
+        made = self.FakeRowAsset(self.RowData())
+        u.AssetToolsHelpers.get_asset_tools.return_value.create_asset.return_value = made
+        res = self.rows.ensure_class_manager_row(self.ROW, self.CLS)
+        self.assertEqual(res, {"asset": self.ROW, "created": True, "changed": True})
+        self.assertEqual(made.props["row_name"], "EntityDirector_Test")
+        self.assertEqual(made.props["row"].props["object_class"].get_path_name(), self.CLS)
+        self.assertEqual(made.props["row"].props["release_group"], 0)
+        args = u.AssetToolsHelpers.get_asset_tools.return_value.create_asset.call_args[0]
+        self.assertEqual(args[:2], ("EntityDirector_Test", "/TestMod/DataTables/DT_ClassManager"))
+        u.EditorAssetLibrary.save_loaded_asset.assert_called_once()
+
+    def test_row_that_already_references_the_class_is_left_alone(self):
+        u = self.u
+        u.EditorAssetLibrary.does_asset_exist.return_value = True
+        existing = self.FakeRowAsset(self.RowData(self.Cls(self.CLS)))
+        u.load_asset.return_value = existing
+        res = self.rows.ensure_class_manager_row(self.ROW, self.CLS)
+        self.assertEqual(res, {"asset": self.ROW, "created": False, "changed": False})
+        u.EditorAssetLibrary.save_loaded_asset.assert_not_called()
+
+    def test_row_with_another_class_changes_only_the_class(self):
+        u = self.u
+        u.EditorAssetLibrary.does_asset_exist.return_value = True
+        data = self.RowData(self.Cls("/TestMod/Other/BP_Old.BP_Old_C"))
+        data.props["release_group"] = 3
+        existing = self.FakeRowAsset(data)
+        u.load_asset.return_value = existing
+        res = self.rows.ensure_class_manager_row(self.ROW, self.CLS)
+        self.assertEqual(res, {"asset": self.ROW, "created": False, "changed": True})
+        self.assertEqual(existing.props["row"].props["object_class"].get_path_name(), self.CLS)
+        self.assertEqual(existing.props["row"].props["release_group"], 3)
+        u.EditorAssetLibrary.save_loaded_asset.assert_called_once()
+
+    def test_game_paths_and_foreign_assets_are_refused(self):
+        u = self.u
+        with self.assertRaises(RuntimeError):
+            self.rows.ensure_class_manager_row("/Game/Tables/Row", self.CLS)
+        u.EditorAssetLibrary.does_asset_exist.return_value = True
+        u.load_asset.return_value = mock.MagicMock()
+        with self.assertRaises(RuntimeError):
+            self.rows.ensure_class_manager_row(self.ROW, self.CLS)
+
+    def test_unsaved_row_is_an_error(self):
+        u = self.u
+        u.EditorAssetLibrary.does_asset_exist.return_value = False
+        u.AssetToolsHelpers.get_asset_tools.return_value.create_asset.return_value = self.FakeRowAsset(self.RowData())
+        u.EditorAssetLibrary.save_loaded_asset.return_value = False
+        with self.assertRaises(RuntimeError):
+            self.rows.ensure_class_manager_row(self.ROW, self.CLS)
+
+    def test_editor_side_files_compile(self):
+        tmp = Path(tempfile.mkdtemp(prefix="abfrows"))
+        self.addCleanup(shutil.rmtree, str(tmp), True)
+        for rel in ("editor/bpkit/rows.py", "editor/bpkit/jobs.py"):
+            py_compile.compile(str(ROOT / rel), cfile=str(tmp / "x.pyc"), doraise=True)
+
+
 if __name__ == "__main__":
     unittest.main()

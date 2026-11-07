@@ -38,7 +38,7 @@ import staging   # noqa: E402
 from bpkit import specs  # noqa: E402
 
 SERVER_NAME = "abiotic-mod-editor"
-SERVER_VERSION = "2.4.0"
+SERVER_VERSION = "2.5.0"
 BACKEND_PROTOCOL = 1
 
 EDITOR_ROOT = paths.find_editor_root()          # None when no Mod Editor install was found
@@ -1228,7 +1228,8 @@ def t_backend_info(args):
                                    "warmSession": headless.warm_enabled(), "stageAudit": True,
                                    "reflect": os.environ.get("ABF_ABFC_TOOLS") == "1", "compileErrorNodeRefs": True,
                                    "functionLocals": False, "userPureFunctions": False,
-                                   "createKinds": list(specs.CREATE_CLASSES), "gameTest": True, "audit": True, "publish": True},
+                                   "createKinds": list(specs.CREATE_CLASSES), "gameTest": True, "audit": True, "publish": True,
+                                   "classManagerRows": True},
                   "bpApply": {"features": list(specs.FEATURES), "nodeKinds": sorted(specs.NODE_KINDS)}})
 
 
