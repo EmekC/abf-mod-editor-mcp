@@ -43,6 +43,8 @@ def op_apply(job):
         bps.append(bp)
     saved = 0
     for bp in bps:             # reached only when every asset applied without an exception
+        if bp is None:         # an unchanged struct: nothing to save
+            continue
         if not unreal.EditorAssetLibrary.save_loaded_asset(bp, False):
             raise RuntimeError("could not save " + core.pth(bp))
         saved += 1
