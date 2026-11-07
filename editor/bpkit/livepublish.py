@@ -21,31 +21,75 @@ def _call_problem(what, res):
     return None
 
 
+_MAX_REFERENCERS = 200
+
+
 def _loaded_referencers(root, pkgs):
     """Loaded packages inside `root` (the mod, never /Game) that reference any of `pkgs`, hard or soft, per the asset registry,
-    excluding `pkgs` themselves. Direct referencers only. Returns (reloadable, skipped); a loaded map is skipped, because
-    reloading it would pull the open level out from under the user."""
+    excluding `pkgs` themselves. Transitive: the referencers of a referencer count too (breadth first), because a package
+    that only references a referencer still holds pins of the classes that referencer replaces. Returns (reloadable, skipped)
+    with `reloadable` in discovery order (the reload order is fixed later, by `_dependency_order`). A loaded map is skipped
+    and not expanded, because reloading it would pull the open level out from under the user. At most 200 are returned."""
     found, skipped = [], []
     if not root:
         return found, skipped
     reg = unreal.AssetRegistryHelpers.get_asset_registry()
     opts = unreal.AssetRegistryDependencyOptions(include_soft_package_references=True, include_hard_package_references=True)
-    for p in pkgs:
+    seen = set(pkgs)
+    frontier = list(pkgs)
+    while frontier:
+        following = []
+        for p in frontier:
+            try:
+                refs = reg.get_referencers(p, opts)
+            except Exception:
+                continue
+            for r in refs or []:
+                n = str(r)
+                if n in seen or not n.startswith(root + "/"):
+                    continue
+                seen.add(n)
+                if unreal.find_package(n) is None:
+                    continue
+                obj = unreal.find_object(None, "%s.%s" % (n, n.rsplit("/", 1)[-1]))
+                if obj is None:
+                    continue
+                if obj.get_class().get_name() == "World":
+                    skipped.append(n)
+                    continue
+                found.append(n)
+                following.append(n)
+                if len(found) >= _MAX_REFERENCERS:
+                    return found, sorted(skipped)
+        frontier = following
+    return found, sorted(skipped)
+
+
+def _dependency_order(names):
+    """`names` ordered so that every package comes after the packages of `names` it depends on (per the asset registry,
+    hard or soft); ties keep the input order. Packages on a dependency cycle, and what is left after one, are appended in
+    input order. A registry error counts as no dependencies."""
+    names = list(dict.fromkeys(names))
+    if len(names) < 2:
+        return names
+    reg = unreal.AssetRegistryHelpers.get_asset_registry()
+    opts = unreal.AssetRegistryDependencyOptions(include_soft_package_references=True, include_hard_package_references=True)
+    deps = {}
+    for n in names:
         try:
-            refs = reg.get_referencers(p, opts)
+            ds = reg.get_dependencies(n, opts)
         except Exception:
-            continue
-        for r in refs or []:
-            n = str(r)
-            if n in pkgs or n in found or n in skipped or not n.startswith(root + "/"):
-                continue
-            if unreal.find_package(n) is None:
-                continue
-            obj = unreal.find_object(None, "%s.%s" % (n, n.rsplit("/", 1)[-1]))
-            if obj is None:
-                continue
-            (skipped if obj.get_class().get_name() == "World" else found).append(n)
-    return sorted(found), sorted(skipped)
+            ds = []
+        deps[n] = {d for d in (str(x) for x in ds or []) if d != n and d in names}
+    ordered, placed, rest = [], set(), names
+    while rest:
+        ready = next((n for n in rest if deps[n] <= placed), None)
+        if ready is None:
+            break
+        ordered.append(ready)
+        placed.add(ready)
+        rest = [n for n in rest if n != ready]
+    return ordered + rest
 
 
 def prepare(args):
@@ -102,8 +146,10 @@ def prepare(args):
 
 def reload_assets(args):
     """Rescan the mod's folder, load each package (missing ones are reported) and reload them without asking. `packages` are
-    the ones that were replaced; `also` are loaded referencers that stay unchanged on disk and are reloaded in the same call,
-    after the replaced ones, so they are rebuilt from their files against the new classes and not recompiled against the old.
+    the ones that were replaced; `also` are loaded referencers (direct or transitive) that stay unchanged on disk and are
+    reloaded in the same call, so they are rebuilt from their files against the new classes and not recompiled against the old.
+    All of them are reloaded in dependency order (dependencies first, `_dependency_order`): a package reloaded before a
+    package it depends on keeps pins of that package's replaced class and shows compile errors (ABFC7013).
     `prepare` checked for unsaved changes before the copy, but the editor stays editable during it, so the dirty set is read
     again right before the reload: a dirty `also` package is left out (`skipped_dirty`) so its edit is not thrown away; a dirty
     replaced package is still reloaded, since its file on disk has already changed (`dirty_published`)."""
@@ -115,7 +161,8 @@ def reload_assets(args):
     dirty_published = [n for n in published if n in dirty_before]
     skipped_dirty = [n for n in (args.get("also") or []) if n not in published and n in dirty_before]
     loaded, missing, pkgs = [], [], []
-    for name in published + [n for n in (args.get("also") or []) if n not in published and n not in skipped_dirty]:
+    also = [n for n in (args.get("also") or []) if n not in published and n not in skipped_dirty]
+    for name in _dependency_order(published + also):
         a = unreal.load_asset(name)
         if a is None:
             missing.append(name)
@@ -137,3 +184,23 @@ def reload_assets(args):
     if problem:
         out["error"] = problem
     return out
+
+
+def recompile(args):
+    """Recompile, in memory and without saving, the given loaded Blueprints in dependency order (dependencies first,
+    `_dependency_order`). Used after `reload_assets`: `reload_packages` swaps the classes of the reloaded packages while the
+    Blueprints that use them are still loaded, so the editor compiles those against the old and the new class at once and logs
+    compile errors that are gone once the swap is over. Compiling them again, dependencies first, shows the state that stays
+    (the caller reads the editor log for what this compile reports). Packages that are not Blueprints are left alone."""
+    compiled, skipped = [], []
+    for name in _dependency_order(list(args.get("packages") or [])):
+        a = unreal.find_object(None, "%s.%s" % (name, name.rsplit("/", 1)[-1]))
+        if a is None or not isinstance(a, unreal.Blueprint):
+            skipped.append(name)
+            continue
+        unreal.BlueprintEditorLibrary.compile_blueprint(a)
+        compiled.append(name)
+        a = None
+    dirty = sorted(p.get_name() for p in unreal.EditorLoadingAndSavingUtils.get_dirty_content_packages()
+                   if p.get_name().startswith((args.get("root") or "/") + "/"))
+    return {"compiled": compiled, "skipped": skipped, "dirty_after": dirty}

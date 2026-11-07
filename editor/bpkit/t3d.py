@@ -3,6 +3,7 @@ widget trees, timelines, animations. Imports no `unreal`, so it runs on the host
 
 Everything the tools write is the same text the engine exports, so values and defaults are raw T3D strings.
 """
+import hashlib
 import re
 import uuid
 
@@ -185,6 +186,9 @@ _NAME_RX = re.compile(r'PinName="((?:[^"\\]|\\.)*)"')
 _ID_RX = re.compile(r"PinId=([0-9A-Fa-f]+)")
 _LINK_RX = re.compile(r",LinkedTo=\(([^)]*)\)")
 _DEFAULT_RX = re.compile(r',DefaultValue="(?:[^"\\]|\\.)*"')
+_QSTR = r'"(?:[^"\\]|\\.)*"'
+_DEFTEXT_RX = re.compile(r',DefaultTextValue=(?:NSLOCTEXT\(\s*%s\s*,\s*%s\s*,\s*%s\s*\)|INVTEXT\(\s*%s\s*\)|None)'
+                         % (_QSTR, _QSTR, _QSTR, _QSTR))
 _DEFOBJ_RX = re.compile(r',DefaultObject=(?:"(?:[^"\\]|\\.)*"|None)')
 _PINTYPE_RX = re.compile(r'PinType\.PinCategory="[^"]*",PinType\.PinSubCategory="[^"]*",PinType\.PinSubCategoryObject=(?:"[^"]*"|None),'
                          r'PinType\.PinSubCategoryMemberReference=\([^)]*\),PinType\.PinValueType=\([^)]*\),PinType\.ContainerType=\w+')
@@ -370,6 +374,12 @@ class GraphNode:
         p = self._input(pin)
         p.text = _DEFAULT_RX.sub("", p.text)
         p.text = _insert_attr(p.text, 'DefaultValue="%s"' % value)
+        if p.category == "text":
+            # a text pin's value is its DefaultTextValue; DefaultValue alone imports as an empty FText
+            p.text = _DEFTEXT_RX.sub("", p.text)
+            if value != "":
+                key = hashlib.md5(value.encode("utf-8")).hexdigest()[:32]
+                p.text = _insert_attr(p.text, 'DefaultTextValue=NSLOCTEXT("","%s","%s")' % (key, value))
 
     def set_default_object(self, pin, object_text):
         p = self._input(pin)

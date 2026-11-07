@@ -180,16 +180,39 @@ class LiveEditor:
     def prepare(self, packages):
         return self._call("prepare", {"root": "/" + self.mod, "packages": packages})
 
+    RECOMPILE_ROUNDS = 3
+
     def reload(self, packages, also=None):
         """Reload the replaced packages plus `also` (unchanged loaded referencers), then read the Blueprint compile errors the
-        editor logged for them while it reloaded (`compile_errors`: asset and message). The log is only read, never changed;
-        `compile_check` says whether it could be read."""
+        editor logged for them while it reloaded. `reload_packages` swaps the classes of the reloaded packages while the
+        Blueprints that use them are still loaded, so those are compiled against the old and the new class at once and log
+        errors that are gone after the swap (`transient_compile_errors` lists those the recompile no longer logs). Each Blueprint that logged one is recompiled in the
+        editor, dependencies first (at most RECOMPILE_ROUNDS times, in memory, nothing saved), and only what that recompile
+        still logs is a real error (`compile_errors`). `recompiled` lists what was recompiled. The log is only read, never
+        changed; `compile_check` says whether it could be read."""
         also = list(also or [])
+        allpkgs = list(packages) + also
         before = self._log_size()
         out = self._call("reload_assets", {"root": "/" + self.mod, "packages": packages, "also": also})
         if isinstance(out, dict):
-            errs, check = self._compile_errors(before, list(packages) + also)
+            errs, check = self._compile_errors(before, allpkgs)
+            transient, recompiled = [], []
+            rounds = 0
+            while errs and check == "editor log" and rounds < self.RECOMPILE_ROUNDS and not out.get("error"):
+                rounds += 1
+                transient += [e for e in errs if e not in transient]
+                names = list(dict.fromkeys(e["asset"] for e in errs))
+                before = self._log_size()
+                comp = self._call("recompile", {"root": "/" + self.mod, "packages": names})
+                recompiled += [n for n in (comp.get("compiled") or []) if n not in recompiled]
+                out["dirty_after"] = sorted(set(out.get("dirty_after") or []) | set(comp.get("dirty_after") or []))
+                prev = errs
+                errs, check = self._compile_errors(before, allpkgs)
+                if errs == prev:        # the same errors after a recompile: they are real, another round will not change them
+                    break
             out["compile_errors"] = errs
+            out["transient_compile_errors"] = [e for e in transient if e not in errs]
+            out["recompiled"] = recompiled
             out["compile_check"] = check
         return out
 

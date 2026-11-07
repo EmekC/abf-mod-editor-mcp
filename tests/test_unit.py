@@ -171,6 +171,42 @@ class T3dTests(unittest.TestCase):
         b.set_default_object("Count", "/Script/Engine.Actor")
         self.assertIn(',DefaultObject="/Script/Engine.Actor",PersistentGuid=', b.pin("Count").text)
 
+    def test_text_pin_default_writes_default_text_value(self):
+        n = GraphNode.from_export("/Script/BlueprintGraph.K2Node_FormatText", "FormatText_0", [
+            t3d.pin_line("Format", "text", pin_id="CCCC0001"),
+            t3d.pin_line("Count", "int", pin_id="CCCC0002", default="1")])
+        n.set_default("Format", "Hunger {a}   |   \\\"q\\\"")
+        txt = n.pin("Format").text
+        key = hashlib.md5('Hunger {a}   |   \\"q\\"'.encode("utf-8")).hexdigest()[:32]
+        self.assertIn(',DefaultValue="Hunger {a}   |   \\"q\\"",DefaultTextValue=NSLOCTEXT("","%s","Hunger {a}   |   \\"q\\"")'
+                      ',PersistentGuid=' % key, txt)
+        # setting it again replaces both, never duplicates
+        n.set_default("Format", "Next {b}")
+        txt = n.pin("Format").text
+        self.assertEqual(txt.count("DefaultTextValue="), 1)
+        self.assertEqual(txt.count("DefaultValue="), 1)
+        self.assertNotIn("Hunger", txt)
+        self.assertIn('DefaultTextValue=NSLOCTEXT("","%s","Next {b}")' % hashlib.md5(b"Next {b}").hexdigest()[:32], txt)
+        # an empty text is an empty FText: no DefaultTextValue left behind
+        n.set_default("Format", "")
+        self.assertNotIn("DefaultTextValue", n.pin("Format").text)
+        self.assertIn(',DefaultValue="",PersistentGuid=', n.pin("Format").text)
+        # an existing engine-style value is replaced too
+        n.pin("Format").text = n.pin("Format").text.replace(
+            ',PersistentGuid=', ',DefaultTextValue=NSLOCTEXT("Ns", "K", "old \\"x\\""),PersistentGuid=')
+        n.set_default("Format", "z")
+        self.assertEqual(n.pin("Format").text.count("DefaultTextValue="), 1)
+        self.assertNotIn("old", n.pin("Format").text)
+
+    def test_non_text_pin_default_has_no_default_text_value(self):
+        n = GraphNode.from_export("/Script/BlueprintGraph.K2Node_B", "B_0", [
+            t3d.pin_line("Count", "int", pin_id="DDDD0001"), t3d.pin_line("Name", "string", pin_id="DDDD0002")])
+        n.set_default("Count", "7")
+        n.set_default("Name", "abc")
+        self.assertNotIn("DefaultTextValue", n.pin("Count").text)
+        self.assertNotIn("DefaultTextValue", n.pin("Name").text)
+        self.assertIn(',DefaultValue="7",PersistentGuid=', n.pin("Count").text)
+
     def test_spawn_and_create_widget_class_types_return_value(self):
         def pin(name, direction, cat, obj):
             return ('CustomProperties Pin (PinId=%s01,PinName="%s"%s,PinType.PinCategory="%s",PinType.PinSubCategory="",'
@@ -1100,6 +1136,67 @@ class LiveEditorTests(unittest.TestCase):
         out = ed.reload(["/ModX/Sub/BP_A"])
         self.assertEqual(out["compile_errors"], [])
         self.assertIn("could not be read", out["compile_check"])
+
+    def test_errors_logged_during_the_class_swap_are_transient_when_a_recompile_is_clean(self):
+        tmp = Path(tempfile.mkdtemp(prefix="abflog"))
+        self.addCleanup(shutil.rmtree, str(tmp), True)
+        log = tmp / "Editor.log"
+        log.write_text("", encoding="utf-8")
+        calls = []
+
+        def run_json(code, args, timeout=None):
+            calls.append(args)
+            if "packages" in args and len(calls) == 1:     # reload_assets: the swap logs errors
+                with open(log, "a", encoding="utf-8") as f:
+                    f.write("LogBlueprint: Error: [AssetLog] C:\\Mods\\ModX\\Content\\Sub\\BP_B.uasset: [Compiler] stale pin\n")
+                return {"loaded": ["/ModX/Sub/BP_A", "/ModX/Sub/BP_B"], "missing": [], "dirty_after": []}
+            return {"compiled": list(args["packages"]), "dirty_after": []}      # the recompile logs nothing
+        ed = headless_tools.LiveEditor(run_json, (RuntimeError,), "STATUS", "ModX", None, lambda: [], log_path=log, log_wait=0)
+        out = ed.reload(["/ModX/Sub/BP_A"], ["/ModX/Sub/BP_B"])
+        self.assertEqual(out["compile_errors"], [])
+        self.assertEqual(out["transient_compile_errors"], [{"asset": "/ModX/Sub/BP_B", "message": "stale pin"}])
+        self.assertEqual(out["recompiled"], ["/ModX/Sub/BP_B"])
+        self.assertEqual(len(calls), 2)
+
+    def test_errors_that_survive_a_recompile_are_real_and_the_recompile_stops(self):
+        tmp = Path(tempfile.mkdtemp(prefix="abflog"))
+        self.addCleanup(shutil.rmtree, str(tmp), True)
+        log = tmp / "Editor.log"
+        log.write_text("", encoding="utf-8")
+        calls = []
+
+        def run_json(code, args, timeout=None):
+            calls.append(args)
+            with open(log, "a", encoding="utf-8") as f:
+                f.write("LogBlueprint: Error: [AssetLog] C:\\Mods\\ModX\\Content\\Sub\\BP_B.uasset: [Compiler] broken\n")
+            return {"loaded": [], "missing": [], "compiled": ["/ModX/Sub/BP_B"], "dirty_after": []}
+        ed = headless_tools.LiveEditor(run_json, (RuntimeError,), "STATUS", "ModX", None, lambda: [], log_path=log, log_wait=0)
+        out = ed.reload(["/ModX/Sub/BP_A"], ["/ModX/Sub/BP_B"])
+        self.assertEqual(out["compile_errors"], [{"asset": "/ModX/Sub/BP_B", "message": "broken"}])
+        self.assertEqual(len(calls), 2)       # reload_assets and one recompile: the same error after it ends the loop
+        self.assertEqual(out["transient_compile_errors"], [])    # a surviving error is real, not transient
+
+    def test_only_errors_gone_after_the_recompile_are_transient(self):
+        tmp = Path(tempfile.mkdtemp(prefix="abflog"))
+        self.addCleanup(shutil.rmtree, str(tmp), True)
+        log = tmp / "Editor.log"
+        log.write_text("", encoding="utf-8")
+        calls = []
+
+        def run_json(code, args, timeout=None):
+            calls.append(args)
+            line = "LogBlueprint: Error: [AssetLog] C:\\Mods\\ModX\\Content\\Sub\\%s.uasset: [Compiler] %s\n"
+            with open(log, "a", encoding="utf-8") as f:
+                if len(calls) == 1:                  # reload_assets: the swap logs a stale and a real error
+                    f.write(line % ("BP_B", "stale pin"))
+                    f.write(line % ("BP_C", "broken"))
+                    return {"loaded": [], "missing": [], "dirty_after": []}
+                f.write(line % ("BP_C", "broken"))   # the recompile logs only the real one again
+            return {"compiled": list(args["packages"]), "dirty_after": []}
+        ed = headless_tools.LiveEditor(run_json, (RuntimeError,), "STATUS", "ModX", None, lambda: [], log_path=log, log_wait=0)
+        out = ed.reload(["/ModX/Sub/BP_A"], ["/ModX/Sub/BP_B", "/ModX/Sub/BP_C"])
+        self.assertEqual(out["compile_errors"], [{"asset": "/ModX/Sub/BP_C", "message": "broken"}])
+        self.assertEqual(out["transient_compile_errors"], [{"asset": "/ModX/Sub/BP_B", "message": "stale pin"}])
 
     def test_no_process_is_closed_and_nothing_is_called(self):
         called = []
