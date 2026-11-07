@@ -2136,5 +2136,41 @@ class StdioSmokeTests(unittest.TestCase):
         self.assertNotIn("Traceback", res["content"][0]["text"])
 
 
+class NameGuardTests(unittest.TestCase):
+    # The forbidden words are assembled from pieces so this file does not trip its own guard.
+    FORBIDDEN = ["".join(p) for p in (("so", "up"), ("wag", "dd"))]
+
+    def _files(self):
+        try:
+            out = subprocess.run(["git", "ls-files"], cwd=str(ROOT), capture_output=True, text=True, check=True).stdout
+            names = [n for n in out.splitlines() if n]
+            if names:
+                return [ROOT / n for n in names]
+        except (OSError, subprocess.CalledProcessError):
+            pass
+        found = []
+        for dirpath, dirnames, filenames in os.walk(str(ROOT)):
+            dirnames[:] = [d for d in dirnames if d not in (".git", "__pycache__")]
+            found.extend(Path(dirpath) / f for f in filenames)
+        return found
+
+    def test_no_mod_names_in_tracked_text_files(self):
+        files = self._files()
+        self.assertTrue(files, "expected tracked files")
+        hits = []
+        for f in files:
+            try:
+                data = f.read_bytes()
+            except OSError:
+                continue
+            if b"\0" in data:
+                continue
+            text = data.decode("utf-8", "replace").lower()
+            for w in self.FORBIDDEN:
+                if w in text:
+                    hits.append("%s: %s" % (f.relative_to(ROOT), w))
+        self.assertEqual(hits, [])
+
+
 if __name__ == "__main__":
     unittest.main()

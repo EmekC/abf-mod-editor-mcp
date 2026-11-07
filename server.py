@@ -1322,7 +1322,7 @@ TOOLS = [
     ("get_game_row", t_get_game_row,
      "Read a base-game row as export text by kind + name (kind = snake_case of the game's <Kind>HandleFunctionLibrary: "
      "global_item, gear_item, weapon_item, craftable_item, deployable_item, pickup_item, food_and_gibs_item, pet_item, plant_item, "
-     "recipe, chemistry_recipe, soup_recipe, buff_debuff, npc, pet, trait, ...). With no name: list row names (name_contains filter).",
+     "recipe, chemistry_recipe, buff_debuff, npc, pet, trait, ...). With no name: list row names (name_contains filter).",
      S(kind=STR, name=STR, name_contains=STR, limit=INT), ["kind"]),
     ("create_row_asset", t_create_row_asset,
      "Create a mod row asset (DataAssetFactory) of a *ModRowAsset class at asset_path inside a mod, e.g. "
