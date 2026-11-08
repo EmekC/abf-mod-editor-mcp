@@ -176,6 +176,10 @@ def _build_node(spec, model, templates, ctx):
                      for h in node.head]
     for pin, ts in (spec.get("pin_types") or {}).items():
         node.resolve_wildcard(pin, t3d.parse_type(ts, ctx["env"].class_text))
+    if k == "std_macro" and spec.get("pin_types"):
+        # the element type: the "Array Element" entry (any key order), else the first entry (set_resolved_wildcard drops its container)
+        pts = spec["pin_types"]
+        node.set_resolved_wildcard(t3d.parse_type(pts.get("Array Element") or next(iter(pts.values())), ctx["env"].class_text))
     node.fill_default_wildcards()
     return node
 

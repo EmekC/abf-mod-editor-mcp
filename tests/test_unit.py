@@ -391,6 +391,31 @@ class T3dTests(unittest.TestCase):
         self.assertIn('PinType.PinSubCategoryObject="/Script/UMG.WidgetBlueprintGeneratedClass\'/TestModXyz34/Example/WBP_Example.WBP_Example_C\'"', txt)
         self.assertIn("PinType.ContainerType=None", txt)
 
+    def test_std_macro_ref(self):
+        ref = t3d.std_macro_ref("ForEachLoop")
+        self.assertIn("StandardMacros.StandardMacros:ForEachLoop'", ref)
+        self.assertIn("GraphBlueprint=\"/Script/Engine.Blueprint'/Engine/EditorBlueprintResources/StandardMacros.StandardMacros'\"", ref)
+        with self.assertRaises(SpecError):
+            t3d.std_macro_ref("NoSuchLoop")
+
+    def test_set_resolved_wildcard(self):
+        n = GraphNode(t3d.MACRO_CLASS, "K2Node_MacroInstance_0", [t3d.std_macro_ref("ForEachLoop"), "NodeGuid=ABC", "NodePosX=0"], [])
+        n.set_resolved_wildcard(t3d.parse_type("object:/Script/Engine.Actor"))
+        lines = [h for h in n.head if h.startswith("ResolvedWildcardType=")]
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].startswith('ResolvedWildcardType=(PinCategory="object",PinSubCategoryObject='))
+        self.assertLess(n.head.index(lines[0]), n.head.index("NodeGuid=ABC"))
+        n.set_resolved_wildcard(t3d.parse_type("int"))
+        lines = [h for h in n.head if h.startswith("ResolvedWildcardType=")]
+        self.assertEqual(lines, ['ResolvedWildcardType=(PinCategory="int")'])
+        n.set_resolved_wildcard(t3d.parse_type("array:object:/Script/Engine.Actor"))
+        lines = [h for h in n.head if h.startswith("ResolvedWildcardType=")]
+        self.assertEqual(len(lines), 1)
+        self.assertNotIn("ContainerType", lines[0])
+        bare = GraphNode(t3d.MACRO_CLASS, "K2Node_MacroInstance_1", ["X=1"], [])
+        bare.set_resolved_wildcard(t3d.parse_type("int"))
+        self.assertEqual(bare.head[-1], 'ResolvedWildcardType=(PinCategory="int")')
+
     def test_resolve_wildcard_refusals(self):
         n = GraphNode.from_template(_CALLARRAY, "K2Node_CallArrayFunction_9001", [WILD_TA, WILD_ONE, INT_PIN], (0, 0))
         with self.assertRaises(SpecError) as cm:
@@ -681,6 +706,16 @@ class SpecTests(unittest.TestCase):
         self.assertTrue(any("not offered" in p for p in self.problems(on_self)))
         self.assertEqual(self.problems(lambda a: a["variables"].append({"name": "M", "type": "map:name:int"})), [])
 
+    def test_std_macro_validation(self):
+        def add(extra):
+            def m(a):
+                a["graphs"][0]["add"].append(dict({"id": "fe", "k": "std_macro"}, **extra))
+            return m
+        self.assertEqual(self.problems(add({"name": "ForEachLoop", "pin_types": {"Array": "array:int", "Array Element": "int"}})), [])
+        self.assertEqual(self.problems(add({"name": "ForLoop"})), [])
+        self.assertTrue(any("unknown standard macro" in p for p in self.problems(add({"name": "Nope"}))))
+        self.assertTrue(any("needs 'name'" in p for p in self.problems(add({}))))
+
     def test_game_refused(self):
         self.assertTrue(any("/Game" in p for p in self.problems(lambda a: a.update(asset="/Game/Maps/X"))))
 
@@ -775,7 +810,14 @@ class SpecTests(unittest.TestCase):
         self.assertEqual(specs.NODE_KINDS["self"]({}, env), (None, None))
         self.assertEqual(sorted(specs.NODE_KINDS), sorted(["call", "get", "set", "event", "override", "branch", "sequence", "cast", "spawn",
                                                            "create_widget", "call_dispatcher", "bind_dispatcher", "timeline", "message",
-                                                           "self", "macro", "node"]))
+                                                           "self", "macro", "std_macro", "node"]))
+        cls, body = specs.NODE_KINDS["std_macro"]({"id": "x", "k": "std_macro", "name": "ForEachLoop"}, env)
+        self.assertEqual(cls, t3d.MACRO_CLASS)
+        self.assertEqual(len(body), 1)
+        self.assertIn("StandardMacros:ForEachLoop'", body[0])
+        self.assertIn("GraphBlueprint=", body[0])
+        with self.assertRaises(SpecError):
+            specs.NODE_KINDS["std_macro"]({"id": "x", "k": "std_macro", "name": "Nope"}, env)
 
 
 # ---------------------------------------------------------------- headless

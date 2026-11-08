@@ -110,6 +110,9 @@ def _preload(env, node):
     for v in (node.get("objects") or {}).values():
         if isinstance(v, str) and v.startswith("/") and not v.startswith("/Script/") and "'" not in v:
             env.class_text(v)
+    if node.get("k") == "std_macro":
+        sm = must(unreal.load_asset(t3d.STD_MACROS_PACKAGE), "StandardMacros")
+        must(LIB.find_graph(sm, node["name"]), "standard macro " + node["name"])
 
 
 def apply_asset(spec, mod, index=0):

@@ -20,6 +20,9 @@ RESULT_CLASS = "/Script/BlueprintGraph.K2Node_FunctionResult"
 TUNNEL_CLASS = "/Script/BlueprintGraph.K2Node_Tunnel"
 SELF_CLASS = "/Script/BlueprintGraph.K2Node_Self"
 MACRO_CLASS = "/Script/BlueprintGraph.K2Node_MacroInstance"
+STD_MACROS_PACKAGE = "/Engine/EditorBlueprintResources/StandardMacros"
+STD_MACROS_ASSET = STD_MACROS_PACKAGE + ".StandardMacros"
+STD_MACROS = ("ForEachLoop", "ForEachLoopWithBreak", "ForLoop", "ForLoopWithBreak", "ReverseForEachLoop", "WhileLoop")
 
 
 class SpecError(ValueError):
@@ -28,6 +31,14 @@ class SpecError(ValueError):
 
 def gid():
     return uuid.uuid4().hex.upper()
+
+
+def std_macro_ref(name):
+    """MacroGraphReference line of an instance of an engine StandardMacros macro (the engine allocates the pins on import)."""
+    if name not in STD_MACROS:
+        raise SpecError("unknown standard macro %r (known: %s)" % (name, ", ".join(STD_MACROS)))
+    return ("MacroGraphReference=(MacroGraph=\"/Script/Engine.EdGraph'%s:%s'\",GraphBlueprint=\"/Script/Engine.Blueprint'%s'\")"
+            % (STD_MACROS_ASSET, name, STD_MACROS_ASSET))
 
 
 # ---- types ------------------------------------------------------------------
@@ -450,6 +461,16 @@ class GraphNode:
         if p.container != (t["container"] or "None"):
             raise SpecError("pin_types: pin %r on %s is %s" % (pin, self.name, _CONTAINER_HINT.get(p.container, p.container)))
         p.set_type(t)
+
+    def set_resolved_wildcard(self, t):
+        """K2Node_MacroInstance.ResolvedWildcardType (the element type; never a container): a reconstruct keeps the pin types."""
+        line = "ResolvedWildcardType=(%s)" % _compact_type(dict(t, container=None, value=None))
+        self.head = [h for h in self.head if not h.startswith("ResolvedWildcardType=")]
+        for i, h in enumerate(self.head):
+            if h.startswith("NodeGuid="):
+                self.head.insert(i, line)
+                return
+        self.head.append(line)
 
     def fill_default_wildcards(self):
         """Type the wildcard pins whose type never depends on the wiring (bp_apply wires by text and the

@@ -33,6 +33,11 @@ All notable changes to abf-mod-editor-mcp. The format follows [Keep a Changelog]
   loaded with an invalid tag and its director did not start). The editor's tag tree is refreshed in memory, else filled from the
   settings' tag list, and every tag is read back to verify it; nothing is saved. The result gains `tags_registered`,
   `tags_unregistered`, `tags_strategy` and `tags_error`; a failure of this step never fails the publish. `capabilities.liveTags`.
+- bp_apply node kind `std_macro` (`name`): a `K2Node_MacroInstance` of an engine StandardMacros macro (ForEachLoop,
+  ForEachLoopWithBreak, ForLoop, ForLoopWithBreak, ReverseForEachLoop, WhileLoop). The macro graph is referenced by object path
+  (`/Engine/EditorBlueprintResources/StandardMacros`, loaded before the import), the engine writes the pins, and `pin_types`
+  types the wildcard pins and sets the node's `ResolvedWildcardType` so a later reconstruct keeps the type. Listed in
+  `backend_info.bpApply.nodeKinds`.
 
 ### Fixed
 

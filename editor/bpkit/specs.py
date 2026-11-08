@@ -83,6 +83,11 @@ def _message(node, env):
     return BP + "K2Node_Message", ['FunctionReference=(MemberParent="%s",MemberName="%s")' % (env.class_text(node["interface"]), node["function"])]
 
 
+def _std_macro(node, env):
+    _req(node, "name")
+    return t3d.MACRO_CLASS, [t3d.std_macro_ref(node["name"])]
+
+
 def _manual(node, env):
     return None, None
 
@@ -109,6 +114,7 @@ NODE_KINDS = {
     "message": _message,
     "self": _manual,
     "macro": _manual,
+    "std_macro": _std_macro,
     "node": _raw,
 }
 MANUAL_KINDS = ("self", "macro")
@@ -117,7 +123,7 @@ REQUIRED = {
     "call": ("function",), "get": ("name",), "set": ("name",), "event": ("name",), "override": ("function", "class"),
     "cast": ("target",), "call_dispatcher": ("name", "params"), "bind_dispatcher": ("name", "params"),
     "timeline": ("name",), "message": ("function", "interface"), "macro": ("name", "inputs", "outputs"),
-    "node": ("class", "props"),
+    "std_macro": ("name",), "node": ("class", "props"),
 }
 CREATE_CLASSES = ("Blueprint", "WidgetBlueprint", "BlueprintInterface", "UserDefinedStruct")
 RAW_KINDS = ("graph", "tree", "tree_replace", "python")
@@ -364,6 +370,8 @@ def _check_graph_nodes(problems, where, nodes, wires, reserved, existing_ok):
         for key in ("params", "inputs", "outputs"):
             if key in n:
                 _check_params(problems, "%s.%s" % (w, key), n[key])
+        if k == "std_macro" and n.get("name") and n["name"] not in t3d.STD_MACROS:
+            problems.append("%s: unknown standard macro %r (known: %s)" % (w, n["name"], ", ".join(t3d.STD_MACROS)))
         if "pin_types" in n:
             pt = n["pin_types"]
             if k in MANUAL_KINDS:

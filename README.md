@@ -163,6 +163,7 @@ Node kinds (`k`):
 | `message` | `function`, `interface` | `K2Node_Message` |
 | `self` | | `K2Node_Self` |
 | `macro` | `name`, `inputs`, `outputs` | `K2Node_MacroInstance` of a macro from the same batch |
+| `std_macro` | `name` | `K2Node_MacroInstance` of an engine StandardMacros macro (ForEachLoop, ForEachLoopWithBreak, ForLoop, ForLoopWithBreak, ReverseForEachLoop, WhileLoop); the pins come from the engine, `pin_types` types the wildcard pins and sets `ResolvedWildcardType` |
 | `node` | `class`, `props` | any node class, `props` are raw lines |
 
 How it works, briefly: Python cannot create nodes, so text is imported through a Map import into throwaway carrier objects, and the carrier's arrays are swapped into the real graph in process memory. Pins come from a throwaway scratch Blueprint (never saved) so the engine writes them. Offsets are discovered per build and the tools refuse rather than guess.
