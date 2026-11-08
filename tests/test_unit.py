@@ -2387,7 +2387,7 @@ class StdioSmokeTests(unittest.TestCase):
         p = subprocess.run([sys.executable, "-I", str(ROOT / "server.py")], input="\n".join(json.dumps(r) for r in reqs) + "\n",
                            capture_output=True, text=True, env=env, timeout=60, cwd=str(ROOT))
         replies = {json.loads(l)["id"]: json.loads(l) for l in p.stdout.splitlines() if l.strip()}
-        self.assertEqual(replies[1]["result"]["serverInfo"]["version"], "2.5.0")
+        self.assertEqual(replies[1]["result"]["serverInfo"]["version"], "2.6.0")
         names = [t["name"] for t in replies[2]["result"]["tools"]]
         self.assertEqual(len(names), 44)
         for n in ("staging_sync", "staging_status", "bp_apply", "bp_read", "bp_compile_report", "bp_game_test",

@@ -1552,9 +1552,9 @@ class ClassManagerRowSpecTests(unittest.TestCase):
         for bad in ("", "a..b", "a b", "a/b", ".a", "a.", "x" * 201, 5, None, "a\"b"):
             self.assertTrue(any("gameplay_tag" in p for p in self.validate(dict(self.good(), gameplay_tag=bad))), repr(bad))
 
-    def test_server_version_is_2_5_0(self):
+    def test_server_version_is_2_6_0(self):
         text = (ROOT / "server.py").read_text(encoding="utf-8")
-        self.assertIn('SERVER_VERSION = "2.5.0"', text)
+        self.assertIn('SERVER_VERSION = "2.6.0"', text)
 
 
 class ClassManagerRowEditorSideTests(unittest.TestCase):

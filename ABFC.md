@@ -14,7 +14,7 @@ Three tools are registered only when the server starts with `ABF_ABFC_TOOLS=1` (
 ### `abfc_extensions` (no arguments, no editor)
 
 ```json
-{ "extProtocol": 1, "serverVersion": "2.5.0", "python": "3.11.9",
+{ "extProtocol": 1, "serverVersion": "2.6.0", "python": "3.11.9",
   "features": ["reflect", "compile_node_refs", "bp_read_seconds"] }
 ```
 
@@ -60,7 +60,7 @@ argument wins over the variable. Skipped means every function has `meta: null`.
 Core tool, no editor needed, no arguments. Keys:
 
 - `protocol`: backend protocol number (`1`).
-- `serverVersion`: this server's version (`"2.5.0"`).
+- `serverVersion`: this server's version (`"2.6.0"`).
 - `engineVersion`: `Major.Minor.Patch` from `<editor root>/Engine/Build/Build.version`, `null` when the file is missing or unreadable.
 - `editorRoot`, `headlessDir`, `documentsDir`: the paths the server uses (`editorRoot` is `null` when no editor install was found).
 - `capabilities.pinTypes`: `bp_apply` node specs accept `pin_types` (wildcard pin resolution in one pass).
@@ -76,6 +76,11 @@ Core tool, no editor needed, no arguments. Keys:
 - `capabilities.audit`: `mod_audit` is available.
 - `capabilities.publish`: `bp_publish` is available.
 - `capabilities.classManagerRows` (2.5.0): `bp_apply` accepts the asset-spec key `class_manager_row` (below).
+- `capabilities.gameplayTags` (2.6.0): `class_manager_row` accepts `gameplay_tag` (bp_apply feature `class_manager_row_tag`) and `reflect`
+  accepts `gameplay_tags` (below).
+- `capabilities.reflectDefaults` (2.6.0): `reflect` function entries carry `meta.defaults` (below).
+- `capabilities.assetOps` (2.6.0): the ops `bp_asset_ops` accepts, `["rename", "delete", "reparent", "recreate"]` (below).
+- `capabilities.publishDeletes` (2.6.0): `bp_publish` accepts `delete_removed` (below).
 - `bpApply.features`, `bpApply.nodeKinds`: the `bp_apply` feature flags and node kinds this build understands.
 
 ## Additive keys in existing tools
@@ -112,6 +117,40 @@ Core tool, no editor needed, no arguments. Keys:
 - Result: `rows: [{ asset, created, changed }]` (in the order of the specs that carry the key; `[]` otherwise). Any failure is an
   error of the whole call, and the staged files, including the row asset, are rolled back like any other failed `bp_apply`.
 - A staged row asset is published by `bp_publish` like any other changed or added file when it is named in `assets`.
+
+## 2.6.0: gameplay tags, reflect defaults, asset ops, publish deletions
+
+**Gameplay tag on a class-manager row** (`capabilities.gameplayTags`). `class_manager_row` takes an optional `gameplay_tag` (a
+dotted tag such as `Feature.Director`, at most 200 characters, no `/`). Before the run the host adds the tag to the stage file
+`Config/Tags/<Mod>Tags.ini` (created with its header when missing; CRLF kept when the file uses it; case-insensitive dedupe) and the
+row's tag is set when it differs. The result gains `tags_added` and each `rows[]` entry gains `tag`. A failed apply restores the ini.
+`Config/Tags/*.ini` is part of the staged baseline, so `bp_publish` copies a changed ini like any other file (no reload). A running
+warm session is stopped when tags were added, so the next run starts with the new tag list.
+
+**`reflect` extras.** `gameplay_tags: true` adds `gameplayTags: { tags: [sorted unique names], sources: { <source>: count | "error: ..." } }`
+to `reflect.json` and `gameplayTags` to `counts`. With `meta` read, each function entry's `meta` gains
+`defaults: { <input pin>: "<default text>" }` from the `CPP_Default_<pin>` metadata (`null` when it could not be read; the per-pin
+read is the fallback when the bulk read fails).
+
+**`bp_asset_ops(mod, ops, timeout_seconds)`** (`capabilities.assetOps`). Edits the staged mod only (`bp_apply` still refuses these).
+At most 20 ops, executed in order, all-or-nothing: on any failure the staged `Content/` and `Config/Tags/` are restored.
+
+- `{ "op": "rename", "from": "/Mod/A", "to": "/Mod/B" }`: Unreal's own rename; refused when the target exists or the source is
+  missing; referencers are fixed up (redirector removed) and the changed referencers saved (`touched`).
+- `{ "op": "delete", "asset": "/Mod/A" }`: refused, naming them, while an asset outside the call's delete set still references it.
+- `{ "op": "reparent", "asset": "/Mod/A", "parent": "/Script/Engine.Actor" }`: same family only (Actor, ActorComponent, UserWidget or other
+  objects); compiled and verified.
+- `{ "op": "recreate", "asset": "/Mod/A" }`: removes the staged files of the asset so a following `bp_apply` create makes it again.
+
+Paths must be inside the mod (`/Game`, other mods, config assets and tooling folders are refused). Result:
+`{ ok, results: [{ op, ok, detail }], touched: [...], run, error }`.
+
+**`bp_publish(..., delete_removed = false)`** (`capabilities.publishDeletes`). With `delete_removed: true`, the files that are gone
+from staging (limited to `assets` when given) are deleted from the real mod as part of the publish. Each is backed up first (listed under
+`deleted` in the backup's `manifest.json`), and a real file that changed since `staging_sync` is a conflict that refuses. An open editor
+releases those packages together with the published ones, and afterwards rescans their folders so its asset registry forgets them; any
+failure (including the reload) restores the deleted files from the backup. A publish with only deletions is valid. The result gains
+`deleted: [...]` (and `would_delete` in a dry run). Without the flag nothing is deleted and the old note stays.
 
 ## `mod_audit` on the stage (`backend_info.capabilities.stageAudit`)
 

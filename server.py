@@ -38,7 +38,7 @@ import staging   # noqa: E402
 from bpkit import specs  # noqa: E402
 
 SERVER_NAME = "abiotic-mod-editor"
-SERVER_VERSION = "2.5.0"
+SERVER_VERSION = "2.6.0"
 BACKEND_PROTOCOL = 1
 
 EDITOR_ROOT = paths.find_editor_root()          # None when no Mod Editor install was found
@@ -1248,7 +1248,9 @@ TOOLS = [
      "Read-only, needs no editor: backend protocol number, server version, paths and capabilities (for tools such as abfc). "
      "Also engineVersion (from the editor install, null if unknown). capabilities: pinTypes (bp_apply node specs accept pin_types), "
     "containerTypes, warmSession, stageAudit, reflect (the reflect tool is registered), compileErrorNodeRefs, functionLocals, "
-    "userPureFunctions, createKinds (asset kinds bp_apply can create), gameTest, audit, publish.", S(), []),
+    "userPureFunctions, createKinds (asset kinds bp_apply can create), gameTest, audit, publish, classManagerRows, "
+    "gameplayTags (class_manager_row gameplay_tag; reflect gameplay_tags), reflectDefaults (reflect meta.defaults), "
+    "assetOps (the ops bp_asset_ops accepts), publishDeletes (bp_publish delete_removed).", S(), []),
     ("launch_editor", t_launch_editor,
      "Start the Mod Editor and wait until it is reachable. It opens on the Mod Browser picker; then use open_mod.",
      S(wait_seconds=NUM), []),

@@ -2,6 +2,25 @@
 
 All notable changes to abf-mod-editor-mcp. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.6.0] - Unreleased
+
+### Added
+
+- `bp_asset_ops(mod, ops)`: rename (with referencer fix-up and redirector removal), delete (refused while referenced from outside
+  the delete set), reparent (same family only) and recreate, on the staged mod only, all-or-nothing. `capabilities.assetOps`.
+- `bp_publish` argument `delete_removed`: deletes the real files of assets that are gone from staging, with backup, conflict
+  check and restore on failure; an open editor releases the packages and forgets them afterwards (`livepublish.forget`). The result
+  gains `deleted`. `capabilities.publishDeletes`.
+- `class_manager_row.gameplay_tag` (bp_apply feature `class_manager_row_tag`): the tag is written to the stage's
+  `Config/Tags/<Mod>Tags.ini` and set on the row. The ini is tracked by staging and published with the Content files.
+  `capabilities.gameplayTags`.
+- `reflect` argument `gameplay_tags` (lists the editor's gameplay tags) and `meta.defaults` on function entries (the
+  `CPP_Default_*` metadata). `capabilities.reflectDefaults`.
+
+### Changed
+
+- `SERVER_VERSION` is `2.6.0`.
+
 ## [2.5.0] - Unreleased
 
 ### Added
