@@ -33,6 +33,12 @@ All notable changes to abf-mod-editor-mcp. The format follows [Keep a Changelog]
   Python), and the result is checked by re-reading that tag after the save (the class check only when the tag is unreadable), so a
   reparent to an ancestor of the old parent that did nothing is an error.
 
+- Gameplay tag listing (`reflect` with `gameplay_tags`): the tag sources are read through the class path and the C++ property
+  names, because the cooked editor exposes no `GameplayTagsList` or settings object; the `make_tag` error names the registration
+  requirement.
+- `bp_apply` rollback: the copy and unlink steps are retried, the tag ini is restored even when the rollback itself raises, the
+  asset file match is case-insensitive, and a UTF-16 tag ini gives a clear error.
+
 ### Changed
 
 - `bp_apply` `variables[i].default` must be a string, a number or a bool; a number or bool is written as text through `str()`
