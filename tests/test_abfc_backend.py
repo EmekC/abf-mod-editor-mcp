@@ -1207,6 +1207,66 @@ class NodeRefTests(unittest.TestCase):
             shutil.rmtree(str(stage_dir), ignore_errors=True)
 
 
+class ApplyTagsIniHostTests(unittest.TestCase):
+    """bp_apply with a class_manager_row gameplay_tag: the stage's tag ini is written before the commandlet runs and
+    restored when the apply fails."""
+    ROW = {"asset_path": "/Mod/Tables/Row_A", "class_path": "/Mod/X/BP_A.BP_A_C", "gameplay_tag": "ClassManager.EntityDirector.A"}
+
+    def run_apply(self, ok, old=None):
+        import headless_tools
+        import tagsini
+        run = Path(tempfile.mkdtemp(prefix="abftagrun"))
+        stage_dir = Path(tempfile.mkdtemp(prefix="abftagstage"))
+        self.addCleanup(shutil.rmtree, str(run), True)
+        self.addCleanup(shutil.rmtree, str(stage_dir), True)
+        ini = tagsini.ini_path(stage_dir, "Mod")
+        if old is not None:
+            ini.parent.mkdir(parents=True)
+            ini.write_bytes(old)
+        log = run / "editor.log"
+        log.write_text("", encoding="utf-8")
+        seen = {}
+
+        def fake_run(stage_, job, timeout=300, prepare=None):
+            prepare(run)
+            seen["ini"] = ini.read_bytes() if ini.is_file() else None
+            return {"ok": ok, "run": str(run), "log": str(log), "seconds": 1.0, "error": None if ok else "boom",
+                    "result": {"assets": [], "rows": [], "saved": 0}}
+
+        tools = {t[0]: t[1] for t in headless_tools.build(lambda *a, **k: None, (RuntimeError,), lambda text, prefix=None: {"problems": []},
+                                                            ROOT / "editor", [], "", list_processes=lambda: [])}
+        stage = SimpleNamespace(dir=stage_dir, name="Mod")
+        with mock.patch.object(headless_tools.staging, "load", return_value=stage), \
+                mock.patch.object(headless_tools.staging, "strip_scratch"), \
+                mock.patch.object(headless, "run_commandlet", side_effect=fake_run):
+            text, _ = tools["bp_apply"]({"mod": "Mod", "assets": [{"asset": "/Mod/X/BP_A", "class_manager_row": dict(self.ROW)}]})
+        return json.loads(text), seen, ini
+
+    def test_tag_is_in_the_ini_before_the_run(self):
+        d, seen, ini = self.run_apply(True)
+        self.assertIn(b'GameplayTagList=(Tag="ClassManager.EntityDirector.A",DevComment="")', seen["ini"])
+        self.assertEqual(d["tags_added"], ["ClassManager.EntityDirector.A"])
+        self.assertTrue(ini.is_file())
+
+    def test_known_tag_adds_nothing(self):
+        old = b'[/Script/GameplayTags.GameplayTagsList]\r\nGameplayTagList=(Tag="ClassManager.EntityDirector.A",DevComment="")\r\n'
+        d, seen, ini = self.run_apply(True, old)
+        self.assertEqual(d["tags_added"], [])
+        self.assertEqual(ini.read_bytes(), old)
+
+    def test_failed_apply_restores_a_missing_ini(self):
+        d, seen, ini = self.run_apply(False)
+        self.assertIsNotNone(seen["ini"])
+        self.assertFalse(ini.exists())
+        self.assertEqual(d["tags_added"], [])
+
+    def test_failed_apply_restores_the_old_ini_bytes(self):
+        old = b'[/Script/GameplayTags.GameplayTagsList]\r\nGameplayTagList=(Tag="Other.Tag",DevComment="")\r\n'
+        d, seen, ini = self.run_apply(False, old)
+        self.assertNotEqual(seen["ini"], old)
+        self.assertEqual(ini.read_bytes(), old)
+
+
 REG_LOG = (
     "[2026.11.05-20.32.58:042][ 35]LogRowRegistry: Registered mod plugin 'OtherModAbc12' (row prefix 'ROWPFX') as a row source.\n"
     "[2026.11.05-20.33.03:072][ 35]AbioticFactorEditorCookedLog: Display: Registered 0 'PlayerCharacterVoiceDataAsset' primary assets from mod 'OtherModAbc12'\n"
@@ -1441,6 +1501,16 @@ class ClassManagerRowSpecTests(unittest.TestCase):
         caps = BackendInfoCapabilityTests().capabilities(False)
         self.assertIs(caps["classManagerRows"], True)
 
+    def test_gameplay_tag_validation(self):
+        from bpkit import specs
+        import tagsini
+        self.assertEqual(specs.TAG_RX, tagsini.TAG_RX)
+        self.assertIn("class_manager_row_tag", specs.FEATURES)
+        for ok in ("ClassManager.EntityDirector.Test", "A", "A-b_c.D1"):
+            self.assertEqual(self.validate(dict(self.good(), gameplay_tag=ok)), [], ok)
+        for bad in ("", "a..b", "a b", "a/b", ".a", "a.", "x" * 201, 5, None, "a\"b"):
+            self.assertTrue(any("gameplay_tag" in p for p in self.validate(dict(self.good(), gameplay_tag=bad))), repr(bad))
+
     def test_server_version_is_2_5_0(self):
         text = (ROOT / "server.py").read_text(encoding="utf-8")
         self.assertIn('SERVER_VERSION = "2.5.0"', text)
@@ -1475,7 +1545,7 @@ class ClassManagerRowEditorSideTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
         import bpkit
         import importlib
-        for short in ("core", "rows"):
+        for short in ("core", "tags", "rows"):
             name = "bpkit." + short
             sys.modules.pop(name, None)
             if hasattr(bpkit, short):
@@ -1512,7 +1582,7 @@ class ClassManagerRowEditorSideTests(unittest.TestCase):
         made = self.FakeRowAsset(self.RowData())
         u.AssetToolsHelpers.get_asset_tools.return_value.create_asset.return_value = made
         res = self.rows.ensure_class_manager_row(self.ROW, self.CLS)
-        self.assertEqual(res, {"asset": self.ROW, "created": True, "changed": True})
+        self.assertEqual(res, {"asset": self.ROW, "created": True, "changed": True, "tag": None})
         self.assertEqual(made.props["row_name"], "EntityDirector_Test")
         self.assertEqual(made.props["row"].props["object_class"].get_path_name(), self.CLS)
         self.assertEqual(made.props["row"].props["release_group"], 0)
@@ -1526,7 +1596,7 @@ class ClassManagerRowEditorSideTests(unittest.TestCase):
         existing = self.FakeRowAsset(self.RowData(self.Cls(self.CLS)))
         u.load_asset.return_value = existing
         res = self.rows.ensure_class_manager_row(self.ROW, self.CLS)
-        self.assertEqual(res, {"asset": self.ROW, "created": False, "changed": False})
+        self.assertEqual(res, {"asset": self.ROW, "created": False, "changed": False, "tag": None})
         u.EditorAssetLibrary.save_loaded_asset.assert_not_called()
 
     def test_row_with_another_class_changes_only_the_class(self):
@@ -1537,10 +1607,63 @@ class ClassManagerRowEditorSideTests(unittest.TestCase):
         existing = self.FakeRowAsset(data)
         u.load_asset.return_value = existing
         res = self.rows.ensure_class_manager_row(self.ROW, self.CLS)
-        self.assertEqual(res, {"asset": self.ROW, "created": False, "changed": True})
+        self.assertEqual(res, {"asset": self.ROW, "created": False, "changed": True, "tag": None})
         self.assertEqual(existing.props["row"].props["object_class"].get_path_name(), self.CLS)
         self.assertEqual(existing.props["row"].props["release_group"], 3)
         u.EditorAssetLibrary.save_loaded_asset.assert_called_once()
+
+    TAG = "ClassManager.EntityDirector.Test"
+
+    class FakeTag:
+        """A GameplayTag struct: import_text sets the name, export_text reads it (the first strategy of tags.make_tag)."""
+        refuse = False
+
+        def __init__(self, name=""):
+            self.name = name
+
+        def import_text(self, text):
+            if not self.refuse:
+                self.name = text.split('"')[1]
+
+        def export_text(self):
+            return '(TagName="%s")' % (self.name or "None")
+
+    def tag_row(self, name=""):
+        data = self.RowData(self.Cls(self.CLS))
+        data.props["gameplay_tag"] = self.FakeTag(name)
+        return self.FakeRowAsset(data)
+
+    def test_tag_is_set_when_different_and_saved(self):
+        u = self.u
+        u.EditorAssetLibrary.does_asset_exist.return_value = True
+        u.GameplayTag = self.FakeTag
+        existing = self.tag_row("ClassManager.EntityDirector.Old")
+        u.load_asset.return_value = existing
+        res = self.rows.ensure_class_manager_row(self.ROW, self.CLS, self.TAG)
+        self.assertEqual(res, {"asset": self.ROW, "created": False, "changed": True, "tag": self.TAG})
+        self.assertEqual(existing.props["row"].props["gameplay_tag"].name, self.TAG)
+        u.EditorAssetLibrary.save_loaded_asset.assert_called_once()
+
+    def test_unchanged_tag_is_left_alone(self):
+        u = self.u
+        u.EditorAssetLibrary.does_asset_exist.return_value = True
+        u.GameplayTag = self.FakeTag
+        u.load_asset.return_value = self.tag_row(self.TAG)
+        res = self.rows.ensure_class_manager_row(self.ROW, self.CLS, self.TAG)
+        self.assertEqual(res, {"asset": self.ROW, "created": False, "changed": False, "tag": self.TAG})
+        u.EditorAssetLibrary.save_loaded_asset.assert_not_called()
+
+    def test_tag_that_cannot_be_verified_is_an_error_and_nothing_is_saved(self):
+        u = self.u
+        u.EditorAssetLibrary.does_asset_exist.return_value = True
+        u.GameplayTag = self.FakeTag
+        self.FakeTag.refuse = True
+        self.addCleanup(setattr, self.FakeTag, "refuse", False)
+        u.load_asset.return_value = self.tag_row("")
+        with self.assertRaises(RuntimeError) as cm:
+            self.rows.ensure_class_manager_row(self.ROW, self.CLS, self.TAG)
+        self.assertIn("cannot set gameplay tag", str(cm.exception))
+        u.EditorAssetLibrary.save_loaded_asset.assert_not_called()
 
     def test_game_paths_and_foreign_assets_are_refused(self):
         u = self.u

@@ -23,6 +23,7 @@ import headless     # noqa: E402
 import hiddendesk   # noqa: E402
 import paths        # noqa: E402
 import staging      # noqa: E402
+import tagsini      # noqa: E402
 from bpkit import specs   # noqa: E402
 LIVEPUBLISH = HERE / "editor" / "bpkit" / "livepublish.py"
 HARNESS_ASSET = "_McpTest/BP_McpHarness"
@@ -321,7 +322,32 @@ def build(run_json, remote_errors, t3d_errors, kit_root, forbidden, py_status, l
                     shutil.copy2(stage.dir / rel, dst)
                     existing[rel] = dst
 
-        res = headless.run_commandlet(stage, {"op": "apply", "assets": batch["assets"]}, timeout=timeout, prepare=snapshot)
+        # gameplay tags of class-manager rows: the mod's tag list must hold them before the editor process starts (a plugin's
+        # tag inis are registered when it mounts), so a warm session that already mounted the mod is stopped when the file changed
+        want_tags = []
+        for a in batch["assets"]:
+            row = a.get("class_manager_row")
+            if row and row.get("gameplay_tag") and row["gameplay_tag"] not in want_tags:
+                want_tags.append(row["gameplay_tag"])
+        ini = tagsini.ini_path(stage.dir, mod)
+        old_ini = ini.read_bytes() if ini.is_file() else None
+        tags_added = tagsini.ensure_tags(ini, want_tags) if want_tags else []
+        if tags_added:
+            headless.WARMS.stop_all()
+
+        def restore_ini():
+            if old_ini is None:
+                if ini.is_file():
+                    ini.unlink()
+            else:
+                ini.write_bytes(old_ini)
+
+        try:
+            res = headless.run_commandlet(stage, {"op": "apply", "assets": batch["assets"]}, timeout=timeout, prepare=snapshot)
+        except BaseException:
+            if tags_added:
+                restore_ini()
+            raise
         run = Path(res["run"])
         staging.strip_scratch(stage)
         log_text = _read(res["log"])
@@ -354,9 +380,12 @@ def build(run_json, remote_errors, t3d_errors, kit_root, forbidden, py_status, l
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, dst)
             rolled_back = True
+            if tags_added:
+                restore_ini()
         out = {"ok": ok, "rolled_back": rolled_back, "assets": (res.get("result") or {}).get("assets"),
                "rows": (res.get("result") or {}).get("rows") or [], "compile": compile_,
-               "problems": t3d_problems, "run": res["run"], "seconds": res["seconds"], "warm": bool(res.get("warm"))}
+               "problems": t3d_problems, "run": res["run"], "seconds": res["seconds"], "warm": bool(res.get("warm")),
+               "tags_added": [] if (rolled_back and tags_added) else tags_added}
         if not ok:
             out["error"] = (res.get("error") or ("%d compile error(s) in the edited assets" % len(target_errors)))
             if res.get("log_tail"):

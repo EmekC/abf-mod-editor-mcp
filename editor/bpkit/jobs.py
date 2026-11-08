@@ -53,7 +53,7 @@ def op_apply(job):
         row = spec.get("class_manager_row")
         if row:
             from . import rows as rows_mod
-            rows.append(rows_mod.ensure_class_manager_row(row["asset_path"], row["class_path"]))
+            rows.append(rows_mod.ensure_class_manager_row(row["asset_path"], row["class_path"], row.get("gameplay_tag")))
     return {"assets": reports, "saved": saved, "rows": rows}
 
 

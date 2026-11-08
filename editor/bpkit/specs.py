@@ -122,7 +122,8 @@ REQUIRED = {
 CREATE_CLASSES = ("Blueprint", "WidgetBlueprint", "BlueprintInterface", "UserDefinedStruct")
 RAW_KINDS = ("graph", "tree", "tree_replace", "python")
 # bp_apply features reported by the backend_info tool
-FEATURES = ("cast_object_pin", "class_manager_row", "event_meta","map_types", "pin_types", "self_event_calls", "set_types", "struct_fields")
+FEATURES = ("cast_object_pin", "class_manager_row", "class_manager_row_tag", "event_meta", "map_types", "pin_types", "self_event_calls",
+            "set_types", "struct_fields")
 EVENT_META_KEYS = ("tooltip", "category", "keywords")
 EVENT_META_MAX = 2000
 # keys that make no sense on a UserDefinedStruct asset
@@ -130,7 +131,11 @@ _STRUCT_FORBIDDEN_KEYS = ("variables", "remove_variables", "components", "dispat
                           "macros", "functions", "remove_functions", "interfaces", "graphs", "raw", "class_manager_row")
 _ROW_ASSET_RX = re.compile(r"^/[A-Za-z0-9_]+(/[A-Za-z0-9_]+)+$")
 _ROW_CLASS_RX = re.compile(r"^/[A-Za-z0-9_]+(/[A-Za-z0-9_]+)+\.[A-Za-z0-9_]+_C$")
-_ROW_KEYS = ("asset_path", "class_path")
+_ROW_KEYS = ("asset_path", "class_path", "gameplay_tag")
+# same rule as tagsini.TAG_RX (the host module cannot be imported editor side); a unit test keeps them equal
+TAG_RX = r"^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)*$"
+TAG_MAX = 200
+_TAG_RE = re.compile(TAG_RX)
 _FORBIDDEN_CODE = tuple("delete_" + n for n in ("asset", "directory", "loaded_asset")) + ("reparent_" + "blueprint", "rename_asset")
 
 
@@ -199,7 +204,8 @@ def check_struct_fields(w, a):
 
 
 def check_class_manager_row(w, row, mod):
-    """Problems of an asset spec's class_manager_row: {asset_path, class_path}, both inside the mod, never /Game."""
+    """Problems of an asset spec's class_manager_row: {asset_path, class_path, gameplay_tag?}, both paths inside the mod,
+    never /Game; the optional gameplay_tag is a dotted tag name written to the row's gameplay tag."""
     if not isinstance(row, dict):
         return [w + ".class_manager_row must be an object {asset_path, class_path}"]
     problems = []
@@ -218,6 +224,15 @@ def check_class_manager_row(w, row, mod):
             problems.append("%s: %r is not a path like %s" % (kw, value, shape))
         elif not value.startswith(prefix):
             problems.append("%s: must start with %s (other roots are refused)" % (kw, prefix))
+    if "gameplay_tag" in row:
+        tag = row["gameplay_tag"]
+        kw = w + ".class_manager_row.gameplay_tag"
+        if not isinstance(tag, str) or not tag:
+            problems.append(kw + " must be a non-empty string like ClassManager.EntityDirector.Name")
+        elif len(tag) > TAG_MAX:
+            problems.append("%s: longer than %d characters" % (kw, TAG_MAX))
+        elif "/" in tag or not _TAG_RE.match(tag):
+            problems.append("%s: %r may only hold letters, digits, '_' and '-' in dot separated segments" % (kw, tag))
     return problems
 
 
