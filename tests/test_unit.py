@@ -468,6 +468,18 @@ class T3dTests(unittest.TestCase):
         with self.assertRaises(SpecError):
             t3d.animation_text({"name": "F", "tracks": [{"widget": "Nope"}]}, {"Txt": "x"})
 
+    def test_fn_flags(self):
+        self.assertEqual(t3d.fn_flags("public"), 201457664)
+        self.assertEqual(t3d.fn_flags("private"), 201588736)
+        self.assertEqual(t3d.fn_flags("protected"), 201850880)
+        self.assertEqual(t3d.fn_flags(None), 201457664)
+        with self.assertRaises(KeyError):
+            t3d.fn_flags("secret")
+
+    def test_entry_node_access_flags(self):
+        e = t3d.entry_node("F", [], flags=t3d.fn_flags("private"))
+        self.assertIn("ExtraFlags=201588736", e.head)
+
     def test_function_nodes(self):
         e = t3d.entry_node("F", [{"name": "A", "type": "int"}], flags=t3d.FLAGS_FN | t3d.FLAGS_PURE, exec_pin=False)
         self.assertEqual([p.name for p in e.pins], ["A"])
@@ -541,6 +553,26 @@ class SpecTests(unittest.TestCase):
 
     def test_valid_sample_passes(self):
         self.assertEqual(specs.validate(self.GOOD, "Mod"), [])
+
+    def test_function_access_valid(self):
+        self.assertEqual(self.problems(lambda a: a["functions"][0].update(access="private")), [])
+
+    def test_function_access_invalid(self):
+        problems = self.problems(lambda a: a["functions"][0].update(access="secret"))
+        self.assertTrue(any("access must be public, protected or private" in p for p in problems), problems)
+
+    def test_function_duplicate_names(self):
+        problems = self.problems(lambda a: a["functions"].append({"name": "AddScore"}))
+        self.assertTrue(any("function AddScore is listed twice" in p for p in problems), problems)
+
+    def test_function_replace_in_one_spec(self):
+        self.assertEqual(self.problems(lambda a: a.update(remove_functions=["AddScore"])), [])
+
+    def test_interface_function_access_refused(self):
+        def mutate(a):
+            a["interfaces"] = [{"class": "/Mod/BPI_X.BPI_X_C", "functions": [{"name": "Ping", "access": "private"}]}]
+        problems = self.problems(mutate)
+        self.assertTrue(any("access is not allowed on an interface function" in p for p in problems), problems)
 
     def test_event_meta_prop_text_and_escaping(self):
         text = t3d.function_meta_prop({"tooltip": 'Say "hi"\nsecond \\ line\r', "category": "My Cat", "keywords": "a b"}, "Go")
@@ -2470,6 +2502,9 @@ class SelfEventCallTests(unittest.TestCase):
 
     def test_feature_is_advertised(self):
         self.assertIn("self_event_calls", specs.FEATURES)
+
+    def test_function_graphs_feature_is_advertised(self):
+        self.assertIn("function_graphs", specs.FEATURES)
 
 
 class BpReadToolTests(unittest.TestCase):

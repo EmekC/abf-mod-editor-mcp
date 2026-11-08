@@ -6,6 +6,8 @@ All notable changes to abf-mod-editor-mcp. The format follows [Keep a Changelog]
 
 ### Added
 
+- bp_apply feature `function_graphs`: `access` (`public`, `protected`, `private`) on own `functions` entries, a name in both
+  `remove_functions` and `functions` is replaced (compiled in between), and the created graph's name is checked.
 - `bp_asset_ops(mod, ops)`: rename (with referencer fix-up and redirector removal), delete (refused while referenced from outside
   the delete set), reparent (same family only) and recreate, on the staged mod only, all-or-nothing. `capabilities.assetOps`.
 - `bp_publish` argument `delete_removed`: deletes the real files of assets that are gone from staging, with backup, conflict

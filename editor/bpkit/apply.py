@@ -94,7 +94,8 @@ def _self_events(scopes):
 
 def _fn_nodes(f, parent=None, editable=True):
     ins, outs = f.get("inputs") or [], f.get("outputs") or []
-    nodes = [t3d.entry_node(f["name"], ins, parent=parent, editable=editable)]
+    flags = t3d.fn_flags(f.get("access")) if parent is None else t3d.FLAGS_FN
+    nodes = [t3d.entry_node(f["name"], ins, flags=flags, parent=parent, editable=editable)]
     if outs:
         nodes.append(t3d.result_node(f["name"], outs, parent=parent))
     return nodes
@@ -169,11 +170,19 @@ def apply_asset(spec, mod, index=0):
         LIB.compile_blueprint(bp)
 
     # 5. functions: signatures first (entry and result only)
-    for name in spec.get("remove_functions") or []:
+    removed = list(spec.get("remove_functions") or [])
+    for name in removed:
         must(LIB.find_graph(bp, name), "function graph " + name)
         LIB.remove_function_graph(bp, name)
+    added = [f["name"] for f in spec.get("functions") or []]
+    if any(name in added for name in removed):
+        LIB.compile_blueprint(bp)   # a replaced name is free only after the removal is compiled
     for f in spec.get("functions") or []:
+        if LIB.find_graph(bp, f["name"]):
+            raise RuntimeError("function graph %s already exists; list it in remove_functions to replace it" % f["name"])
         g = must(LIB.add_function_graph(bp, f["name"]), "new function graph " + f["name"])
+        if g.get_name() != f["name"]:
+            raise RuntimeError("function graph %s was created as %s (the name is still in use)" % (f["name"], g.get_name()))
         graphs.write_graph(g, [n.defn() for n in _fn_nodes(f)])
     if spec.get("functions") or spec.get("remove_functions"):
         LIB.compile_blueprint(bp)

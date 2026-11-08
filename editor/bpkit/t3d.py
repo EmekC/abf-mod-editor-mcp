@@ -9,6 +9,8 @@ import uuid
 
 FLAGS_FN = 201457664              # default ExtraFlags of a function entry
 FLAGS_PURE = 0x10000000           # added for a pure function
+ACCESS_FLAGS = {"public": 0x00020000, "protected": 0x00080000, "private": 0x00040000}   # FUNC_Public / Protected / Private
+ACCESS_MASK = 0x000E0000
 FLAGS_DELEGATE = 335675392        # ExtraFlags of a dispatcher signature entry
 DISPATCHER_PROPERTY_FLAGS = 17592454479877
 SCHEMA_K2 = "/Script/CoreUObject.Class'/Script/BlueprintGraph.EdGraphSchema_K2'"
@@ -693,6 +695,11 @@ def retarget(lines, class_text):
 
 def _fref(fn, parent):
     return 'FunctionReference=(%sMemberName="%s")' % ('MemberParent="%s",' % parent if parent else "", fn)
+
+
+def fn_flags(access=None):
+    """ExtraFlags of an own function entry for an access specifier (default public). KeyError on a bad value."""
+    return (FLAGS_FN & ~ACCESS_MASK) | ACCESS_FLAGS[access or "public"]
 
 
 def entry_node(fn, inputs, flags=FLAGS_FN, parent=None, editable=True, pos=(0, 0), exec_pin=True, name="K2Node_FunctionEntry_0"):

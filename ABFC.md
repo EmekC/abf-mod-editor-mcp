@@ -162,6 +162,24 @@ releases those packages together with the published ones, and afterwards rescans
 failure (including the reload) restores the deleted files from the backup. A publish with only deletions is valid. The result gains
 `deleted: [...]` (and `would_delete` in a dry run). Without the flag nothing is deleted and the old note stays.
 
+## bp_apply feature `function_graphs` (2.6.0)
+
+For tools that own whole function graphs (abfc compiles an undecorated TypeScript method to one). `backend_info.bpApply.features`
+lists `function_graphs`.
+
+- `access` on an own `functions` entry: `"public"` (default), `"protected"` or `"private"`. It is written as the entry node's
+  `ExtraFlags`: 201457664 (public, the default), 201850880 (protected), 201588736 (private). That is the default flag word with the
+  access bits (`FUNC_Public` 0x20000, `FUNC_Protected` 0x80000, `FUNC_Private` 0x40000) swapped. Any other value is a spec problem;
+  `access` on an interface function is refused. Interface functions keep the default flags.
+- A name listed in both `remove_functions` and `functions` is replaced: the old graph is removed, the Blueprint is compiled so the
+  name is free, then the new graph is created. Replacing is the way to change a signature.
+- After `add_function_graph` the graph's name must equal the requested name; otherwise the apply fails with "function graph X was
+  created as Y (the name is still in use)". Adding a function whose graph already exists and is not in `remove_functions` fails with
+  "function graph X already exists; list it in remove_functions to replace it". A name listed twice in `functions` is a spec problem.
+- Unchanged: `pure` is still refused, and a function graph cannot get local variables (`capabilities.functionLocals` stays `false`,
+  `capabilities.userPureFunctions` stays `false`). The body goes in a normal `graphs` edit of the function's graph (`entry` and
+  `result` are the reserved node ids).
+
 ## `mod_audit` on the stage (`backend_info.capabilities.stageAudit`)
 
 `mod_audit` always audits the staged copy (`audited_copy: "stage"`; the optional `stage` argument is accepted and ignored, there is no
@@ -227,7 +245,7 @@ Opt-in, off by default. With `ABF_WARM_SESSION=1` the server keeps one hidden `-
 abfc needs protocol >= 1 (a lower number is its error ABFC4001) and warns below server version 2.4.0 (ABFC4014). It reads
 `backend_info`: `protocol`, `serverVersion`, `engineVersion`, `capabilities` (`pinTypes`, `containerTypes` for diagnostics,
 `warmSession`, `stageAudit`, `compileErrorNodeRefs`, and the other keys above) and `bpApply.features` (`pin_types`, `cast_object_pin`,
-`map_types`, `set_types`, `struct_fields`, `event_meta`, `self_event_calls`, `class_manager_row`) and `bpApply.nodeKinds`. `pinTypes` is on only when the
+`map_types`, `set_types`, `struct_fields`, `event_meta`, `self_event_calls`, `class_manager_row`, `function_graphs`) and `bpApply.nodeKinds`. `pinTypes` is on only when the
 tool lists `pin_types`; otherwise (including a backend without `backend_info`) abfc uses a two-phase route: apply, read the rolled-back
 `final_<i>.t3d`, patch the wildcard pins, re-apply as a raw graph. Everything `backend_info` does not report comes from `tools/list`
 (for example whether `reflect` is registered), from `abfc_extensions` and from a static `bp_apply` protocol-1 baseline inside abfc. A

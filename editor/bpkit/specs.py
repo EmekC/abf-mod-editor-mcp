@@ -122,7 +122,7 @@ REQUIRED = {
 CREATE_CLASSES = ("Blueprint", "WidgetBlueprint", "BlueprintInterface", "UserDefinedStruct")
 RAW_KINDS = ("graph", "tree", "tree_replace", "python")
 # bp_apply features reported by the backend_info tool
-FEATURES = ("cast_object_pin", "class_manager_row", "class_manager_row_tag", "event_meta", "map_types", "pin_types", "self_event_calls",
+FEATURES = ("cast_object_pin", "class_manager_row", "class_manager_row_tag", "event_meta", "function_graphs", "map_types", "pin_types", "self_event_calls",
             "set_types", "struct_fields", "variable_defaults")
 EVENT_META_KEYS = ("tooltip", "category", "keywords")
 EVENT_META_MAX = 2000
@@ -482,11 +482,17 @@ def validate(batch, mod):
             _check_params(problems, mw + ".inputs", m.get("inputs") or [])
             _check_params(problems, mw + ".outputs", m.get("outputs") or [])
             _check_graph_nodes(problems, mw, m.get("nodes"), m.get("wires"), ("in", "out"), False)
+        seen_fns = set()
         for i, f in enumerate(a.get("functions") or []):
             fw = "%s.functions[%d]" % (w, i)
             if not isinstance(f, dict) or not f.get("name"):
                 problems.append(fw + " needs a name")
                 continue
+            if f["name"] in seen_fns:
+                problems.append("%s: function %s is listed twice" % (fw, f["name"]))
+            seen_fns.add(f["name"])
+            if "access" in f and f["access"] not in ("public", "protected", "private"):
+                problems.append("%s.access must be public, protected or private" % fw)
             if f.get("pure"):
                 problems.append(fw + ": pure functions are not supported (the engine rejects the generated pure function; make it an ordinary function)")
             _check_params(problems, fw + ".inputs", f.get("inputs") or [])
@@ -502,6 +508,8 @@ def validate(batch, mod):
                 if not isinstance(f, dict) or not f.get("name"):
                     problems.append(fw + " needs a name")
                     continue
+                if "access" in f:
+                    problems.append(fw + ": access is not allowed on an interface function")
                 _check_params(problems, fw + ".inputs", f.get("inputs") or [])
                 _check_params(problems, fw + ".outputs", f.get("outputs") or [])
                 _check_graph_nodes(problems, fw, f.get("nodes"), f.get("wires"), ("entry", "result"), False)
