@@ -20,7 +20,7 @@ Three tools are registered only when the server starts with `ABF_ABFC_TOOLS=1` (
 
 ### `reflect`
 
-`reflect(mod, classes, structs = [], cast_targets = [], meta = true, timeout_seconds = 900)`. Hidden editor on the staging copy, read only.
+`reflect(mod, classes, structs = [], cast_targets = [], supers_of = [], meta = true, timeout_seconds = 900)`. Hidden editor on the staging copy, read only.
 Paths must be `/Script/...`, `/Game/...` or `/<mod>/...` (anything else is refused on the host before an editor starts).
 Classes are loaded with `unreal.load_class` (never `load_asset`, never an export of a `/Game` asset). Returns:
 
@@ -40,13 +40,17 @@ or `{ "error", "run", "log_tail" }`. `<run>/reflect.json`:
                            "properties": [{ "name": "...", "pins": [Pin] }],
                            "castPin": "<cast result output pin name or null>" } },
   "structs": { "<path>": { "fields": [Pin] } },
+  "supers": { "<path>": ["<parent>", "...", "/Script/CoreUObject.Object"] },
   "errors": ["..."] }
 ```
 
 A `Pin` is `{ name, dir: "in"|"out", category, subCategory, subCategoryObject (inner path or null), objectMeta, container, hidden, default }`.
 Classes that appear only in `cast_targets` get an entry with empty member lists, their `castPin` and `"castOnly": true`.
 Per-member failures go to `errors` and do not abort the run. `ExecuteUbergraph_*` and `*__DelegateSignature` functions are skipped.
-Blueprint parent chains are not walkable from Python, so `ancestors` lists native wrapper classes only.
+`ancestors` stays native-only (the Python wrapper chain). `supers` comes from the asset registry's class inheritance (every parent,
+Blueprint and native, nearest first, ending at `/Script/CoreUObject.Object`) for every loaded class and for each `supers_of` path
+(classes that are loaded only to learn their parents; they get no `classes` entry). Every link is checked with `class_is_child_of`;
+a class whose chain cannot be confirmed has no entry in `supers`. The key is always present, `{}` when nothing could be confirmed.
 
 **Function metadata and the `meta` switch.** The top-level `meta` of the result and of `reflect.json` is `"read"` or `"skipped"`.
 When it is read (the default), each function entry gets `meta: { tooltip, displayName }` from the `ToolTip` and `DisplayName` tags

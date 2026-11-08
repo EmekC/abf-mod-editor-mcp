@@ -6,6 +6,9 @@ All notable changes to abf-mod-editor-mcp. The format follows [Keep a Changelog]
 
 ### Added
 
+- `reflect` reports `supers` (reflect.json: path -> every parent class, Blueprint and native, nearest first, from the asset
+  registry's class inheritance, each link checked with `class_is_child_of`) for every loaded class, and takes `supers_of` (class
+  paths loaded only to report their parents).
 - bp_apply feature `function_graphs`: `access` (`public`, `protected`, `private`) on own `functions` entries, a name in both
   `remove_functions` and `functions` is replaced (compiled in between), and the created graph's name is checked.
 - `bp_asset_ops(mod, ops)`: rename (with referencer fix-up and redirector removal), delete (refused while referenced from outside

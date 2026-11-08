@@ -202,3 +202,27 @@ def collect_function_meta(read_tag, items, budget=META_BUDGET_SECONDS, clock=Non
         else:
             out[key] = read_function_meta(read_tag, fn, read_all, (pins or {}).get(key))
     return out
+
+
+OBJECT_PATH = "/Script/CoreUObject.Object"
+
+
+def verified_supers(path, names, is_child):
+    """Ancestor paths of `path` (nearest first, e.g. from the asset registry) when the whole chain checks out, else None.
+    The self entry and duplicates are dropped; the chain must end at /Script/CoreUObject.Object and every link
+    (`path` -> names[0], names[i] -> names[i+1]) must satisfy is_child(child, parent). An is_child that raises gives None."""
+    chain = []
+    for n in names or []:
+        if n != path and n not in chain:
+            chain.append(n)
+    if not chain or chain[-1] != OBJECT_PATH:
+        return None
+    try:
+        if not is_child(path, chain[0]):
+            return None
+        for i in range(len(chain) - 1):
+            if not is_child(chain[i], chain[i + 1]):
+                return None
+    except Exception:
+        return None
+    return chain

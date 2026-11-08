@@ -96,11 +96,43 @@ def _ancestors(cls, errors=None):
         return []
 
 
+def _supers(cls, ancestors):
+    """Every parent class of `cls` (Blueprint and native), nearest first, ending at /Script/CoreUObject.Object, or None.
+    Source: the asset registry's class inheritance; every link is checked with class_is_child_of. A /Script class whose
+    registry chain does not verify falls back to the native `ancestors` list (checked the same way)."""
+    try:
+        path = cls.get_path_name()
+        pkg, _, name = path.rpartition(".")
+        reg = unreal.AssetRegistryHelpers.get_asset_registry()
+        found = reg.get_ancestor_class_names(unreal.TopLevelAssetPath(pkg, name))
+        names = ["%s.%s" % (str(n.package_name), str(n.asset_name)) for n in (found or [])]
+        cache = {path: cls}
+
+        def load(p):
+            if p not in cache:
+                cache[p] = unreal.load_class(None, p)
+            return cache[p]
+
+        def is_child(a, b):
+            ca, cb = load(a), load(b)
+            if ca is None or cb is None:
+                return False
+            return bool(unreal.MathLibrary.class_is_child_of(ca, cb))
+
+        result = rp.verified_supers(path, names, is_child)
+        if result is None and path.startswith("/Script/"):
+            result = rp.verified_supers(path, ancestors, is_child)
+        return result
+    except Exception:
+        return None
+
+
 def run(job):
     errors = []
     classes_in = list(job.get("classes") or [])
     structs_in = list(job.get("structs") or [])
     casts_in = list(job.get("cast_targets") or [])
+    supers_in = list(job.get("supers_of") or [])
     loaded = {}   # requested path -> (class object, path name, meta)
     for p in classes_in + [c for c in casts_in if c not in classes_in]:
         try:
@@ -168,6 +200,25 @@ def run(job):
                                  "castPin": None, "castOnly": True}
         result_classes[p]["castPin"] = rp.cast_pin(pins)
 
+    # parent chains (Blueprint and native) of every loaded class and of the supers_of paths; absent key = unknown
+    result_supers = {}
+    for p in loaded:
+        s = _supers(loaded[p][0], result_classes.get(p, {}).get("ancestors") or _ancestors(loaded[p][0]))
+        if s is not None:
+            result_supers[p] = s
+    for p in supers_in:
+        if p in loaded:
+            continue
+        try:
+            cls = unreal.load_class(None, _load_path(p))
+            if cls is None:
+                continue
+            s = _supers(cls, _ancestors(cls))
+        except Exception:
+            continue
+        if s is not None:
+            result_supers[p] = s
+
     # struct fields: the output pins of a BreakStruct node
     struct_items = {}
     for s in structs_in:
@@ -193,13 +244,13 @@ def run(job):
         result_classes[p]["functions"].append({"name": n, "pins": pins, "meta": metas.get((p, n))})
 
     out = {"engineVersion": unreal.SystemLibrary.get_engine_version(), "meta": "read" if want_meta else "skipped",
-           "classes": result_classes, "structs": result_structs, "errors": errors}
+           "classes": result_classes, "structs": result_structs, "supers": result_supers, "errors": errors}
     with open(os.path.join(job["run"], "reflect.json"), "w", encoding="utf-8") as f:
         json.dump(out, f, indent=1, default=str)
     counts = {"classes": len(result_classes),
               "functions": sum(len(c["functions"]) for c in result_classes.values()),
               "properties": sum(len(c["properties"]) for c in result_classes.values()),
-              "structs": len(result_structs), "errors": len(errors)}
+              "structs": len(result_structs), "supers": len(result_supers), "errors": len(errors)}
     if job.get("gameplay_tags"):
         from . import tags as tags_mod
         out["gameplayTags"] = tags_mod.list_tags()

@@ -98,6 +98,8 @@ class ToolTableTests(unittest.TestCase):
             self.assertEqual(reflect[3][k]["type"], "array")
         self.assertEqual(reflect[3]["meta"]["type"], "boolean")
         self.assertNotIn("meta", reflect[4])
+        self.assertEqual(reflect[3]["supers_of"]["type"], "array")
+        self.assertNotIn("supers_of", reflect[4])
         self.assertEqual(tools[0][3], {})
 
     def test_abfc_extensions_shape(self):
@@ -121,6 +123,9 @@ class ToolTableTests(unittest.TestCase):
         self.assertIn("structs", json.loads(text)["error"])
         text, is_err = reflect({"mod": "Mod", "classes": [], "cast_targets": ["/Engine/C"]})
         self.assertTrue(is_err)
+        text, is_err = reflect({"mod": "Mod", "classes": [], "supers_of": ["/Engine/X"]})
+        self.assertTrue(is_err)
+        self.assertIn("supers_of", json.loads(text)["error"])
 
 
 class ReflectParseTests(unittest.TestCase):
@@ -179,6 +184,43 @@ class ReflectParseTests(unittest.TestCase):
         self.assertTrue(reflectparse.SKIP_FUNCTION("ExecuteUbergraph_BP_X"))
         self.assertTrue(reflectparse.SKIP_FUNCTION("OnHit__DelegateSignature"))
         self.assertFalse(reflectparse.SKIP_FUNCTION("DoIt"))
+
+    def test_verified_supers(self):
+        obj = "/Script/CoreUObject.Object"
+        bp, parent, native = "/Game/A/BP_X.BP_X_C", "/Game/A/BP_P.BP_P_C", "/Script/Fake.Widget"
+        parents = {bp: parent, parent: native, native: obj}
+
+        def is_child(a, b):
+            while a in parents:
+                a = parents[a]
+                if a == b:
+                    return True
+            return False
+
+        good = reflectparse.verified_supers(bp, [parent, native, obj], is_child)
+        self.assertEqual(good, [parent, native, obj])
+        # the self entry and duplicates are dropped
+        self.assertEqual(reflectparse.verified_supers(bp, [bp, parent, parent, native, obj], is_child), [parent, native, obj])
+        # a native class listing itself first (wrapper chain) still verifies
+        self.assertEqual(reflectparse.verified_supers(native, [native, obj], is_child), [obj])
+        self.assertIsNone(reflectparse.verified_supers(bp, [], is_child))
+        self.assertIsNone(reflectparse.verified_supers(bp, None, is_child))
+        self.assertIsNone(reflectparse.verified_supers(bp, [bp], is_child))
+        # the chain must end at UObject
+        self.assertIsNone(reflectparse.verified_supers(bp, [parent, native], is_child))
+        # one broken link anywhere: the first link, a middle link
+        self.assertIsNone(reflectparse.verified_supers(bp, [native, parent, obj], is_child))
+        self.assertIsNone(reflectparse.verified_supers(bp, [parent, "/Script/Fake.Other", obj], is_child))
+
+        def broken(a, b):
+            return not (a == parent and b == native) and is_child(a, b)
+
+        self.assertIsNone(reflectparse.verified_supers(bp, [parent, native, obj], broken))
+
+        def boom(a, b):
+            raise RuntimeError("no class")
+
+        self.assertIsNone(reflectparse.verified_supers(bp, [parent, native, obj], boom))
 
     def test_function_meta_shape(self):
         tags = {"ToolTip": " Does it. ", "DisplayName": ""}

@@ -54,17 +54,18 @@ def build(server_version):
         classes = list(args.get("classes") or [])
         structs = list(args.get("structs") or [])
         casts = list(args.get("cast_targets") or [])
-        for kind, paths_ in (("classes", classes), ("structs", structs), ("cast_targets", casts)):
+        supers_of = list(args.get("supers_of") or [])
+        for kind, paths_ in (("classes", classes), ("structs", structs), ("cast_targets", casts), ("supers_of", supers_of)):
             bad = check_reflect_paths(mod, kind, paths_)
             if bad:
                 return _out({"error": bad})
-        if not (classes or structs or casts):
-            return _out({"error": "nothing to reflect (classes, structs and cast_targets are all empty)"})
+        if not (classes or structs or casts or supers_of):
+            return _out({"error": "nothing to reflect (classes, structs, cast_targets and supers_of are all empty)"})
         want_meta = args["meta"] if isinstance(args.get("meta"), bool) else os.environ.get("ABF_REFLECT_META", "1") != "0"
         stage = staging.load(mod)
         try:
             res = headless.run_commandlet(stage, {"op": "reflect", "classes": classes, "structs": structs, "cast_targets": casts,
-                                                  "meta": want_meta, "gameplay_tags": args.get("gameplay_tags") is True},
+                                                  "supers_of": supers_of, "meta": want_meta, "gameplay_tags": args.get("gameplay_tags") is True},
                                           timeout=float(args.get("timeout_seconds") or 900))
         finally:
             staging.strip_scratch(stage)
@@ -103,8 +104,9 @@ def build(server_version):
          "Read-only, hidden editor on the staging copy: enumerate functions, properties, struct fields, ancestors and cast pins of classes "
          "(/Script, /Game, mod) into <run>/reflect.json, and return the Blueprint filter rules. Never loads /Game assets as assets. "
          "meta=false (or env ABF_REFLECT_META=0) skips the function tooltip/display-name/C++-default read. "
-         "gameplay_tags=true also lists every gameplay tag the editor knows (gameplayTags in reflect.json).",
-         {"mod": STR, "classes": STR_LIST, "structs": STR_LIST, "cast_targets": STR_LIST, "timeout_seconds": NUM,
+         "gameplay_tags=true also lists every gameplay tag the editor knows (gameplayTags in reflect.json). "
+         "reflect.json also has supers (every parent class, Blueprint and native, nearest first) of each loaded class and of the supers_of paths.",
+         {"mod": STR, "classes": STR_LIST, "structs": STR_LIST, "cast_targets": STR_LIST, "supers_of": STR_LIST, "timeout_seconds": NUM,
           "meta": {"type": "boolean"}, "gameplay_tags": {"type": "boolean"}}, ["mod", "classes"]),
         ("warm_session", t_warm_session,
          "Start, stop or inspect the warm session: one hidden commandlet kept alive on the staging copy that serves bp_apply, bp_read, "
