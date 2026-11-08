@@ -207,6 +207,39 @@ class ReflectParseTests(unittest.TestCase):
         got = reflectparse.read_function_meta(route, "f", read_all=read_all, pins=["InString", "Key", "Other"])
         self.assertEqual(got["defaults"], {"InString": "Hello"})
 
+    def test_param_name_metadata_is_a_default(self):
+        # Delay: the engine declares meta=(Latent, LatentInfo="LatentInfo", Duration="0.2"); the Blueprint editor places Duration 0.2
+        vals = {"Duration": "0.2", "Latent": "", "LatentInfo": "LatentInfo", "ToolTip": "x"}
+        got = reflectparse.read_function_meta(lambda fn, tag: "", "f", read_all=lambda fn: vals, pins=["Duration"])
+        self.assertEqual(got["defaults"], {"Duration": "0.2"})
+        # the latent marker (key == value == pin name) is no default, and without pins only CPP_Default_ keys are listed
+        got = reflectparse.read_function_meta(lambda fn, tag: "", "f", read_all=lambda fn: vals, pins=["Duration", "LatentInfo", "Other"])
+        self.assertEqual(got["defaults"], {"Duration": "0.2"})
+        self.assertEqual(reflectparse.read_function_meta(lambda fn, tag: "", "f", read_all=lambda fn: vals)["defaults"], {})
+
+    def test_param_name_metadata_wins_over_cpp_default(self):
+        vals = {"Duration": "0.2", "CPP_Default_Duration": "5.000000", "CPP_Default_Key": "K", "Key": ""}
+        got = reflectparse.read_function_meta(lambda fn, tag: "", "f", read_all=lambda fn: vals, pins=["Duration", "Key"])
+        self.assertEqual(got["defaults"], {"Duration": "0.2", "Key": "K"})
+
+    def test_param_name_metadata_per_pin_fallback(self):
+        def read_all(fn):
+            raise RuntimeError("no bulk read")
+
+        tags = {"Duration": "0.2", "CPP_Default_Duration": "5.000000", "CPP_Default_Key": "K", "LatentInfo": "LatentInfo"}
+        got = reflectparse.read_function_meta(lambda fn, tag: tags.get(tag, ""), "f", read_all=read_all,
+                                              pins=["Duration", "Key", "LatentInfo", "Other"])
+        self.assertEqual(got["defaults"], {"Duration": "0.2", "Key": "K"})
+
+        def route(fn, tag):
+            if tag == "Duration":
+                raise RuntimeError("no")
+            return tags.get(tag, "")
+
+        # a parameter-name read that raises falls through to the C++ default
+        self.assertEqual(reflectparse.read_function_meta(route, "f", read_all=read_all, pins=["Duration"])["defaults"],
+                         {"Duration": "5.000000"})
+
     def test_function_defaults_unreadable_is_none(self):
         def boom(fn, tag):
             if tag.startswith("CPP_Default_"):

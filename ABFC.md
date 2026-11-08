@@ -129,7 +129,8 @@ warm session is stopped when tags were added, so the next run starts with the ne
 
 **`reflect` extras.** `gameplay_tags: true` adds `gameplayTags: { tags: [sorted unique names], sources: { <source>: count | "error: ..." } }`
 to `reflect.json` and `gameplayTags` to `counts`. With `meta` read, each function entry's `meta` gains
-`defaults: { <input pin>: "<default text>" }` from the `CPP_Default_<pin>` metadata (`null` when it could not be read; the per-pin
+`defaults: { <input pin>: "<default text>" }` from the pin's metadata, in Unreal's own lookup order (`UEdGraphSchema_K2::FindFunctionParameterDefaultValue`):
+the key equal to the parameter name first (`meta=(Duration="0.2")`), then `CPP_Default_<pin>` (`null` when it could not be read; the per-pin
 read is the fallback when the bulk read fails).
 
 **`bp_asset_ops(mod, ops, timeout_seconds)`** (`capabilities.assetOps`). Edits the staged mod only (`bp_apply` still refuses these).

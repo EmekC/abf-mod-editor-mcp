@@ -15,7 +15,8 @@ All notable changes to abf-mod-editor-mcp. The format follows [Keep a Changelog]
   `Config/Tags/<Mod>Tags.ini` and set on the row. The ini is tracked by staging and published with the Content files.
   `capabilities.gameplayTags`.
 - `reflect` argument `gameplay_tags` (lists the editor's gameplay tags) and `meta.defaults` on function entries (the
-  `CPP_Default_*` metadata). `capabilities.reflectDefaults`.
+  `CPP_Default_*` metadata, and the metadata key equal to the parameter name first: Unreal's own lookup order, e.g. `Delay`'s
+  `Duration="0.2"`). `capabilities.reflectDefaults`.
 - `variable_defaults` ({name: default text or null}) on a bp_apply asset spec (bp_apply feature `variable_defaults`): replaces or drops the
   DefaultValue of variables that stay, keeping their guid (no remove and re-add). Variable defaults are now escaped in the T3D text.
 

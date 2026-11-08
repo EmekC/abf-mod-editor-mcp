@@ -131,28 +131,46 @@ META_BUDGET_SECONDS = 20.0
 DEFAULT_PREFIX = "CPP_Default_"
 
 
+LATENT_PIN = "LatentInfo"   # UHT writes meta LatentInfo="LatentInfo" (key == value == pin name): a marker, not a default
+
+
 def read_function_defaults(read_tag, fn, read_all=None, pins=None):
-    """{pin: default text} from the UFunction's CPP_Default_<Pin> metadata (the C++ default arguments), or None when
-    unreadable. read_all(fn) -> {tag: value} reads every tag at once (unreal.EditorAssetLibrary.get_metadata_tag_values);
-    when it is missing or raises, each of `pins` is read with read_tag(fn, "CPP_Default_" + pin) and non-empty values are kept."""
+    """{pin: default text} of a UFunction's input pins, or None when unreadable. The lookup is Unreal's own
+    (UEdGraphSchema_K2::FindFunctionParameterDefaultValue): the metadata key equal to the PARAMETER NAME first (UHT
+    `meta=(Duration="0.2")`), then CPP_Default_<Param> (the C++ default argument); empty values are no default.
+    read_all(fn) -> {tag: value} reads every tag at once (unreal.EditorAssetLibrary.get_metadata_tag_values). With `pins` both
+    keys are looked up for each pin; without `pins` only the CPP_Default_ keys can be listed (a parameter-name key cannot be told from
+    other metadata). When read_all is missing or raises, each of `pins` is read with read_tag(fn, pin), then
+    read_tag(fn, "CPP_Default_" + pin) (first non-empty wins; unreadable = None when no value was found and no CPP_Default_ read worked)."""
     if read_all is not None:
         try:
-            return {str(k)[len(DEFAULT_PREFIX):]: str(v) for k, v in dict(read_all(fn)).items()
-                    if str(k).startswith(DEFAULT_PREFIX) and str(v) != ""}
+            tags = {str(k): str(v) for k, v in dict(read_all(fn)).items()}
+            if pins is None:
+                return {k[len(DEFAULT_PREFIX):]: v for k, v in tags.items() if k.startswith(DEFAULT_PREFIX) and v != ""}
+            got = {}
+            for pin in pins:
+                v = (tags.get(pin) if pin != LATENT_PIN else None) or tags.get(DEFAULT_PREFIX + pin)
+                if v:
+                    got[pin] = v
+            return got
         except Exception:
             pass
     if not pins:
         return None
     got, readable = {}, False
     for pin in pins:
-        try:
-            v = read_tag(fn, DEFAULT_PREFIX + pin)
-        except Exception:
-            continue
-        readable = True
-        v = str(v) if v is not None else ""
-        if v != "":
-            got[pin] = v
+        for key in (pin, DEFAULT_PREFIX + pin) if pin != LATENT_PIN else (DEFAULT_PREFIX + pin,):
+            try:
+                v = read_tag(fn, key)
+            except Exception:
+                continue
+            v = str(v) if v is not None else ""
+            if v != "":
+                got[pin] = v
+                readable = True
+                break
+            if key.startswith(DEFAULT_PREFIX):
+                readable = True   # the C++ default read worked and found none (an empty parameter-name read proves nothing)
     return got if readable else None
 
 
