@@ -376,17 +376,29 @@ def build(run_json, remote_errors, t3d_errors, kit_root, forbidden, py_status, l
         ok = bool(res["ok"]) and not target_errors
         rolled_back = False
         if not ok and not keep_on_error:
-            for stem in stems:
-                for rel in staging.files_for(stage, stem):
-                    if rel not in existing:
-                        (stage.dir / rel).unlink()
-            for rel, src in existing.items():
-                dst = stage.dir / rel
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src, dst)
-            rolled_back = True
-            if tags_added:
-                restore_ini()
+            def unlink_retry(p):
+                for pause in list(fscopy.COPY_DELAYS) + [None]:
+                    try:
+                        p.unlink()
+                        return
+                    except PermissionError as e:
+                        if getattr(e, "winerror", None) not in fscopy.SHARING_WINERRORS or pause is None:
+                            raise
+                    time.sleep(pause)
+
+            try:
+                for stem in stems:
+                    for rel in staging.files_for(stage, stem):
+                        if rel not in existing:
+                            unlink_retry(stage.dir / rel)
+                for rel, src in existing.items():
+                    dst = stage.dir / rel
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    fscopy.copy_file_retry(src, dst)
+                rolled_back = True
+            finally:
+                if tags_added:
+                    restore_ini()
         out = {"ok": ok, "rolled_back": rolled_back, "assets": (res.get("result") or {}).get("assets"),
                "rows": (res.get("result") or {}).get("rows") or [], "compile": compile_,
                "problems": t3d_problems, "run": res["run"], "seconds": res["seconds"], "warm": bool(res.get("warm")),

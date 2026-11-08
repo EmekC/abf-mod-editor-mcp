@@ -211,11 +211,11 @@ def strip_scratch(stage):
 def files_for(stage, stem):
     """Existing files of one asset: every Content/<stem>.* (uasset, uexp, ...)."""
     parent = (stage.dir / stem).parent
-    name = Path(stem).name
+    name = Path(stem).name.casefold()      # Windows and Unreal treat asset names case-insensitively
     if not parent.is_dir():
         return []
     return sorted((parent / f.name).relative_to(stage.dir).as_posix() for f in parent.iterdir()
-                  if f.is_file() and os.path.splitext(f.name)[0] == name)
+                  if f.is_file() and os.path.splitext(f.name)[0].casefold() == name)
 
 
 def diff(stage):

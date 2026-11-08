@@ -1254,13 +1254,17 @@ class ApplyTagsIniHostTests(unittest.TestCase):
     restored when the apply fails."""
     ROW = {"asset_path": "/Mod/Tables/Row_A", "class_path": "/Mod/X/BP_A.BP_A_C", "gameplay_tag": "ClassManager.EntityDirector.A"}
 
-    def run_apply(self, ok, old=None):
+    def run_apply(self, ok, old=None, asset_bytes=None, copy_patch=None):
         import headless_tools
         import tagsini
         run = Path(tempfile.mkdtemp(prefix="abftagrun"))
         stage_dir = Path(tempfile.mkdtemp(prefix="abftagstage"))
         self.addCleanup(shutil.rmtree, str(run), True)
         self.addCleanup(shutil.rmtree, str(stage_dir), True)
+        self.stage_dir = stage_dir
+        if asset_bytes is not None:
+            (stage_dir / "Content" / "X").mkdir(parents=True)
+            (stage_dir / "Content" / "X" / "BP_A.uasset").write_bytes(asset_bytes)
         ini = tagsini.ini_path(stage_dir, "Mod")
         if old is not None:
             ini.parent.mkdir(parents=True)
@@ -1280,9 +1284,49 @@ class ApplyTagsIniHostTests(unittest.TestCase):
         stage = SimpleNamespace(dir=stage_dir, name="Mod")
         with mock.patch.object(headless_tools.staging, "load", return_value=stage), \
                 mock.patch.object(headless_tools.staging, "strip_scratch"), \
-                mock.patch.object(headless, "run_commandlet", side_effect=fake_run):
+                mock.patch.object(headless, "run_commandlet", side_effect=fake_run), \
+                (copy_patch or __import__("contextlib").nullcontext()):
             text, _ = tools["bp_apply"]({"mod": "Mod", "assets": [{"asset": "/Mod/X/BP_A", "class_manager_row": dict(self.ROW)}]})
         return json.loads(text), seen, ini
+
+    def test_rollback_retries_a_sharing_violation(self):
+        import fscopy
+        real = fscopy.copy_file_retry
+        state = {"n": 0}
+
+        def flaky(src, dst, *a, **k):
+            return real(src, dst, delays=(0,), sleep=lambda s: None, copy=one_violation)
+
+        def one_violation(src, dst):
+            if "before" in Path(src).parts and state["n"] == 0:
+                state["n"] += 1
+                e = PermissionError(13, "in use")
+                e.winerror = 32
+                raise e
+            return shutil.copy2(src, dst)
+
+        old = b'[/Script/GameplayTags.GameplayTagsList]\r\nGameplayTagList=(Tag="Other.Tag",DevComment="")\r\n'
+        d, seen, ini = self.run_apply(False, old, asset_bytes=b"GOOD", copy_patch=mock.patch.object(fscopy, "copy_file_retry", side_effect=flaky))
+        self.assertIs(d["rolled_back"], True)
+        self.assertEqual(state["n"], 1)
+        self.assertEqual(ini.read_bytes(), old)
+
+    def test_rollback_failure_still_restores_the_ini(self):
+        import fscopy
+        calls = {"n": 0}
+        real = fscopy.copy_file_retry
+
+        def failing_on_rollback(src, dst, *a, **k):
+            calls["n"] += 1
+            if calls["n"] > 1:          # the first call is the snapshot
+                raise OSError("disk full (simulated)")
+            return real(src, dst, *a, **k)
+
+        old = b'[/Script/GameplayTags.GameplayTagsList]\r\nGameplayTagList=(Tag="Other.Tag",DevComment="")\r\n'
+        with self.assertRaises(OSError):
+            self.run_apply(False, old, asset_bytes=b"GOOD", copy_patch=mock.patch.object(fscopy, "copy_file_retry", side_effect=failing_on_rollback))
+        ini = __import__("tagsini").ini_path(self.stage_dir, "Mod")
+        self.assertEqual(ini.read_bytes(), old)
 
     def test_tag_is_in_the_ini_before_the_run(self):
         d, seen, ini = self.run_apply(True)

@@ -31,7 +31,10 @@ def ini_path(base, mod):
 
 
 def _read_text(path):
-    return Path(path).read_bytes().decode("utf-8")
+    data = Path(path).read_bytes()
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        raise ValueError("%s is saved as UTF-16 (byte order mark); re-save it as UTF-8 so the tags can be read and extended safely" % path)
+    return data.decode("utf-8")
 
 
 def read_tags(path):

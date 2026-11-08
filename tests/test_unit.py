@@ -1396,6 +1396,23 @@ class TagsIniTests(unittest.TestCase):
     def test_missing_file_reads_empty(self):
         self.assertEqual(tagsini.read_tags(self.ini), [])
 
+    def test_utf16_file_is_refused_clearly(self):
+        self.ini.parent.mkdir(parents=True)
+        self.ini.write_bytes(TAGS_HEAD.encode("utf-16"))      # BOM + UTF-16LE, as Unreal saves non-ASCII ini files
+        with self.assertRaisesRegex(ValueError, "UTF-16"):
+            tagsini.read_tags(self.ini)
+        with self.assertRaisesRegex(ValueError, "UTF-16"):
+            tagsini.ensure_tags(self.ini, ["ClassManager.EntityDirector.One"])
+
+    def test_files_for_ignores_name_case(self):
+        import staging
+        from types import SimpleNamespace
+        (self.work / "Content" / "X").mkdir(parents=True)
+        (self.work / "Content" / "X" / "BP_Thing.uasset").write_bytes(b"1")
+        stage = SimpleNamespace(dir=self.work)
+        self.assertEqual(staging.files_for(stage, "Content/X/bp_thing"), ["Content/X/BP_Thing.uasset"])
+        self.assertEqual(staging.files_for(stage, "Content/X/Other"), [])
+
     def test_creates_folder_file_and_header(self):
         added = tagsini.ensure_tags(self.ini, ["ClassManager.EntityDirector.One", "ClassManager.EntityDirector.Two"])
         self.assertEqual(added, ["ClassManager.EntityDirector.One", "ClassManager.EntityDirector.Two"])
