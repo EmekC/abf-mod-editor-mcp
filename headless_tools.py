@@ -70,8 +70,8 @@ def filter_editor_processes(rows, exe, headless_root):
     return out
 
 
-def list_editor_processes():
-    """Read-only process listing (no handle to the editor is opened, nothing is sent to it): PowerShell + CIM, no window."""
+def _editor_rows():
+    """Every editor process as {"pid","path","command_line"} (read-only: PowerShell + CIM, no window)."""
     name = paths.EDITOR_EXE_REL.name
     cmd = ('Get-CimInstance Win32_Process -Filter "Name=\'%s\'" | Select-Object ProcessId,ExecutablePath,CommandLine '
            '| ConvertTo-Json -Compress' % name)
@@ -93,10 +93,49 @@ def list_editor_processes():
         data = [data]
     if not isinstance(data, list):
         raise headless.HeadlessError("could not read the process list")
-    rows = [{"pid": x.get("ProcessId"), "path": x.get("ExecutablePath"), "command_line": x.get("CommandLine")} for x in data]
+    return [{"pid": x.get("ProcessId"), "path": x.get("ExecutablePath"), "command_line": x.get("CommandLine")} for x in data]
+
+
+def list_editor_processes():
+    """Read-only process listing (no handle to the editor is opened, nothing is sent to it): PowerShell + CIM, no window."""
+    rows = _editor_rows()
     kept = filter_editor_processes(rows, paths.editor_exe(), headless.root())
     # the command line carries a login code: it is used for filtering only and never leaves this function
     return [{"pid": r["pid"], "path": r["path"]} for r in kept]
+
+
+def hidden_pids(rows=None):
+    """Pids of this tool's own hidden editor processes (their command line carries our private -userdir); [] when the list
+    cannot be read."""
+    own = "-userdir=%s/ud" % str(headless.root()).replace("\\", "/").lower().rstrip("/")
+    try:
+        rows = _editor_rows() if rows is None else rows
+    except headless.HeadlessError:
+        return []
+    return [r["pid"] for r in rows if r.get("command_line") and own in r["command_line"].replace("\\", "/").lower()]
+
+
+class StageFileBusy(headless.HeadlessError):
+    """A staged file stayed in use by another process for the whole patience; the message is the readable text."""
+
+
+def copy_stage_file(src, dst):
+    """fscopy.copy_file_retry with the long patience a staged file needs: a previous hidden editor run may still be shutting
+    down, or a scanner / another tool holds the file. Only a sharing violation that outlasts the patience is an error, and its
+    text says what to do."""
+    try:
+        return fscopy.copy_file_retry(src, dst, patience=fscopy.PATIENCE)
+    except PermissionError as e:
+        if getattr(e, "winerror", None) not in fscopy.SHARING_WINERRORS:
+            raise
+        name = Path(str(src)).name
+        pids = hidden_pids()
+        if pids:
+            who = "a hidden editor process of a previous run (pid %s) is still running and holds it" % ", ".join(str(p) for p in pids)
+        else:
+            who = "another program (a virus scanner, the search indexer, a second tool using the staged mod) holds it"
+        raise StageFileBusy("the staged file %s is still in use after %d s: %s. Nothing was changed; wait a moment and run the "
+                            "command again." % (name, int(fscopy.PATIENCE), who))
 
 
 def valid_map(mod, map_path):
@@ -324,7 +363,7 @@ def build(run_json, remote_errors, t3d_errors, kit_root, forbidden, py_status, l
                 for rel in staging.files_for(stage, stem):
                     dst = before / rel
                     dst.parent.mkdir(parents=True, exist_ok=True)
-                    fscopy.copy_file_retry(stage.dir / rel, dst)
+                    copy_stage_file(stage.dir / rel, dst)
                     existing[rel] = dst
 
         # gameplay tags of class-manager rows: the mod's tag list must hold them before the editor process starts (a plugin's
@@ -394,7 +433,7 @@ def build(run_json, remote_errors, t3d_errors, kit_root, forbidden, py_status, l
                 for rel, src in existing.items():
                     dst = stage.dir / rel
                     dst.parent.mkdir(parents=True, exist_ok=True)
-                    fscopy.copy_file_retry(src, dst)
+                    copy_stage_file(src, dst)
                 rolled_back = True
             finally:
                 if tags_added:
@@ -464,14 +503,14 @@ def build(run_json, remote_errors, t3d_errors, kit_root, forbidden, py_status, l
         snap.mkdir(parents=True)
         for rel in ("Content", "Config/Tags"):
             if (stage.dir / rel).is_dir():
-                shutil.copytree(stage.dir / rel, snap / rel, copy_function=fscopy.copy_file_retry)
+                shutil.copytree(stage.dir / rel, snap / rel, copy_function=copy_stage_file)
         return snap
 
     def restore_stage(stage, snap):
         for rel in ("Content", "Config/Tags"):
             staging._rmtree(stage.dir / rel)
             if (snap / rel).is_dir():
-                shutil.copytree(snap / rel, stage.dir / rel, copy_function=fscopy.copy_file_retry)
+                shutil.copytree(snap / rel, stage.dir / rel, copy_function=copy_stage_file)
 
     def asset_ops(stage, ops, timeout):
         problems, expected = asset_ops_problems(stage, ops)
