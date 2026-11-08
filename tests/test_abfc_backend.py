@@ -1155,8 +1155,8 @@ def _zen_package(names, exports, tail=b"\0" * 64):
     return out + b"\0" * 16 + tail
 
 
-def _write_container(paks, files, method=0):
-    """<paks>/Test.utoc + Test.ucas holding `files` ({'Dir/Asset': chunk bytes}) under <Project>/Content/ (uncompressed unless method != 0)."""
+def _write_container(paks, files, method=0, name="Test"):
+    """<paks>/<name>.utoc + <name>.ucas holding `files` ({'Dir/Asset': chunk bytes}) under <Project>/Content/ (uncompressed unless method != 0)."""
     import struct
     bs = 0x10000
     ucas, blocks, entries = b"", [], []
@@ -1188,15 +1188,15 @@ def _write_container(paks, files, method=0):
         toc += off.to_bytes(5, "little") + size.to_bytes(3, "little") + size.to_bytes(3, "little") + bytes([m])
     toc += dirblob
     Path(paks).mkdir(parents=True, exist_ok=True)
-    (Path(paks) / "Test.utoc").write_bytes(toc)
-    (Path(paks) / "Test.ucas").write_bytes(ucas)
+    (Path(paks) / (name + ".utoc")).write_bytes(toc)
+    (Path(paks) / (name + ".ucas")).write_bytes(ucas)
 
 
 class CookedPkgTests(unittest.TestCase):
     """editor/bpkit/cookedpkg.py on synthetic IoStore containers (uncompressed, unencrypted)."""
 
-    NAMES = ["BP_A_C", "Default__BP_A_C", "PlayerHUD", "NewVar", "Lbl", "WidgetTree", "Arms_GEN_VARIABLE", "Arms", "Elsewhere"]
-    EXPORTS = [(0, 0, None), (5, 0, 0), (4, 0, 1), (6, 0, 0), (3, 1, 0)]
+    NAMES = ["BP_A_C", "Default__BP_A_C", "PlayerHUD", "NewVar", "Lbl", "WidgetTree", "Arms_GEN_VARIABLE", "Arms", "Elsewhere", "Zip_Template"]
+    EXPORTS = [(0, 0, None), (5, 0, 0), (4, 0, 1), (6, 0, 0), (3, 1, 0), (9, 0, 0)]
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="abfcooked"))
@@ -1217,6 +1217,9 @@ class CookedPkgTests(unittest.TestCase):
         self.assertIn("NewVar_0", got["names"])            # a numbered name: base + number 1
         self.assertEqual(got["widgets"], {"Lbl"})          # export under the WidgetTree export
         self.assertEqual(got["components"], {"Arms"})      # <Var>_GEN_VARIABLE export
+        self.assertEqual(got["timelines"], {"Zip"})        # <Var>_Template export (timeline template)
+        self.assertIn("Zip", got["names"])
+        self.assertTrue({"PlayerHUD", "NewVar"} <= got["base"] and "NewVar_0" not in got["base"])
         self.assertEqual(self.index().class_member_candidates("/Game/Dir/BP_A.BP_A_C"), got["names"])
 
     def test_unknown_package_or_class_is_none(self):
@@ -1224,6 +1227,68 @@ class CookedPkgTests(unittest.TestCase):
         self.assertIsNone(idx.class_members("/Game/Dir/Missing.Missing_C"))
         self.assertIsNone(idx.class_members("/Game/Dir/BP_A.Other_C"))
         self.assertIsNone(idx.class_member_candidates("/Game/Dir/Missing.Missing_C"))
+
+    def test_package_paths_and_class_names_compare_case_insensitively(self):
+        idx = self.index()
+        self.assertIsNotNone(idx.package_header("/game/DIR/bp_a"))
+        self.assertIsNotNone(idx.class_members("/Game/dir/BP_A.bp_a_c"))
+        self.assertIsNone(idx.class_members("/Game/dir/nothing.bp_a_c"))
+
+    def test_numbered_names(self):
+        got = cookedpkg.numbered_names(["NewVar", "Timeline", "Old_3", "_5"], count=3)
+        self.assertEqual(got, {"NewVar_0", "NewVar_1", "NewVar_2", "Timeline_0", "Timeline_1", "Timeline_2", "_5_0", "_5_1", "_5_2"})
+        self.assertEqual(len(cookedpkg.numbered_names(["A"])), cookedpkg.NUMBER_PROBES)
+        self.assertEqual(cookedpkg.numbered_names([]), set())
+
+    def broken_containers(self):
+        """Test.utoc (good) plus containers that sort before it and cannot be used."""
+        import struct
+        _write_container(self.paks, {"Dir/BP_A": _zen_package(self.NAMES, self.EXPORTS)})
+        good = (self.paks / "Test.utoc").read_bytes()
+        ucas = (self.paks / "Test.ucas").read_bytes()
+
+        def make(name, data):
+            (self.paks / (name + ".utoc")).write_bytes(bytes(data))
+            (self.paks / (name + ".ucas")).write_bytes(ucas)
+
+        def mutated(pos, value):
+            d = bytearray(good)
+            d[pos:pos + len(value)] = value
+            return d
+        make("A1_signed", mutated(80, bytes([cookedpkg.FLAG_INDEXED | cookedpkg.FLAG_SIGNED])))
+        make("A2_oldversion", mutated(16, bytes([2])))
+        make("A3_partitions", mutated(52, struct.pack("<I", 2)))
+        make("A4_truncated", good[:150])
+        make("A5_dirbad", mutated(48, struct.pack("<I", 8)))              # directory index too small: parse error
+        make("A6_garbage", b"x" * 300)
+        make("A7_encrypted", mutated(80, bytes([cookedpkg.FLAG_INDEXED | cookedpkg.FLAG_ENCRYPTED])))
+        make("A8_global", mutated(80, bytes([0])))                         # not indexed
+        (self.paks / "A9_noucas.utoc").write_bytes(good)
+        (self.paks / "notes.txt").write_text("x")
+
+    def test_unusable_containers_are_skipped_and_listed(self):
+        self.broken_containers()
+        idx = cookedpkg.CookedIndex(str(self.paks))
+        self.assertEqual(set(idx.files), {"/Game/Dir/BP_A"})
+        self.assertEqual(len(idx.containers), 1)
+        skipped = dict(idx.skipped)
+        self.assertEqual(set(skipped), {"A1_signed.utoc", "A2_oldversion.utoc", "A3_partitions.utoc", "A4_truncated.utoc", "A5_dirbad.utoc",
+                                        "A6_garbage.utoc", "A7_encrypted.utoc", "A8_global.utoc", "A9_noucas.utoc"})
+        self.assertIn("signed", skipped["A1_signed.utoc"])
+        self.assertIn("version", skipped["A2_oldversion.utoc"])
+        self.assertIn("partitions", skipped["A3_partitions.utoc"])
+        self.assertIn("encrypted", skipped["A7_encrypted.utoc"])
+        self.assertEqual(skipped["A8_global.utoc"], cookedpkg.NOT_INDEXED)
+        self.assertEqual({n for n, _r in idx.rejected()}, set(skipped) - {"A8_global.utoc"})
+        self.assertIsNotNone(idx.class_members("/Game/Dir/BP_A.BP_A_C"))
+
+    def test_only_unusable_containers_is_a_format_error_with_reasons(self):
+        self.broken_containers()
+        for fn in ("Test.utoc", "Test.ucas"):
+            (self.paks / fn).unlink()
+        with self.assertRaises(cookedpkg.CookedFormatError) as cm:
+            cookedpkg.CookedIndex(str(self.paks))
+        self.assertIn("A1_signed.utoc: signed", str(cm.exception))
 
     def test_compressed_block_is_a_format_error(self):
         idx = self.index(method=1)
@@ -1340,7 +1405,7 @@ class ReflectMemberPassTests(unittest.TestCase):
         self.cls.get_path_name.return_value = self.PATH
         self.cls.get_class.return_value.get_path_name.return_value = "/Script/Engine.BlueprintGeneratedClass"
 
-    def run_reflect(self, classes, cands=None, own=None, doc=None, array=("Btn",), supers=("/Script/Engine.Actor", _OBJECT_PATH)):
+    def run_reflect(self, classes, cands=None, own=None, doc=None, array=("Btn",), supers=("/Script/Engine.Actor", _OBJECT_PATH), itype=None):
         r = self.reflect
         r.unreal.load_class.return_value = self.cls
         seen = []
@@ -1358,7 +1423,8 @@ class ReflectMemberPassTests(unittest.TestCase):
         patches = [mock.patch.object(r, "_templates", side_effect=templates), mock.patch.object(r, "_function_index", return_value={}),
                    mock.patch.object(r, "_ancestors", return_value=["/Script/Engine.Actor"]),
                    mock.patch.object(r, "_supers", return_value=list(supers)),
-                   mock.patch.object(r.rp, "collect_function_meta", return_value={})]
+                   mock.patch.object(r.rp, "collect_function_meta", return_value={}),
+                   mock.patch.object(r, "_instanced_type", side_effect=itype or (lambda pin: "visual"))]
         if cands is not None:
             patches.append(mock.patch.object(r, "_member_candidates", side_effect=cands if isinstance(cands, Exception) else None,
                                              return_value=None if isinstance(cands, Exception) else cands))
@@ -1366,7 +1432,6 @@ class ReflectMemberPassTests(unittest.TestCase):
             patches.append(mock.patch.object(r, "_own_members", return_value=own))
         if doc is not None:
             patches.append(mock.patch.object(r, "_doc_members", return_value=doc))
-            patches.append(mock.patch.object(r, "_is_component", side_effect=lambda pin: pin["name"] == "Mesh"))
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
@@ -1399,7 +1464,7 @@ class ReflectMemberPassTests(unittest.TestCase):
         with mock.patch.object(r, "_templates", side_effect=templates), mock.patch.object(r, "_function_index", return_value={}), \
                 mock.patch.object(r, "_ancestors", return_value=[]), mock.patch.object(r, "_supers", return_value=["/Script/Engine.Actor", _OBJECT_PATH]), \
                 mock.patch.object(r, "_member_candidates", return_value=cands), mock.patch.object(r, "_own_members", return_value=[("hud", "member"), ("Extra", "member")]), \
-                mock.patch.object(r.rp, "collect_function_meta", return_value={}):
+                mock.patch.object(r.rp, "collect_function_meta", return_value={}), mock.patch.object(r, "_instanced_type", return_value="visual"):
             r.unreal.load_class.return_value = self.cls
             r.run({"run": str(self.tmp), "classes": [self.PATH]})
         props = json.loads((self.tmp / "reflect.json").read_text(encoding="utf-8"))["classes"][self.PATH]["properties"]
@@ -1421,10 +1486,37 @@ class ReflectMemberPassTests(unittest.TestCase):
 
     def test_native_class_uses_python_doc_and_pin_type_decides_kind(self):
         self.cls.get_path_name.return_value = "/Script/Engine.Character"
-        res, written, _ = self.run_reflect(["/Script/Engine.Character"], doc=["Mesh", "Foo"])
+        types = {"Mesh": "component", "Foo": "visual", "HlodLayer": None, "PreviewBackground": None, "Navigation": None}
+        res, written, _ = self.run_reflect(["/Script/Engine.Character"], doc=["Mesh", "Foo", "HlodLayer", "PreviewBackground", "Navigation"],
+                                           itype=lambda pin: types[pin["name"]])
         props = written["classes"]["/Script/Engine.Character"]["properties"]
+        # native properties that are not a widget / component type (editor-only, not Blueprint-visible) are dropped
         self.assertEqual([(x["name"], x["kind"]) for x in props], [("Mesh", "component"), ("Foo", "member")])
         self.assertEqual(written["memberSources"], ["pythonDoc"])
+
+    def test_blueprint_members_of_other_types_are_dropped_and_timelines_are_components(self):
+        types = {"Hud": "visual", "Arms": "component", "Btn": "visual", "ZipTimeline": "timeline", "Other": None}
+        cands = ({self.PATH: {}}, ["cookedClass"])
+        own = [("Hud", "member"), ("Arms", "member"), ("Btn", "widget"), ("ZipTimeline", "member"), ("Other", "member")]
+        _res, written, _ = self.run_reflect([self.PATH], cands=cands, own=own, array=(), itype=lambda pin: types[pin["name"]])
+        props = written["classes"][self.PATH]["properties"]
+        self.assertEqual([(x["name"], x["kind"]) for x in props],
+                         [("Hud", "member"), ("Arms", "member"), ("Btn", "widget"), ("ZipTimeline", "component")])   # a component-typed variable stays writable
+
+    def test_instanced_type_by_base_class(self):
+        r = self.reflect
+        bases = {"/Script/Engine.TimelineComponent": "T", "/Script/Engine.ActorComponent": "C", "/Script/UMG.Visual": "V"}
+        subs = {"/Game/X/Tl.Tl_C": {"T", "C"}, "/Game/X/Cmp.Cmp_C": {"C"}, "/Game/X/W.W_C": {"V"}, "/Game/X/Plain.Plain_C": set()}
+
+        def load(_outer, path):
+            return bases.get(path) or (path if path in subs else None)
+
+        def child(sub, base):
+            return base in subs[sub]
+        with mock.patch.object(r.unreal, "load_class", side_effect=load), mock.patch.object(r.unreal.MathLibrary, "class_is_child_of", side_effect=child):
+            got = {p: r._instanced_type({"subCategoryObject": p}) for p in list(subs) + ["/Game/X/Missing.Missing_C"]}
+        self.assertEqual(got, {"/Game/X/Tl.Tl_C": "timeline", "/Game/X/Cmp.Cmp_C": "component", "/Game/X/W.W_C": "visual", "/Game/X/Plain.Plain_C": None,
+                               "/Game/X/Missing.Missing_C": None})
 
     def test_no_game_class_means_empty_sources(self):
         self.cls.get_path_name.return_value = "/Script/Engine.Actor"
@@ -1467,15 +1559,48 @@ class ReflectMemberPassTests(unittest.TestCase):
             def __init__(self, _paks):
                 pass
 
+            def rejected(self):
+                return []
+
             def class_members(self, path):
-                return {"names": {"Foo", "Lbl", "Arms"}, "widgets": set(), "components": set()}
+                return {"names": {"Foo", "Lbl", "Arms", "Zip", "NewVar"}, "base": {"Foo", "NewVar", "A.B"}, "widgets": set(), "components": set(),
+                        "timelines": {"Zip"}}
         loaded = {pn: (self.cls, pn, "m")}
         errors = []
         with mock.patch.object(r.unreal, "ObjectIterator", side_effect=lambda c: iter(iters[id(c)])), \
                 mock.patch.object(r.cookedpkg, "CookedIndex", Index), mock.patch.object(r, "_paks_dir", return_value="x"):
             cand, sources = r._member_candidates(loaded, [pn], errors)
-        self.assertEqual(cand[pn], {"lbl": ("Lbl", "widget"), "arms": ("Arms", "component"), "foo": ("Foo", "member")})
+        got = cand[pn]
+        # timeline templates are components; numbered probes are added for the name-map entries (not for unusable names)
+        self.assertEqual({k: v for k, v in got.items() if not k.startswith(("foo_", "newvar_"))},
+                         {"lbl": ("Lbl", "widget"), "arms": ("Arms", "component"), "foo": ("Foo", "member"), "zip": ("Zip", "component"),
+                          "newvar": ("NewVar", "member")})
+        self.assertEqual(got["newvar_0"], ("NewVar_0", "member"))
+        self.assertEqual(got["foo_9"], ("Foo_9", "member"))
+        self.assertNotIn("newvar_10", got)
+        self.assertFalse(any(k.startswith("a.b") for k in got))
         self.assertEqual((sources, errors), (["widgetTree", "scs", "cookedClass"], []))
+
+    def test_member_candidates_reports_skipped_containers(self):
+        r = self.reflect
+        pn = self.PATH
+
+        class Index:
+            def __init__(self, _paks):
+                pass
+
+            def rejected(self):
+                return [("mod.utoc", "signed container")]
+
+            def class_members(self, path):
+                return {"names": {"Foo"}, "base": {"Foo"}, "widgets": set(), "components": set(), "timelines": set()}
+        errors = []
+        with mock.patch.object(r.unreal, "ObjectIterator", side_effect=lambda c: iter([])), mock.patch.object(r.cookedpkg, "CookedIndex", Index), \
+                mock.patch.object(r, "_paks_dir", return_value="x"):
+            _cand, sources = r._member_candidates({pn: (self.cls, pn, "m")}, [pn], errors)
+        self.assertIn("cookedClass", sources)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("mod.utoc: signed container", errors[0])
 
     def test_member_candidates_without_cooked_reader(self):
         r = self.reflect
@@ -1498,6 +1623,9 @@ class ReflectMemberPassTests(unittest.TestCase):
         class Index:
             def __init__(self, _paks):
                 pass
+
+            def rejected(self):
+                return []
 
             def class_members(self, path):
                 return None

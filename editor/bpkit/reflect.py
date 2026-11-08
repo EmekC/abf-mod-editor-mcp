@@ -4,7 +4,9 @@ Reads only: classes are loaded with unreal.load_class (never load_asset, never a
 come from throwaway nodes in a scratch Blueprint (graphs.make_templates), parsed by reflectparse. Members that
 GetClassDefaults cannot list (widgets, components, widget/component variables) are found by _member_pass before the first
 template run: candidate names from the widget tree, SCS templates and the class's cooked package (cookedpkg), native classes from
-their Python docstring; each is checked on the class default object. Writes
+their Python docstring; each is checked on the class default object. Only widget (Visual) and ActorComponent typed members are
+kept (timelines are kind "component"). A native member's name comes from the docstring (snake_case -> PascalCase) and may differ in
+case from the real property name (acronyms); FNames compare case-insensitively, so the VariableGet lowering still resolves it. Writes
 <run>/reflect.json and returns {"file", "counts"}. A failing member goes to "errors" and never aborts the run.
 """
 import json
@@ -169,6 +171,8 @@ def _member_candidates(loaded, wanted, errors):
     except Exception as e:
         errors.append("member discovery: cooked package reader unavailable (%s)" % str(e)[:200])
     if index is not None:
+        if index.rejected():
+            errors.append("member discovery: cooked container(s) skipped (%s)" % "; ".join("%s: %s" % s for s in index.rejected())[:300])
         for p in wanted:
             try:
                 got = index.class_members(loaded[p][1])
@@ -181,11 +185,14 @@ def _member_candidates(loaded, wanted, errors):
             cooked[p] = got
         if cooked:
             sources.append("cookedClass")
-    empty = {"names": set(), "widgets": set(), "components": set()}
+    empty = {"names": set(), "base": set(), "widgets": set(), "components": set(), "timelines": set()}
     for p in wanted:
         pn = loaded[p][1]
-        c = cooked.get(p, empty)
-        cand[p] = rp.member_candidates(widgets.get(pn, set()) | c["widgets"], scs.get(pn, set()) | c["components"], c["names"])
+        c = dict(empty, **cooked.get(p, {}))
+        # a numbered variable (NewVar_0) is spelled `NewVar` in the name map: probe the base names with a number appended
+        numbered = cookedpkg.numbered_names(n for n in c["base"] if rp.member_name_ok(n))
+        cand[p] = rp.member_candidates(widgets.get(pn, set()) | c["widgets"], scs.get(pn, set()) | c["components"] | c["timelines"],
+                                       c["names"] | numbered)
     return cand, sources
 
 
@@ -225,13 +232,25 @@ def _doc_members(cls, parent_cls):
     return out
 
 
-def _is_component(pin):
-    """True when the object type of a VariableGet output pin is an ActorComponent class."""
+INSTANCED_TYPES = (("timeline", "/Script/Engine.TimelineComponent"), ("component", "/Script/Engine.ActorComponent"),
+                   ("visual", "/Script/UMG.Visual"))
+
+
+def _instanced_type(pin):
+    """"timeline", "component" or "visual" when the object type of a VariableGet output pin is a TimelineComponent / other ActorComponent /
+    Visual (widget) class, else None. These are the DefaultToInstanced types whose single references GetClassDefaults cannot list; a
+    discovered member of any other type is not Blueprint-visible (GetClassDefaults would have listed it) and is dropped."""
     try:
         sub = unreal.load_class(None, pin["subCategoryObject"])
-        return bool(sub is not None and unreal.MathLibrary.class_is_child_of(sub, unreal.ActorComponent.static_class()))
+        if sub is None:
+            return None
+        for kind, path in INSTANCED_TYPES:
+            base = unreal.load_class(None, path)
+            if base is not None and unreal.MathLibrary.class_is_child_of(sub, base):
+                return kind
     except Exception:
-        return False
+        pass
+    return None
 
 
 def _member_pass(loaded, classes_in, result_classes, result_supers, errors):
@@ -391,9 +410,14 @@ def run(job):
             pin = rp.member_pin(pins, n)
             if pin is None or pin["name"].lower() in have.setdefault(p, set()):
                 continue
+            itype = _instanced_type(pin)
+            if itype is None:
+                continue   # not a widget / component type: a Blueprint-visible one would be in GetClassDefaults, so this is editor-only
             kind = member_kind[(p, n)]
-            if kind == "native":
-                kind = "component" if _is_component(pin) else "member"
+            if itype == "timeline":
+                kind = "component"      # no Set node for a timeline variable
+            elif kind == "native":
+                kind = "component" if itype == "component" else "member"
             have[p].add(pin["name"].lower())
             result_classes[p]["properties"].append({"name": pin["name"], "pins": pins, "kind": kind})
             continue

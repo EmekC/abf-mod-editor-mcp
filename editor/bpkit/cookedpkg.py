@@ -17,6 +17,10 @@ INVALID = 0xFFFFFFFF
 SUMMARY_SIZE = 52          # FZenPackageSummary without versioning info
 EXPORT_ENTRY_SIZE = 72
 GEN_VARIABLE = "_GEN_VARIABLE"
+TIMELINE_TEMPLATE = "_Template"
+MIN_TOC_VERSION = 4        # EIoStoreTocVersion::PerfectHash: the section layout parse_toc reads
+NOT_INDEXED = "not indexed"
+NUMBER_PROBES = 10         # numbered FNames are probed as <base>_0 .. <base>_9
 
 
 class CookedFormatError(Exception):
@@ -39,6 +43,10 @@ def parse_toc(data):
     """Header fields and section offsets of a .utoc (bytes). Raises CookedFormatError for a layout this reader does not know."""
     if len(data) < 144 or data[:16] != TOC_MAGIC:
         raise CookedFormatError("not a .utoc file")
+    if data[16] < MIN_TOC_VERSION:
+        raise CookedFormatError("table of contents version %d is older than the perfect-hash layout (%d)" % (data[16], MIN_TOC_VERSION))
+    if _u32(data, 52) != 1:
+        raise CookedFormatError("container with %d partitions (only single-partition containers are read)" % _u32(data, 52))
     t = {"data": data, "version": data[16], "header_size": _u32(data, 20), "entry_count": _u32(data, 24), "block_count": _u32(data, 28),
          "block_entry_size": _u32(data, 32), "method_count": _u32(data, 36), "method_length": _u32(data, 40), "block_size": _u32(data, 44),
          "dir_size": _u32(data, 48), "partitions": _u32(data, 52), "flags": data[80], "seeds": _u32(data, 84), "no_hash": _u32(data, 96)}
@@ -233,15 +241,30 @@ def parse_zen_header(buf):
     return {"header_size": header_size, "names": names, "exports": exports}
 
 
+def numbered_names(names, count=NUMBER_PROBES):
+    """`<base>_0` .. `<base>_<count-1>` for every name in `names`. A numbered FName (NewVar_0, Timeline_3) is stored as its base in the
+    name map; only an export name spells the number, so plain variables lose it. Names that already end in `_<digits>` are skipped."""
+    out = set()
+    for n in names:
+        stem, _sep, tail = n.rpartition("_")
+        if tail.isdigit() and stem:
+            continue
+        for i in range(count):
+            out.add("%s_%d" % (n, i))
+    return out
+
+
 def package_members(header, class_name):
-    """Member name candidates of the class `class_name` out of a parsed header, or None when the package has no such class export:
-    {"names": every spelled name (name map, export names, `_GEN_VARIABLE` stems), "widgets": exports whose outer is a
-    `WidgetTree` export, "components": `<Var>_GEN_VARIABLE` stems}."""
+    """Member name candidates of the class `class_name` out of a parsed header, or None when the package has no such class export
+    (class names compare case-insensitively, like FNames): {"names": every spelled name (name map, export names, `_GEN_VARIABLE` stems),
+    "base": the name-map entries alone (what numbered_names expands), "widgets": exports whose outer is a `WidgetTree` export,
+    "components": `<Var>_GEN_VARIABLE` stems, "timelines": `<Var>_Template` stems (timeline templates)}."""
     exports = header["exports"]
-    if not any(e["name"] == class_name for e in exports):
+    low = class_name.lower()
+    if not any(e["name"].lower() == low for e in exports):
         return None
     names = set(header["names"])
-    widgets, components = set(), set()
+    widgets, components, timelines = set(), set(), set()
     for e in exports:
         n = e["name"]
         names.add(n)
@@ -249,14 +272,20 @@ def package_members(header, class_name):
             stem = n[:-len(GEN_VARIABLE)]
             components.add(stem)
             names.add(stem)
+        elif n.endswith(TIMELINE_TEMPLATE) and len(n) > len(TIMELINE_TEMPLATE):
+            stem = n[:-len(TIMELINE_TEMPLATE)]
+            timelines.add(stem)
+            names.add(stem)
         o = e["outer"]
         if o is not None and o < len(exports) and exports[o]["name"] == "WidgetTree":
             widgets.add(n)
-    return {"names": names, "widgets": widgets, "components": components}
+    return {"names": names, "base": set(header["names"]), "widgets": widgets, "components": components, "timelines": timelines}
 
 
 class CookedIndex:
-    """Index of the Indexed, unencrypted *.utoc containers in a Paks folder; maps /Game packages to their package chunk."""
+    """Index of the Indexed, unencrypted, single-partition *.utoc containers in a Paks folder; maps /Game packages to their package
+    chunk. A container this reader cannot use (signed, odd version, truncated, several partitions, ...) is skipped and listed in
+    `skipped` ([(file name, reason)]) instead of failing the whole index. Package paths compare case-insensitively (asset paths do)."""
 
     def __init__(self, paks_dir):
         self.paks_dir = paks_dir
@@ -264,31 +293,46 @@ class CookedIndex:
         self.project = os.path.basename(os.path.dirname(content))
         self.containers = []   # (toc, ucas path)
         self.files = {}        # "/Game/x" -> (container index, toc entry)
+        self.skipped = []      # (file name, reason)
+        self._lower = {}       # "/game/x" -> (container index, toc entry); first container wins
         for fn in sorted(os.listdir(paks_dir)):
             if not fn.lower().endswith(".utoc"):
                 continue
             path = os.path.join(paks_dir, fn)
             ucas = path[:-5] + ".ucas"
-            if not os.path.isfile(ucas):
+            try:
+                if not os.path.isfile(ucas):
+                    raise CookedFormatError("no matching .ucas file")
+                with open(path, "rb") as f:
+                    data = f.read()
+                if len(data) < 145 or data[:16] != TOC_MAGIC:
+                    raise CookedFormatError("not a .utoc file")
+                flags = data[80]
+                if not (flags & FLAG_INDEXED):
+                    self.skipped.append((fn, NOT_INDEXED))
+                    continue
+                if flags & FLAG_ENCRYPTED:
+                    raise CookedFormatError("encrypted container")
+                toc = parse_toc(data)
+                found = directory_files(toc, self.project)
+            except Exception as e:   # a damaged or foreign container must not cost the others (struct.error, IndexError, ...)
+                self.skipped.append((fn, (str(e) or type(e).__name__)[:120]))
                 continue
-            with open(path, "rb") as f:
-                data = f.read()
-            if len(data) < 145 or data[:16] != TOC_MAGIC:
-                continue
-            flags = data[80]
-            if not (flags & FLAG_INDEXED) or (flags & FLAG_ENCRYPTED):
-                continue
-            toc = parse_toc(data)
             ci = len(self.containers)
             self.containers.append((toc, ucas))
-            for pkg, entry in directory_files(toc, self.project).items():
+            for pkg, entry in found.items():
                 self.files.setdefault(pkg, (ci, entry))
+                self._lower.setdefault(pkg.lower(), (ci, entry))
         if not self.containers:
-            raise CookedFormatError("no indexed, unencrypted container in %s" % paks_dir)
+            raise CookedFormatError("no usable container in %s (%s)" % (paks_dir, "; ".join("%s: %s" % s for s in self.skipped) or "none found"))
+
+    def rejected(self):
+        """The skipped containers that are worth reporting: everything except plain non-indexed ones (global.utoc)."""
+        return [s for s in self.skipped if s[1] != NOT_INDEXED]
 
     def package_header(self, pkg):
         """Parsed Zen header of a /Game package, or None when the package is unknown."""
-        hit = self.files.get(pkg)
+        hit = self._lower.get(pkg.lower())
         if hit is None:
             return None
         ci, entry = hit

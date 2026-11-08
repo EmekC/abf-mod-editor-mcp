@@ -237,7 +237,7 @@ WIDGET_TREE = "WidgetTree."
 
 
 def member_name_ok(name):
-    return isinstance(name, str) and name != "" and not any(c in INVALID_MEMBER_CHARS for c in name)
+    return isinstance(name, str) and name != "" and INVALID_MEMBER_CHARS.isdisjoint(name)
 
 
 def group_member_paths(object_paths, wanted=None):
