@@ -119,10 +119,11 @@ class StageFileBusy(headless.HeadlessError):
     """A staged file stayed in use by another process for the whole patience; the message is the readable text."""
 
 
-def copy_stage_file(src, dst):
+def copy_stage_file(src, dst, nothing_changed=False, kept=None):
     """fscopy.copy_file_retry with the long patience a staged file needs: a previous hidden editor run may still be shutting
     down, or a scanner / another tool holds the file. Only a sharing violation that outlasts the patience is an error, and its
-    text says what to do."""
+    text says what to do. `nothing_changed=True` (the copies taken before anything is modified) adds that nothing was changed;
+    otherwise the stage is said to be partly restored, with `kept` (the folder holding the saved copies) when known."""
     try:
         return fscopy.copy_file_retry(src, dst, patience=fscopy.PATIENCE)
     except PermissionError as e:
@@ -134,8 +135,12 @@ def copy_stage_file(src, dst):
             who = "a hidden editor process of a previous run (pid %s) is still running and holds it" % ", ".join(str(p) for p in pids)
         else:
             who = "another program (a virus scanner, the search indexer, a second tool using the staged mod) holds it"
-        raise StageFileBusy("the staged file %s is still in use after %d s: %s. Nothing was changed; wait a moment and run the "
-                            "command again." % (name, int(fscopy.PATIENCE), who))
+        if nothing_changed:
+            tail = "Nothing was changed; wait a moment and run the command again."
+        else:
+            tail = ("The staged mod is only partly restored%s; once the file is free, restore it from there (or run staging_sync "
+                    "with discard_changes to take the real mod again)." % ((", the saved copies are in %s" % kept) if kept else ""))
+        raise StageFileBusy("the staged file %s is still in use after %d s: %s. %s" % (name, int(fscopy.PATIENCE), who, tail))
 
 
 def valid_map(mod, map_path):
@@ -356,6 +361,7 @@ def build(run_json, remote_errors, t3d_errors, kit_root, forbidden, py_status, l
             if stem and stem not in stems:
                 stems.append(stem)
         existing = {}
+        before_dirs = []
 
         def snapshot(run):
             before = run / "before"
@@ -363,8 +369,9 @@ def build(run_json, remote_errors, t3d_errors, kit_root, forbidden, py_status, l
                 for rel in staging.files_for(stage, stem):
                     dst = before / rel
                     dst.parent.mkdir(parents=True, exist_ok=True)
-                    copy_stage_file(stage.dir / rel, dst)
+                    copy_stage_file(stage.dir / rel, dst, nothing_changed=True)
                     existing[rel] = dst
+                    before_dirs[:] = [before]
 
         # gameplay tags of class-manager rows: the mod's tag list must hold them before the editor process starts (a plugin's
         # tag inis are registered when it mounts), so a warm session that already mounted the mod is stopped when the file changed
@@ -433,7 +440,7 @@ def build(run_json, remote_errors, t3d_errors, kit_root, forbidden, py_status, l
                 for rel, src in existing.items():
                     dst = stage.dir / rel
                     dst.parent.mkdir(parents=True, exist_ok=True)
-                    copy_stage_file(src, dst)
+                    copy_stage_file(src, dst, kept=before_dirs[0] if before_dirs else None)
                 rolled_back = True
             finally:
                 if tags_added:
@@ -503,14 +510,15 @@ def build(run_json, remote_errors, t3d_errors, kit_root, forbidden, py_status, l
         snap.mkdir(parents=True)
         for rel in ("Content", "Config/Tags"):
             if (stage.dir / rel).is_dir():
-                shutil.copytree(stage.dir / rel, snap / rel, copy_function=copy_stage_file)
+                shutil.copytree(stage.dir / rel, snap / rel,
+                                copy_function=lambda s, d: copy_stage_file(s, d, nothing_changed=True))
         return snap
 
     def restore_stage(stage, snap):
         for rel in ("Content", "Config/Tags"):
             staging._rmtree(stage.dir / rel)
             if (snap / rel).is_dir():
-                shutil.copytree(snap / rel, stage.dir / rel, copy_function=copy_stage_file)
+                shutil.copytree(snap / rel, stage.dir / rel, copy_function=lambda s, d: copy_stage_file(s, d, kept=snap))
 
     def asset_ops(stage, ops, timeout):
         problems, expected = asset_ops_problems(stage, ops)

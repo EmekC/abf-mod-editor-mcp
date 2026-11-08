@@ -224,6 +224,10 @@ def diff(stage):
     src = Path(meta["source_dir"]) if meta.get("source_dir") else None
     now = {rel: None for rel in _tracked_files(stage.dir)}
     changed, added, removed, conflicts, stale = [], [], [], [], []
+    try:
+        synced_ts = time.mktime(time.strptime(meta.get("synced_at"), "%Y-%m-%dT%H:%M:%S"))
+    except (TypeError, ValueError, OverflowError):
+        synced_ts = None
     for rel in now:
         if rel not in base:
             added.append(rel)
@@ -252,7 +256,12 @@ def diff(stage):
                 stale.append(rel)
             else:
                 try:
-                    if real.stat().st_size != base[rel]["size"] or _sha(real) != base[rel]["sha256"]:
+                    st = real.stat()
+                    if st.st_size != base[rel]["size"]:
+                        stale.append(rel)
+                    elif synced_ts is not None and st.st_mtime < synced_ts:
+                        pass                             # same size, not written since the sync: no need to hash it
+                    elif _sha(real) != base[rel]["sha256"]:
                         stale.append(rel)
                 except OSError:
                     pass                                 # locked by an editor: the lock probe in publish decides

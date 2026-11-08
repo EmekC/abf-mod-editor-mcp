@@ -135,9 +135,9 @@ def family(cls):
 def _parent_path(asset):
     """Class path of a Blueprint's parent, or None. `parent_class` cannot be read from Python (the editor says "Failed to find
     property"); the asset registry's ParentClass tag holds it as "/Script/CoreUObject.Class'<path>'"."""
-    reg = unreal.AssetRegistryHelpers.get_asset_registry()
-    data = reg.get_asset_by_object_path(_object_path(asset))
     try:
+        reg = unreal.AssetRegistryHelpers.get_asset_registry()
+        data = reg.get_asset_by_object_path(_object_path(asset))
         value = data.get_tag_value("ParentClass")
     except Exception:
         return None
@@ -172,10 +172,19 @@ def reparent(op, mod):
     unreal.BlueprintEditorLibrary.reparent_blueprint(bp, new_cls)
     unreal.BlueprintEditorLibrary.compile_blueprint(bp)
     now = bp.generated_class()
-    if now is None or not unreal.MathLibrary.class_is_child_of(now, new_cls):
+    if now is None:
         raise RuntimeError("reparent: %s still does not derive from %s after the reparent" % (asset, parent))
     if not unreal.EditorAssetLibrary.save_loaded_asset(bp, False):
         raise RuntimeError("reparent: could not save " + asset)
+    # the registry tag after the save names the real parent; class_is_child_of alone passes when the new parent is already an
+    # ancestor of the old one (nothing happened), so it is only the fallback for a tag that cannot be read
+    after = _parent_path(asset)
+    if after is not None:
+        stuck = after == _class_path(new_cls)
+    else:
+        stuck = unreal.MathLibrary.class_is_child_of(now, new_cls)
+    if not stuck:
+        raise RuntimeError("reparent: %s still does not derive from %s after the reparent" % (asset, parent))
     return {"detail": "reparented %s: %s -> %s" % (asset, old_path or "?", parent), "touched": []}
 
 

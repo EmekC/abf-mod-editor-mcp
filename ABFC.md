@@ -85,6 +85,11 @@ Core tool, no editor needed, no arguments. Keys:
 
 ## Additive keys in existing tools
 
+- `staging_status`: `stale: [rel paths]`, staged files that are untouched in the stage but differ from (or are gone from) the real
+  mod, for example saved in the Mod Editor; not conflicts. `staging.diff` has the same key.
+- Staged file copies wait up to 60 s for a file in use; a file still locked is a `StageFileBusy` text naming the hidden editor pids.
+- `bp_apply` `variables[i].default`: string, number or bool (a bool as `true`/`false`).
+
 - `bp_read`: `seconds` (wall time of the export run).
 - `bp_compile_report`: `messages: [{ severity: "error"|"warning", asset, message, node, graph }]` next to the existing keys.
   `node` and `graph` come from `from Source: /Mod/X/BP.BP:<Graph>.<Node>` in the compile log when the log has it. Observed on the

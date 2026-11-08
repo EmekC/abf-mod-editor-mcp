@@ -102,15 +102,31 @@ class CopyRetryTests(unittest.TestCase):
 
 
 class StageFileBusyTests(unittest.TestCase):
-    def busy(self, pids):
+    def busy(self, pids, **kw):
+        kw = kw or {"nothing_changed": True}
+
         def stuck(src, dst, **k):
             self.assertEqual(k.get("patience"), fscopy.PATIENCE)
             raise sharing()
 
         with mock.patch.object(fscopy, "copy_file_retry", side_effect=stuck), mock.patch.object(headless_tools, "hidden_pids", return_value=pids):
             with self.assertRaises(headless_tools.StageFileBusy) as cm:
-                headless_tools.copy_stage_file("C:/stage/mod/Content/X/BP_A.uasset", "dst")
+                headless_tools.copy_stage_file("C:/stage/mod/Content/X/BP_A.uasset", "dst", **kw)
         return str(cm.exception)
+
+    def test_nothing_changed_is_only_said_for_the_copies_taken_before_a_change(self):
+        msg = self.busy([], nothing_changed=True)
+        self.assertIn("Nothing was changed", msg)
+        self.assertNotIn("partly restored", msg)
+
+    def test_a_rollback_or_restore_copy_says_the_stage_is_partly_restored_and_names_the_backup(self):
+        msg = self.busy([], kept="C:/snapshots/mod-1")
+        self.assertNotIn("Nothing was changed", msg)
+        self.assertIn("partly restored", msg)
+        self.assertIn("C:/snapshots/mod-1", msg)
+        no_path = self.busy([], kept=None)
+        self.assertNotIn("Nothing was changed", no_path)
+        self.assertIn("partly restored", no_path)
 
     def test_a_hidden_editor_of_a_previous_run_is_named(self):
         msg = self.busy([4711, 4712])

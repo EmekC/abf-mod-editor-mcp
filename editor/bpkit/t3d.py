@@ -196,6 +196,8 @@ def user_pin(name, type_str, direction):
 
 def escape_default(text):
     """A variable default as the inside of a quoted T3D attribute (backslash, quote and control characters escaped)."""
+    if isinstance(text, bool):
+        text = "true" if text else "false"
     return (str(text).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t"))
 
 

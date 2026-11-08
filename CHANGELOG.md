@@ -19,8 +19,24 @@ All notable changes to abf-mod-editor-mcp. The format follows [Keep a Changelog]
   `Duration="0.2"`). `capabilities.reflectDefaults`.
 - `variable_defaults` ({name: default text or null}) on a bp_apply asset spec (bp_apply feature `variable_defaults`): replaces or drops the
   DefaultValue of variables that stay, keeping their guid (no remove and re-add). Variable defaults are now escaped in the T3D text.
+- `staging_status` and the staging diff gain `stale`: staged files that are untouched in the stage but differ from, or are gone
+  from, the real mod (for example saved in the Mod Editor since the sync). They are not conflicts; `staging_sync` takes the real
+  mod again. The check skips the hash of a real file whose size is unchanged and whose mtime is older than the sync.
+- Copying a staged file (the `bp_apply` snapshot and rollback, the `bp_asset_ops` snapshot and restore) waits up to 60 s for a
+  sharing violation (WinError 32) to clear. A file still in use after that is a readable error (`StageFileBusy`) that names the
+  leftover hidden editor process(es) by pid, or blames another program. Before any change it says nothing was changed; during a
+  rollback or restore it says the stage is partly restored and where the saved copies are.
+
+### Fixed
+
+- `bp_asset_ops` reparent: the old parent is read from the asset registry `ParentClass` tag (`parent_class` cannot be read from
+  Python), and the result is checked by re-reading that tag after the save (the class check only when the tag is unreadable), so a
+  reparent to an ancestor of the old parent that did nothing is an error.
 
 ### Changed
+
+- `bp_apply` `variables[i].default` must be a string, a number or a bool; a number or bool is written as text through `str()`
+  (a bool as `true`/`false`), as before. Other types (list, object) are refused.
 
 - `SERVER_VERSION` is `2.6.0`.
 

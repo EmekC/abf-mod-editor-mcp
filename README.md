@@ -79,6 +79,7 @@ What it does not touch: your running editor (unless the mod is open there and yo
 
 ```
 staging_sync(mod_dir)        copy the mod (minus Saved, Intermediate, Binaries, DerivedDataCache, .git)
+staging_status(mod)          changed / added / removed / conflicts, and stale (untouched staged files that differ in the real mod)
 bp_apply(mod, assets)        create/edit Blueprints from a JSON spec (rolls back on compile errors)
 bp_asset_ops(mod, ops)       rename, delete, reparent or recreate staged Blueprints (all-or-nothing)
 bp_read / bp_compile_report  read the structure back, compile everything and list errors per asset

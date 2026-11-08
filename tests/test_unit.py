@@ -604,8 +604,15 @@ class SpecTests(unittest.TestCase):
         self.assertTrue(any("variable_defaults[Speed] must be a string or null" in p for p in self.problems(vd({"Speed": 4}))))
 
         def bad_default(a):
-            a["variables"] = [{"name": "N", "type": "int", "default": 3}]
+            a["variables"] = [{"name": "N", "type": "int", "default": ["x"]}]
         self.assertTrue(any("default must be a string" in p for p in self.problems(bad_default)))
+
+        # numbers and bools are still accepted (older callers), written as Unreal's text
+        for value, text in ((3, "3"), (2.5, "2.5"), (True, "true"), (False, "false")):
+            def num_default(a, value=value):
+                a["variables"] = [{"name": "N", "type": "int", "default": value}]
+            self.assertEqual(self.problems(num_default), [], value)
+            self.assertIn('DefaultValue="%s"' % text, t3d.var_line("N", "int", guid="G", default=value))
 
     def test_event_meta_validation(self):
         def event(meta):
@@ -975,6 +982,36 @@ class StagingTests(unittest.TestCase):
 
     def test_nothing_stale_when_the_real_mod_is_unchanged(self):
         self.assertEqual(staging.diff(self.stage)["stale"], [])
+
+    def test_stale_hashes_only_real_files_written_since_the_sync(self):
+        hashed = []
+        real_sha = staging._sha
+
+        def counting(p):
+            hashed.append(Path(p))
+            return real_sha(p)
+
+        sync_ts = staging.time.mktime(staging.time.strptime(self.stage.meta()["synced_at"], "%Y-%m-%dT%H:%M:%S"))
+        a, b = self.real / "Content" / "A.uasset", self.real / "Content" / "Sub" / "B.uasset"
+        for p in (a, b):
+            os.utime(p, (sync_ts - 100, sync_ts - 100))
+
+        def real_hashes():
+            return [h for h in hashed if self.real in h.parents]
+        with mock.patch.object(staging, "_sha", counting):
+            self.assertEqual(staging.diff(self.stage)["stale"], [])
+            self.assertEqual(real_hashes(), [])                      # old mtime, same size: not hashed
+            # same size, new content, mtime after the sync: hashed and stale
+            a.write_bytes(bytes(len(a.read_bytes())))
+            os.utime(a, (sync_ts + 100, sync_ts + 100))
+            self.assertEqual(staging.diff(self.stage)["stale"], ["Content/A.uasset"])
+            self.assertEqual(real_hashes(), [a])
+            # a different size is stale without a hash, whatever the mtime
+            hashed.clear()
+            b.write_bytes(b.read_bytes() + b"more")
+            os.utime(b, (sync_ts - 100, sync_ts - 100))
+            self.assertEqual(staging.diff(self.stage)["stale"], ["Content/A.uasset", "Content/Sub/B.uasset"])
+            self.assertEqual(real_hashes(), [a])
 
     def test_conflict_refuses(self):
         self.stage_write("Content/A.uasset", b"staged edit")

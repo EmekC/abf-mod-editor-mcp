@@ -472,6 +472,26 @@ class AssetOpsEditorSideTests(unittest.TestCase):
         self.assertIs(res["ok"], False)
         self.assertIn("does not derive", res["error"])
 
+    def test_reparent_to_an_ancestor_that_does_nothing_is_an_error(self):
+        # Pawn derives from Actor, so class_is_child_of(now, Actor) is true even when the reparent did not happen
+        self.add("/TestMod/A/BP_A", parent=self.classes["/Script/Engine.Pawn"])
+        self.u.BlueprintEditorLibrary.reparent_blueprint.side_effect = lambda b, c: None
+        res = self.exec_ops({"op": "reparent", "asset": "/TestMod/A/BP_A", "parent": "/Script/Engine.Actor"})
+        self.assertIs(res["ok"], False, res)
+        self.assertIn("does not derive", res["error"])
+
+    def test_reparent_to_an_ancestor_that_sticks_succeeds(self):
+        bp = self.add("/TestMod/A/BP_A", parent=self.classes["/Script/Engine.Pawn"])
+        res = self.exec_ops({"op": "reparent", "asset": "/TestMod/A/BP_A", "parent": "/Script/Engine.Actor"})
+        self.assertIs(res["ok"], True, res)
+        self.assertIs(bp.parent, self.classes["/Script/Engine.Actor"])
+
+    def test_reparent_falls_back_to_the_class_check_when_the_tag_is_unreadable(self):
+        self.add("/TestMod/A/BP_A", parent=self.classes["/Script/Engine.Actor"])
+        self.u.AssetRegistryHelpers.get_asset_registry.return_value.get_asset_by_object_path.side_effect = RuntimeError("no registry")
+        res = self.exec_ops({"op": "reparent", "asset": "/TestMod/A/BP_A", "parent": "/Script/Engine.Pawn"})
+        self.assertIs(res["ok"], True, res)
+
     def test_the_first_failure_stops_the_run(self):
         self.add("/TestMod/A/BP_A")
         res = self.exec_ops({"op": "delete", "asset": "/TestMod/A/BP_Gone"}, {"op": "delete", "asset": "/TestMod/A/BP_A"})

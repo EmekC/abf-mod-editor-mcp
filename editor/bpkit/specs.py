@@ -440,7 +440,8 @@ def validate(batch, mod):
                 problems.append("%s.variables[%d] needs name and type" % (w, i))
             else:
                 _check_type(problems, "%s.variables[%d] (%s)" % (w, i, v["name"]), v["type"])
-                if v.get("default") is not None and not isinstance(v["default"], str):
+                if v.get("default") is not None and not isinstance(v["default"], (str, int, float, bool)):
+                    # a number or a bool is still accepted (turned into text, bool as true/false) for older callers
                     problems.append("%s.variables[%d] (%s): default must be a string (Unreal's text form)" % (w, i, v["name"]))
         vd = a.get("variable_defaults")
         if vd is not None:
