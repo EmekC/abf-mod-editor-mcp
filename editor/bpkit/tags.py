@@ -68,14 +68,26 @@ def make_tag(name):
         if got == name:
             return tag
         tried.append("%s: read back %r" % (label, got))
-    raise RuntimeError("cannot set gameplay tag %r (%s)" % (name, "; ".join(tried)))
+    raise RuntimeError("cannot set gameplay tag %r (%s); the editor only accepts a tag that is registered, so it must be in the "
+                       "mod's Config/Tags ini before the editor process starts" % (name, "; ".join(tried)))
+
+
+def _prop(obj, *names):
+    """The first readable property among `names` (snake_case when Python exposes the class, the C++ name when it does not)."""
+    last = None
+    for n in names:
+        try:
+            return obj.get_editor_property(n)
+        except Exception as e:
+            last = e
+    raise RuntimeError("no readable property among %s (%s)" % (", ".join(names), last))
 
 
 def _names_of_list(items, field="tag"):
     out = []
     for it in items or []:
         try:
-            n = _clean(it.get_editor_property(field))
+            n = _clean(_prop(it, field, field[:1].upper() + field[1:]))
         except Exception:
             n = _clean(getattr(it, field, None))
         if n:
@@ -83,17 +95,43 @@ def _names_of_list(items, field="tag"):
     return out
 
 
+def _tag_list_class():
+    """The GameplayTagsList class: not exposed to Python in the cooked editor (no unreal.GameplayTagsList), so it is loaded by path."""
+    cls = getattr(unreal, "GameplayTagsList", None)
+    if cls is None:
+        cls = unreal.load_class(None, "/Script/GameplayTags.GameplayTagsList")
+    if cls is None:
+        raise RuntimeError("GameplayTagsList class not found")
+    return cls
+
+
+def _settings_cdo():
+    cls = getattr(unreal, "GameplayTagsSettings", None)
+    if cls is not None:
+        return unreal.get_default_object(cls)
+    obj = unreal.find_object(None, "/Script/GameplayTags.Default__GameplayTagsSettings")
+    if obj is None:
+        raise RuntimeError("GameplayTagsSettings default object not found")
+    return obj
+
+
 def _from_tag_lists():
+    """One GameplayTagsList object per tag source: the settings CDO (the game's ini tags) and one per plugin tag ini (a mod's
+    Config/Tags file), the latter only when the plugin was mounted before the tag manager loaded."""
     out = []
-    for obj in unreal.ObjectIterator(unreal.GameplayTagsList):
-        out.extend(_names_of_list(obj.get_editor_property("gameplay_tag_list")))
+    for obj in unreal.ObjectIterator(_tag_list_class()):
+        try:
+            items = _prop(obj, "gameplay_tag_list", "GameplayTagList")
+        except RuntimeError:
+            continue
+        out.extend(_names_of_list(items))
     return out
 
 
 def _from_table_settings():
     out = []
-    settings = unreal.get_default_object(unreal.GameplayTagsSettings)
-    for ref in settings.get_editor_property("gameplay_tag_table_list") or []:
+    settings = _settings_cdo()
+    for ref in _prop(settings, "gameplay_tag_table_list", "GameplayTagTableList") or []:
         table = ref if hasattr(ref, "get_class") else unreal.EditorAssetLibrary.load_asset(str(ref))
         if table is None:
             continue

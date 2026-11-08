@@ -8,6 +8,7 @@ import py_compile
 import shutil
 import subprocess
 import sys
+import types
 import tempfile
 import threading
 import time
@@ -1728,6 +1729,72 @@ class ClassManagerRowEditorSideTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, str(tmp), True)
         for rel in ("editor/bpkit/rows.py", "editor/bpkit/jobs.py"):
             py_compile.compile(str(ROOT / rel), cfile=str(tmp / "x.pyc"), doraise=True)
+
+
+class TagListingEditorSideTests(unittest.TestCase):
+    """editor/bpkit/tags.py list_tags against the shape the cooked 5.4 editor really has: no unreal.GameplayTagsList /
+    GameplayTagsSettings / GameplayTagsManager attributes, the classes load by path, properties use their C++ names."""
+
+    class Row:
+        def __init__(self, tag):
+            self.tag = tag
+
+        def get_editor_property(self, key):
+            if key == "tag":
+                return self.tag
+            raise Exception("no property " + key)
+
+    class Source:
+        def __init__(self, tags):
+            self.tags = tags
+
+        def get_editor_property(self, key):
+            if key == "GameplayTagList":      # snake_case "gameplay_tag_list" is not found in the cooked build
+                return [TagListingEditorSideTests.Row(t) for t in self.tags]
+            if key == "GameplayTagTableList":
+                return []
+            raise Exception("Failed to find property " + key)
+
+    def setUp(self):
+        u = types.ModuleType("unreal")
+        sources = [self.Source(["AI.Cinematic", "ClassManager.EntityDirector.Boxy"]), self.Source(["ClassManager.EntityDirector.TADA", "Tadadas"])]
+        u.load_class = lambda outer, path: "cls:" + path
+        u.ObjectIterator = lambda cls: iter(sources if cls == "cls:/Script/GameplayTags.GameplayTagsList" else [])
+        u.find_object = lambda outer, path: sources[0]
+        patcher = mock.patch.dict(sys.modules, {"unreal": u})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        import bpkit
+        sys.modules.pop("bpkit.tags", None)
+        if hasattr(bpkit, "tags"):
+            delattr(bpkit, "tags")
+        self.addCleanup(sys.modules.pop, "bpkit.tags", None)
+        import importlib
+        self.tags = importlib.import_module("bpkit.tags")
+
+    def test_lists_every_source_through_class_paths_and_cpp_property_names(self):
+        res = self.tags.list_tags()
+        self.assertEqual(res["tags"], ["AI.Cinematic", "ClassManager.EntityDirector.Boxy", "ClassManager.EntityDirector.TADA", "Tadadas"])
+        self.assertEqual(res["sources"]["tag_lists"], 4)
+        self.assertEqual(res["sources"]["table_settings"], 0)
+        self.assertTrue(str(res["sources"]["manager"]).startswith("error"))
+
+    def test_make_tag_error_names_the_registration_requirement(self):
+        class Unregistered:
+            def import_text(self, text):
+                return True        # the real editor returns True and leaves TagName empty for an unregistered tag
+
+            def export_text(self):
+                return '(TagName="")'
+
+            def set_editor_property(self, key, value):
+                raise Exception("read-only")
+
+        sys.modules["unreal"].GameplayTag = Unregistered
+        sys.modules["unreal"].Name = str
+        with self.assertRaises(RuntimeError) as cm:
+            self.tags.make_tag("ClassManager.EntityDirector.New")
+        self.assertIn("Config/Tags ini before the editor process starts", str(cm.exception))
 
 
 from tests.test_asset_ops import AssetOpsEditorSideTests, AssetOpsHostTests, AssetOpsSpecTests  # noqa: E402,F401  (bp_asset_ops tests)
