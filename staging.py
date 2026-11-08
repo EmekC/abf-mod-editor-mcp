@@ -93,18 +93,49 @@ class Stage:
         os.replace(tmp, self.meta_path)
 
 
-def _content_files(base):
-    """Relative posix paths of every file under <base>/Content, minus tooling folders."""
+def _config_files(base):
+    """Relative posix paths of the tracked config files: <base>/Config/Tags/*.ini (a mod's gameplay tag lists)."""
+    tags = Path(base) / "Config" / "Tags"
+    if not tags.is_dir():
+        return []
+    return sorted((tags / f.name).relative_to(base).as_posix() for f in tags.iterdir()
+                  if f.is_file() and f.suffix.lower() == ".ini")
+
+
+def _tracked_files(base):
+    """Relative posix paths of every tracked file: all of <base>/Content (minus tooling folders) and Config/Tags/*.ini."""
     out = []
     content = Path(base) / "Content"
-    if not content.is_dir():
-        return out
-    for dirpath, _dirs, files in os.walk(content):
-        for f in files:
-            rel = (Path(dirpath) / f).relative_to(base).as_posix()
-            if not _is_tooling(rel):
-                out.append(rel)
+    if content.is_dir():
+        for dirpath, _dirs, files in os.walk(content):
+            for f in files:
+                rel = (Path(dirpath) / f).relative_to(base).as_posix()
+                if not _is_tooling(rel):
+                    out.append(rel)
+    out.extend(_config_files(base))
     return sorted(out)
+
+
+def _upgrade_baseline(stage, meta):
+    """A stage synced before config files were tracked has no baseline entry for Config/Tags/*.ini. Give those files
+    the state of the real mod (the stage file when the real mod has none and the stage was never told), once, so they
+    show up as changed when the stage differs and not as added."""
+    if meta.get("tracked_config") or "baseline" not in meta:
+        return meta
+    base = meta.setdefault("baseline", {})
+    src = Path(meta["source_dir"]) if meta.get("source_dir") else None
+    for rel in _config_files(stage.dir):
+        if rel in base:
+            continue
+        real = (src / rel) if src else None
+        if real is not None and real.is_file():
+            try:
+                base[rel] = {"sha256": _sha(real), "size": real.stat().st_size}
+            except OSError:
+                pass
+    meta["tracked_config"] = True
+    stage.save_meta(meta)
+    return meta
 
 
 def sync(mod_dir, discard_changes=False, forbidden=()):
@@ -140,11 +171,11 @@ def sync(mod_dir, discard_changes=False, forbidden=()):
     count = 0
     for dirpath, _dirs, files in os.walk(stage.dir):
         count += len(files)
-    for rel in _content_files(stage.dir):
+    for rel in _tracked_files(stage.dir):
         p = stage.dir / rel
         baseline[rel] = {"sha256": _sha(p), "size": p.stat().st_size}
     stage.save_meta({"mod": stage.name, "source_dir": str(src), "synced_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                     "uplugin_original": uplugin, "baseline": baseline})
+                     "uplugin_original": uplugin, "baseline": baseline, "tracked_config": True})
     stage.file_count = count
     return stage
 
@@ -188,10 +219,10 @@ def files_for(stage, stem):
 
 
 def diff(stage):
-    meta = stage.meta()
+    meta = _upgrade_baseline(stage, stage.meta())
     base = meta.get("baseline", {})
     src = Path(meta["source_dir"]) if meta.get("source_dir") else None
-    now = {rel: None for rel in _content_files(stage.dir)}
+    now = {rel: None for rel in _tracked_files(stage.dir)}
     changed, added, removed, conflicts = [], [], [], []
     for rel in now:
         if rel not in base:
@@ -279,9 +310,9 @@ def _try_reload(editor, packages, also=None):
 
 def publish(stage, editor, compile_gate, assets=None, dry_run=False, now=None):
     name = stage.name
+    d = diff(stage)                       # may upgrade the stored baseline, so read the meta after it
     meta = stage.meta()
     src = Path(meta["source_dir"])
-    d = diff(stage)
     removed = d["removed"]
     if assets:
         wanted = {_asset_rel(a, name) for a in assets}

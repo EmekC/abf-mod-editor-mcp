@@ -38,6 +38,7 @@ import headless  # noqa: E402
 import headless_tools  # noqa: E402
 import paths  # noqa: E402
 import staging  # noqa: E402
+import tagsini  # noqa: E402
 from bpkit import layout, specs, t3d  # noqa: E402
 from bpkit.t3d import GraphModel, GraphNode, SpecError  # noqa: E402
 
@@ -1261,6 +1262,147 @@ class StagingTests(unittest.TestCase):
         with self.assertRaises(staging.StagingError) as cm:
             staging.load("NoSuchMod")
         self.assertIn("staging_sync", str(cm.exception))
+
+
+TAGS_REL = "Config/Tags/FakeTags.ini"
+TAGS_HEAD = "[/Script/GameplayTags.GameplayTagsList]"
+
+
+class TagsIniTests(unittest.TestCase):
+    def setUp(self):
+        self.work = Path(tempfile.mkdtemp(prefix="abftags"))
+        self.ini = self.work / "Config" / "Tags" / "FakeTags.ini"
+
+    def tearDown(self):
+        shutil.rmtree(self.work, ignore_errors=True)
+
+    def test_missing_file_reads_empty(self):
+        self.assertEqual(tagsini.read_tags(self.ini), [])
+
+    def test_creates_folder_file_and_header(self):
+        added = tagsini.ensure_tags(self.ini, ["ClassManager.EntityDirector.One", "ClassManager.EntityDirector.Two"])
+        self.assertEqual(added, ["ClassManager.EntityDirector.One", "ClassManager.EntityDirector.Two"])
+        text = self.ini.read_bytes().decode("utf-8")
+        self.assertTrue(text.startswith(TAGS_HEAD + "\r\n"))
+        self.assertIn('GameplayTagList=(Tag="ClassManager.EntityDirector.One",DevComment="")\r\n', text)
+        self.assertEqual(tagsini.read_tags(self.ini), ["ClassManager.EntityDirector.One", "ClassManager.EntityDirector.Two"])
+
+    def test_crlf_kept_and_trailing_blank_line(self):
+        self.ini.parent.mkdir(parents=True)
+        old = TAGS_HEAD + '\r\nGameplayTagList=(Tag="ClassManager.EntityDirector.TADA",DevComment="")\r\n\r\n'
+        self.ini.write_bytes(old.encode("utf-8"))
+        added = tagsini.ensure_tags(self.ini, ["ClassManager.EntityDirector.New"])
+        self.assertEqual(added, ["ClassManager.EntityDirector.New"])
+        self.assertEqual(self.ini.read_bytes().decode("utf-8"),
+                         TAGS_HEAD + '\r\nGameplayTagList=(Tag="ClassManager.EntityDirector.TADA",DevComment="")\r\n'
+                         'GameplayTagList=(Tag="ClassManager.EntityDirector.New",DevComment="")\r\n\r\n')
+
+    def test_lf_file_stays_lf_and_no_trailing_newline_stays(self):
+        self.ini.parent.mkdir(parents=True)
+        self.ini.write_bytes((TAGS_HEAD + '\nGameplayTagList=(Tag="A.B",DevComment="")').encode("utf-8"))
+        tagsini.ensure_tags(self.ini, ["A.C"])
+        raw = self.ini.read_bytes().decode("utf-8")
+        self.assertNotIn("\r", raw)
+        self.assertFalse(raw.endswith("\n"))
+        self.assertEqual(tagsini.read_tags(self.ini), ["A.B", "A.C"])
+
+    def test_dedupe_is_case_insensitive_and_idempotent(self):
+        tagsini.ensure_tags(self.ini, ["Foo.Bar"])
+        before = self.ini.read_bytes()
+        self.assertEqual(tagsini.ensure_tags(self.ini, ["foo.bar", "FOO.BAR"]), [])
+        self.assertEqual(self.ini.read_bytes(), before)
+        self.assertEqual(tagsini.ensure_tags(self.ini, ["Foo.Baz", "foo.baz"]), ["Foo.Baz"])
+
+    def test_invalid_tag_raises_and_writes_nothing(self):
+        for bad in ("", "a..b", "a b", ".a", "a.", 'a"b', "a/b", "x" * 201, None, 5):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                tagsini.ensure_tags(self.ini, ["Good.Tag", bad])
+        self.assertFalse(self.ini.exists())
+
+    def test_new_tags_go_into_the_tag_section_before_later_sections(self):
+        self.ini.parent.mkdir(parents=True)
+        self.ini.write_bytes((TAGS_HEAD + '\nGameplayTagList=(Tag="A.B",DevComment="")\n[Other]\nKey=1\n').encode("utf-8"))
+        tagsini.ensure_tags(self.ini, ["A.C"])
+        self.assertEqual(self.ini.read_bytes().decode("utf-8"),
+                         TAGS_HEAD + '\nGameplayTagList=(Tag="A.B",DevComment="")\nGameplayTagList=(Tag="A.C",DevComment="")\n[Other]\nKey=1\n')
+
+
+class StagingConfigTrackingTests(unittest.TestCase):
+    def setUp(self):
+        self.work = Path(tempfile.mkdtemp(prefix="abffake"))
+        self.real = make_fake_mod(self.work)
+        (self.real / "Config" / "Tags").mkdir(parents=True)
+        self.real_ini = self.real / TAGS_REL
+        self.real_ini.write_bytes((TAGS_HEAD + '\r\nGameplayTagList=(Tag="A.B",DevComment="")\r\n').encode("utf-8"))
+        shutil.rmtree(staging.root() / "stages", ignore_errors=True)
+        self.stage = staging.sync(self.real)
+        self.gate_ok = lambda packages: []
+
+    def tearDown(self):
+        shutil.rmtree(self.work, ignore_errors=True)
+
+    def test_sync_baseline_holds_the_tag_ini(self):
+        self.assertIn(TAGS_REL, self.stage.meta()["baseline"])
+        d = staging.diff(self.stage)
+        self.assertEqual((d["changed"], d["added"], d["removed"], d["conflicts"]), ([], [], [], []))
+
+    def test_ini_change_is_listed_and_published_with_backup(self):
+        tagsini.ensure_tags(self.stage.dir / TAGS_REL, ["A.C"])
+        d = staging.diff(self.stage)
+        self.assertEqual(d["changed"], [TAGS_REL])
+        r = staging.publish(self.stage, FakeEditor("closed"), self.gate_ok, now="20260101-000000")
+        self.assertEqual(r["published"], [TAGS_REL])
+        self.assertEqual(r["route"], "file-copy")
+        self.assertEqual(tagsini.read_tags(self.real_ini), ["A.B", "A.C"])
+        backup = Path(r["backup"])
+        self.assertEqual(tagsini.read_tags(backup / TAGS_REL), ["A.B"])
+        self.assertEqual(staging.diff(self.stage)["changed"], [])
+
+    def test_ini_publish_can_be_requested_as_an_asset_path(self):
+        tagsini.ensure_tags(self.stage.dir / TAGS_REL, ["A.C"])
+        (self.stage.dir / "Content" / "A.uasset").write_bytes(b"edited")
+        r = staging.publish(self.stage, FakeEditor("closed"), self.gate_ok, assets=[TAGS_REL], now="20260101-000001")
+        self.assertEqual(r["published"], [TAGS_REL])
+        self.assertEqual((self.real / "Content" / "A.uasset").read_bytes(), b"A-original" * 50)
+
+    def test_new_ini_in_a_mod_without_one_is_added(self):
+        self.real_ini.unlink()
+        stage = staging.sync(self.real, discard_changes=True)
+        tagsini.ensure_tags(stage.dir / TAGS_REL, ["X.Y"])
+        d = staging.diff(stage)
+        self.assertEqual(d["added"], [TAGS_REL])
+        r = staging.publish(stage, FakeEditor("closed"), self.gate_ok, now="20260101-000002")
+        self.assertEqual(r["published"], [TAGS_REL])
+        self.assertEqual(tagsini.read_tags(self.real_ini), ["X.Y"])
+
+    def test_real_ini_changed_since_sync_is_a_conflict(self):
+        tagsini.ensure_tags(self.stage.dir / TAGS_REL, ["A.C"])
+        tagsini.ensure_tags(self.real_ini, ["Elsewhere.Tag"])
+        r = staging.publish(self.stage, FakeEditor("closed"), self.gate_ok)
+        self.assertEqual(r["refused"], "conflicts")
+
+    def test_old_baseline_is_upgraded_not_reported_as_added(self):
+        meta = self.stage.meta()
+        del meta["baseline"][TAGS_REL]
+        del meta["tracked_config"]
+        self.stage.save_meta(meta)
+        d = staging.diff(self.stage)
+        self.assertEqual((d["changed"], d["added"], d["removed"], d["conflicts"]), ([], [], [], []))
+        self.assertIn(TAGS_REL, self.stage.meta()["baseline"])
+        self.assertTrue(self.stage.meta()["tracked_config"])
+
+    def test_old_baseline_with_a_stage_edit_is_changed(self):
+        meta = self.stage.meta()
+        del meta["baseline"][TAGS_REL]
+        del meta["tracked_config"]
+        self.stage.save_meta(meta)
+        tagsini.ensure_tags(self.stage.dir / TAGS_REL, ["A.C"])
+        d = staging.diff(self.stage)
+        self.assertEqual((d["changed"], d["added"]), ([TAGS_REL], []))
+        r = staging.publish(self.stage, FakeEditor("closed"), self.gate_ok, now="20260101-000003")
+        self.assertEqual(r["published"], [TAGS_REL])
+        self.assertEqual(tagsini.read_tags(self.real_ini), ["A.B", "A.C"])
+        self.assertTrue(self.stage.meta()["tracked_config"])
 
 
 # ---------------------------------------------------------------- headless_tools helpers
