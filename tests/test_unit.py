@@ -923,6 +923,22 @@ class StagingTests(unittest.TestCase):
         staging.strip_tooling(self.stage)
         self.assertFalse((self.stage.dir / "Content" / "_McpTest").exists())
 
+    def test_untouched_stage_file_saved_in_the_real_mod_is_stale_not_a_conflict(self):
+        (self.real / "Content" / "A.uasset").write_bytes(b"saved in the Mod Editor")
+        (self.real / "Content" / "Sub" / "B.uasset").unlink()
+        d = staging.diff(self.stage)
+        self.assertEqual(d["stale"], ["Content/A.uasset", "Content/Sub/B.uasset"])
+        self.assertEqual(d["conflicts"], [])
+        self.assertEqual(d["changed"], [])
+        # a staged edit of the same file is a conflict, not stale
+        self.stage_write("Content/A.uasset", b"staged edit")
+        d = staging.diff(self.stage)
+        self.assertEqual(d["stale"], ["Content/Sub/B.uasset"])
+        self.assertEqual([c["path"] for c in d["conflicts"]], ["Content/A.uasset"])
+
+    def test_nothing_stale_when_the_real_mod_is_unchanged(self):
+        self.assertEqual(staging.diff(self.stage)["stale"], [])
+
     def test_conflict_refuses(self):
         self.stage_write("Content/A.uasset", b"staged edit")
         (self.real / "Content" / "A.uasset").write_bytes(b"someone else")

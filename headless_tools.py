@@ -302,7 +302,7 @@ def build(run_json, remote_errors, t3d_errors, kit_root, forbidden, py_status, l
         d = staging.diff(stage)
         return _out({"mod": stage.name, "staging_path": str(stage.dir), "source_dir": meta.get("source_dir"),
                      "synced_at": meta.get("synced_at"), "changed": d["changed"], "added": d["added"], "removed": d["removed"],
-                     "conflicts": d["conflicts"], "kit_found": paths.find_editor_root() is not None})
+                     "conflicts": d["conflicts"], "stale": d["stale"], "kit_found": paths.find_editor_root() is not None})
 
     # ---------------------------------------------------------------- apply
     def apply_batch(stage, batch, timeout, keep_on_error):

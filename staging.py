@@ -223,7 +223,7 @@ def diff(stage):
     base = meta.get("baseline", {})
     src = Path(meta["source_dir"]) if meta.get("source_dir") else None
     now = {rel: None for rel in _tracked_files(stage.dir)}
-    changed, added, removed, conflicts = [], [], [], []
+    changed, added, removed, conflicts, stale = [], [], [], [], []
     for rel in now:
         if rel not in base:
             added.append(rel)
@@ -244,10 +244,23 @@ def diff(stage):
                         real_sha = base[rel]["sha256"]       # locked by an editor: the lock probe in publish decides
                     if real_sha != base[rel]["sha256"]:
                         conflicts.append({"path": rel, "reason": "the real file changed since the last sync; run staging_sync again"})
+        elif src is not None:
+            # Untouched in the stage but different (or gone) in the real mod, for example saved in the Mod Editor: nothing
+            # conflicts and nothing is lost by copying the mod again, but the stage no longer shows the real mod.
+            real = src / rel
+            if not real.is_file():
+                stale.append(rel)
+            else:
+                try:
+                    if real.stat().st_size != base[rel]["size"] or _sha(real) != base[rel]["sha256"]:
+                        stale.append(rel)
+                except OSError:
+                    pass                                 # locked by an editor: the lock probe in publish decides
     for rel in base:
         if rel not in now and not _is_tooling(rel):
             removed.append(rel)
-    return {"changed": sorted(changed), "added": sorted(added), "removed": sorted(removed), "conflicts": conflicts}
+    return {"changed": sorted(changed), "added": sorted(added), "removed": sorted(removed), "conflicts": conflicts,
+            "stale": sorted(stale)}
 
 
 # ---- publish ------------------------------------------------------------------
