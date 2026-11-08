@@ -181,7 +181,11 @@ def run(job):
     # once during the function-template chunk is worked around by this order); None where unreadable, over the time cap or skipped
     want_meta = job.get("meta", True) is not False
     if want_meta:
-        metas = rp.collect_function_meta(lambda f, tag: unreal.EditorAssetLibrary.get_metadata_tag(f, tag), meta_items)
+        pin_names = {}
+        for key, pins in call_pins.items():
+            pin_names[(key_info[key][0], key_info[key][2])] = [x["name"] for x in pins if x["dir"] == "in" and x["category"] != "exec"]
+        metas = rp.collect_function_meta(lambda f, tag: unreal.EditorAssetLibrary.get_metadata_tag(f, tag), meta_items,
+                                         read_all=lambda f: unreal.EditorAssetLibrary.get_metadata_tag_values(f), pins=pin_names)
     else:
         metas = {}
     for key, pins in call_pins.items():
@@ -196,4 +200,10 @@ def run(job):
               "functions": sum(len(c["functions"]) for c in result_classes.values()),
               "properties": sum(len(c["properties"]) for c in result_classes.values()),
               "structs": len(result_structs), "errors": len(errors)}
+    if job.get("gameplay_tags"):
+        from . import tags as tags_mod
+        out["gameplayTags"] = tags_mod.list_tags()
+        counts["gameplayTags"] = len(out["gameplayTags"]["tags"])
+        with open(os.path.join(job["run"], "reflect.json"), "w", encoding="utf-8") as f:
+            json.dump(out, f, indent=1, default=str)
     return {"file": "reflect.json", "counts": counts, "meta": out["meta"]}

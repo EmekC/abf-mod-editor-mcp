@@ -187,15 +187,43 @@ class ReflectParseTests(unittest.TestCase):
                 raise RuntimeError("no metadata")
             return tags[tag]
 
-        self.assertEqual(reflectparse.read_function_meta(route, "ok"), {"tooltip": "Does it.", "displayName": None})
-        self.assertEqual(reflectparse.read_function_meta(route, "bad"), {"tooltip": None, "displayName": None})
+        self.assertEqual(reflectparse.read_function_meta(route, "ok"), {"tooltip": "Does it.", "displayName": None, "defaults": None})
+        self.assertEqual(reflectparse.read_function_meta(route, "bad"), {"tooltip": None, "displayName": None, "defaults": None})
+
+    def test_function_defaults_from_read_all(self):
+        vals = {"ToolTip": "x", "CPP_Default_InString": "Hello", "CPP_Default_Duration": "2.000000", "CPP_Default_Key": ""}
+        got = reflectparse.read_function_meta(lambda fn, tag: "", "f", read_all=lambda fn: vals)
+        self.assertEqual(got["defaults"], {"InString": "Hello", "Duration": "2.000000"})
+        self.assertEqual(reflectparse.read_function_meta(lambda fn, tag: "", "f", read_all=lambda fn: {})["defaults"], {})
+
+    def test_function_defaults_fall_back_to_per_pin_reads(self):
+        def read_all(fn):
+            raise RuntimeError("no bulk read")
+
+        def route(fn, tag):
+            return {"CPP_Default_InString": "Hello", "CPP_Default_Key": ""}.get(tag, "")
+
+        got = reflectparse.read_function_meta(route, "f", read_all=read_all, pins=["InString", "Key", "Other"])
+        self.assertEqual(got["defaults"], {"InString": "Hello"})
+
+    def test_function_defaults_unreadable_is_none(self):
+        def boom(fn, tag):
+            if tag.startswith("CPP_Default_"):
+                raise RuntimeError("no")
+            return ""
+
+        def read_all(fn):
+            raise RuntimeError("no")
+
+        self.assertIsNone(reflectparse.read_function_meta(boom, "f", read_all=read_all, pins=["A"])["defaults"])
+        self.assertIsNone(reflectparse.read_function_meta(boom, "f", read_all=read_all)["defaults"])
 
     def test_function_meta_time_cap(self):
         ticks = iter([0.0, 1.0, 25.0, 26.0])   # start, first check, second check (over budget), spare
         got = reflectparse.collect_function_meta(lambda fn, tag: tag + ":" + fn, [("a", "fa"), ("b", "fb")], budget=20.0,
                                                  clock=lambda: next(ticks))
-        self.assertEqual(got["a"], {"tooltip": "ToolTip:fa", "displayName": "DisplayName:fa"})
-        self.assertEqual(got["b"], {"tooltip": None, "displayName": None})
+        self.assertEqual(got["a"], {"tooltip": "ToolTip:fa", "displayName": "DisplayName:fa", "defaults": None})
+        self.assertEqual(got["b"], {"tooltip": None, "displayName": None, "defaults": None})
 
 
 class StdioOptInTests(unittest.TestCase):
@@ -885,6 +913,8 @@ class BackendInfoCapabilityTests(unittest.TestCase):
 
     def test_fixed_capabilities(self):
         caps = self.capabilities(False)
+        self.assertIs(caps["gameplayTags"], True)
+        self.assertIs(caps["reflectDefaults"], True)
         self.assertIs(caps["compileErrorNodeRefs"], True)
         self.assertIs(caps["functionLocals"], False)
         self.assertIs(caps["userPureFunctions"], False)
@@ -975,7 +1005,7 @@ class ReflectRunOrderTests(unittest.TestCase):
             calls.append(("templates", what))
             return {}
 
-        def collect(get_tag, items):
+        def collect(get_tag, items, **kw):
             calls.append(("meta",))
             return {}
 

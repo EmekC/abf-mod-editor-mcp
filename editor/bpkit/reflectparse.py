@@ -128,9 +128,37 @@ def SKIP_FUNCTION(name):
 META_BUDGET_SECONDS = 20.0
 
 
-def read_function_meta(read_tag, fn):
-    """{"tooltip": str|None, "displayName": str|None} of one UFunction; read_tag(fn, tag) -> str (the engine route is
-    unreal.EditorAssetLibrary.get_metadata_tag). A failing or empty read gives None."""
+DEFAULT_PREFIX = "CPP_Default_"
+
+
+def read_function_defaults(read_tag, fn, read_all=None, pins=None):
+    """{pin: default text} from the UFunction's CPP_Default_<Pin> metadata (the C++ default arguments), or None when
+    unreadable. read_all(fn) -> {tag: value} reads every tag at once (unreal.EditorAssetLibrary.get_metadata_tag_values);
+    when it is missing or raises, each of `pins` is read with read_tag(fn, "CPP_Default_" + pin) and non-empty values are kept."""
+    if read_all is not None:
+        try:
+            return {str(k)[len(DEFAULT_PREFIX):]: str(v) for k, v in dict(read_all(fn)).items()
+                    if str(k).startswith(DEFAULT_PREFIX) and str(v) != ""}
+        except Exception:
+            pass
+    if not pins:
+        return None
+    got, readable = {}, False
+    for pin in pins:
+        try:
+            v = read_tag(fn, DEFAULT_PREFIX + pin)
+        except Exception:
+            continue
+        readable = True
+        v = str(v) if v is not None else ""
+        if v != "":
+            got[pin] = v
+    return got if readable else None
+
+
+def read_function_meta(read_tag, fn, read_all=None, pins=None):
+    """{"tooltip": str|None, "displayName": str|None, "defaults": {pin: text}|None} of one UFunction; read_tag(fn, tag) -> str
+    (the engine route is unreal.EditorAssetLibrary.get_metadata_tag). A failing or empty read gives None."""
     out = {}
     for key, tag in (("tooltip", "ToolTip"), ("displayName", "DisplayName")):
         try:
@@ -139,19 +167,20 @@ def read_function_meta(read_tag, fn):
             out[key] = v or None
         except Exception:
             out[key] = None
+    out["defaults"] = read_function_defaults(read_tag, fn, read_all, pins)
     return out
 
 
-def collect_function_meta(read_tag, items, budget=META_BUDGET_SECONDS, clock=None):
-    """items: [(key, fn)] -> {key: meta}. Once the whole pass has run longer than `budget` seconds the remaining
-    functions get a meta with both fields None."""
+def collect_function_meta(read_tag, items, budget=META_BUDGET_SECONDS, clock=None, read_all=None, pins=None):
+    """items: [(key, fn)] -> {key: meta}; pins: {key: [input pin names]} for the per-pin default fallback. Once the whole
+    pass has run longer than `budget` seconds the remaining functions get a meta with every field None."""
     import time
     clock = clock or time.monotonic
     start = clock()
     out = {}
     for key, fn in items:
         if clock() - start > budget:
-            out[key] = {"tooltip": None, "displayName": None}
+            out[key] = {"tooltip": None, "displayName": None, "defaults": None}
         else:
-            out[key] = read_function_meta(read_tag, fn)
+            out[key] = read_function_meta(read_tag, fn, read_all, (pins or {}).get(key))
     return out

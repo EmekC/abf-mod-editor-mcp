@@ -1228,6 +1228,7 @@ def t_backend_info(args):
                                    "warmSession": headless.warm_enabled(), "stageAudit": True,
                                    "reflect": os.environ.get("ABF_ABFC_TOOLS") == "1", "compileErrorNodeRefs": True,
                                    "functionLocals": False, "userPureFunctions": False,
+                                   "gameplayTags": True, "reflectDefaults": True,
                                    "createKinds": list(specs.CREATE_CLASSES), "gameTest": True, "audit": True, "publish": True,
                                    "classManagerRows": True},
                   "bpApply": {"features": list(specs.FEATURES), "nodeKinds": sorted(specs.NODE_KINDS)}})
