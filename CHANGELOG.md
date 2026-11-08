@@ -6,6 +6,9 @@ All notable changes to abf-mod-editor-mcp. The format follows [Keep a Changelog]
 
 ### Added
 
+- abfc tool `catalog(mod)` (and the commandlet op, also served by the warm session): names-only catalog of every `/Game` Blueprint
+  class (with parent, interface flag) and every `/Script` class, struct, enum and function library (with function names) into
+  `<run>/catalog.json`, read only, no asset loads. Feature `catalog` in `abfc_extensions` (ABFC.md).
 - `reflect` reports `supers` (reflect.json: path -> every parent class, Blueprint and native, nearest first, from the asset
   registry's class inheritance, each link checked with `class_is_child_of`) for every loaded class, and takes `supers_of` (class
   paths loaded only to report their parents).

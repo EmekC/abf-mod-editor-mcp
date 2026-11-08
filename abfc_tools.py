@@ -1,8 +1,9 @@
 """Opt-in tools for abfc (https://github.com/EmekC/abf-mod-editor-mcp, see ABFC.md). Registered by server.py only when
 ABF_ABFC_TOOLS=1. build() returns tuples in server.TOOLS form: (name, fn, description, properties, required).
 
-Three tools: abfc_extensions (host only, no editor), reflect (hidden commandlet on the staging copy, read only) and
-warm_session (start, stop or inspect the long-lived hidden commandlet that serves commandlet jobs when ABF_WARM_SESSION=1).
+Four tools: abfc_extensions (host only, no editor), reflect (hidden commandlet on the staging copy, read only), catalog (hidden
+commandlet, read only: names-only class catalog) and warm_session (start, stop or inspect the long-lived hidden commandlet that
+serves commandlet jobs when ABF_WARM_SESSION=1).
 backend_info is not defined here; abfc reads it from the backend when the backend has it.
 """
 import json
@@ -20,11 +21,12 @@ import headless     # noqa: E402
 import staging      # noqa: E402
 
 EXT_PROTOCOL = 1
-FEATURES = ["reflect", "compile_node_refs", "bp_read_seconds"]
+FEATURES = ["reflect", "compile_node_refs", "bp_read_seconds", "catalog"]
 
 STR, NUM = ({"type": "string"}, {"type": "number"})
 STR_LIST = {"type": "array", "items": STR}
 
+_MOD = re.compile(r"^[A-Za-z0-9_]+$")
 _PATH = re.compile(r"^/[A-Za-z0-9_]+(/[A-Za-z0-9_]+)*(\.[A-Za-z0-9_]+)?$")
 
 
@@ -77,6 +79,21 @@ def build(server_version):
                      "counts": counts, "meta": (res.get("result") or {}).get("meta"),
                      "filter": {"content_version": meta.get("content_version"), "rules": [[v, k] for k, v in sorted(rules.items())]}})
 
+    def t_catalog(args):
+        mod = args.get("mod")
+        if not isinstance(mod, str) or not _MOD.match(mod):
+            return _out({"error": "mod must be a non-empty string of letters, digits and underscores"})
+        stage = staging.load(mod)
+        try:
+            res = headless.run_commandlet(stage, {"op": "catalog"}, timeout=float(args.get("timeout_seconds") or 300))
+        finally:
+            staging.strip_scratch(stage)
+        if not res["ok"]:
+            return _out({"error": res.get("error") or "catalog run failed", "run": res["run"], "log_tail": res.get("log_tail")})
+        counts = (res.get("result") or {}).get("counts") or {}
+        return _out({"ok": True, "run": res["run"], "seconds": res["seconds"], "file": str(Path(res["run"]) / "catalog.json"),
+                     "counts": counts, "warm": bool(res.get("warm"))})
+
     def t_warm_session(args):
         action = args.get("action")
         if action not in ("start", "stop", "status"):
@@ -108,6 +125,10 @@ def build(server_version):
          "reflect.json also has supers (every parent class, Blueprint and native, nearest first) of each loaded class and of the supers_of paths.",
          {"mod": STR, "classes": STR_LIST, "structs": STR_LIST, "cast_targets": STR_LIST, "supers_of": STR_LIST, "timeout_seconds": NUM,
           "meta": {"type": "boolean"}, "gameplay_tags": {"type": "boolean"}}, ["mod", "classes"]),
+        ("catalog", t_catalog,
+         "Read-only, hidden editor on the staging copy, no asset loads: names-only catalog of every /Game Blueprint class (with parent) "
+         "and every /Script class, struct, enum and function library (with function names) into <run>/catalog.json.",
+         {"mod": STR, "timeout_seconds": NUM}, ["mod"]),
         ("warm_session", t_warm_session,
          "Start, stop or inspect the warm session: one hidden commandlet kept alive on the staging copy that serves bp_apply, bp_read, "
          "bp_compile_report and reflect without a new editor start per call (needs ABF_WARM_SESSION=1). Returns {running, pid, jobs, startedAt}. "

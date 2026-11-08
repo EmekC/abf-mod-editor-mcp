@@ -8,14 +8,14 @@ results below.
 
 ## Opt-in: `ABF_ABFC_TOOLS=1`
 
-Three tools are registered only when the server starts with `ABF_ABFC_TOOLS=1` (abfc sets it when it spawns the server):
-`abfc_extensions`, `reflect` and `warm_session`. Without the variable the tool list is exactly the stock one.
+Four tools are registered only when the server starts with `ABF_ABFC_TOOLS=1` (abfc sets it when it spawns the server):
+`abfc_extensions`, `reflect`, `catalog` and `warm_session`. Without the variable the tool list is exactly the stock one.
 
 ### `abfc_extensions` (no arguments, no editor)
 
 ```json
 { "extProtocol": 1, "serverVersion": "2.6.0", "python": "3.11.9",
-  "features": ["reflect", "compile_node_refs", "bp_read_seconds"] }
+  "features": ["reflect", "compile_node_refs", "bp_read_seconds", "catalog"] }
 ```
 
 ### `reflect`
@@ -58,6 +58,46 @@ When it is read (the default), each function entry gets `meta: { tooltip, displa
 run, because it is the part of `reflect` that once crashed the hidden editor (one access violation, not reproduced). It is skipped with
 the argument `meta: false`, or, when the argument is absent, with the environment variable `ABF_REFLECT_META=0` on the server; the
 argument wins over the variable. Skipped means every function has `meta: null`.
+
+### `catalog` (2.6.0)
+
+`catalog(mod, timeout_seconds = 300)`. Hidden editor on the staging copy, read only, no asset loads (asset registry tags and the
+already loaded `/Script` objects only; about 0.3 s of work after the editor start). `mod` must be letters, digits and underscores
+(anything else is refused on the host before an editor starts). With `ABF_WARM_SESSION=1` the job goes to the warm session. Returns:
+
+```json
+{ "ok": true, "run": "<run folder>", "seconds": 8.1, "file": "<run>/catalog.json",
+  "counts": { "game": 3098, "scriptClasses": 7316, "scriptStructs": 5308, "scriptEnums": 2234, "libraries": 379, "functions": 5476 },
+  "warm": false }
+```
+
+or `{ "error", "run", "log_tail" }`. `<run>/catalog.json` (version 1, one line of JSON):
+
+```json
+{ "version": 1, "engineVersion": "5.4.4",
+  "game": [{ "path": "/Game/Dir/BP_X.BP_X_C", "kind": "BlueprintGeneratedClass", "parent": "/Script/Engine.Actor", "interface": false }],
+  "scriptClasses": [{ "path": "/Script/Engine.Actor", "parent": "/Script/CoreUObject.Object" },
+                    { "path": "/Script/Fake.IThing", "parent": "/Script/CoreUObject.Interface", "interface": true },
+                    { "path": "/Script/Fake.ThingLibrary", "parent": "/Script/Engine.BlueprintFunctionLibrary",
+                      "library": true, "functions": ["DoThing", "MakeThing"] }],
+  "scriptStructs": ["/Script/CoreUObject.Vector"],
+  "scriptEnums": ["/Script/Engine.EMovementMode"],
+  "counts": { "game": 1, "scriptClasses": 3, "scriptStructs": 1, "scriptEnums": 1, "libraries": 1, "functions": 2 },
+  "errors": ["..."] }
+```
+
+- `game`: every `*GeneratedClass` asset under `/Game` (Blueprint, Widget, Anim, interfaces; the class itself, asset name `X_C`), sorted by
+  `path`. `kind` is the asset class name. `parent` comes from the `ParentClass` tag (a /Game or /Script class path, `null` when absent);
+  `interface` is the `CLASS_Interface` flag (`0x4000`) of the `ClassFlags` tag (`false` when unreadable).
+- `scriptClasses`: every loaded `/Script` class (exact `Class` objects, no `Default__`), sorted by `path`, whether or not it has a Python
+  wrapper. `parent` is the nearest ancestor from the asset registry's class hierarchy, falling back to the nearest Python-wrapped ancestor
+  of the class default object (`null` when neither knows one, for example `Object` itself). `interface: true` when the parent is
+  `/Script/CoreUObject.Interface`. `library: true` marks `BlueprintFunctionLibrary` descendants; `functions` are their function
+  names (sorted, unique, plain identifiers only). Function flags are not readable from Python, so `functions` includes UFunctions that
+  are not Blueprint callable.
+- `scriptStructs`, `scriptEnums`: sorted `/Script` paths.
+- `errors`: per-item failures (at most 200 lines); they never abort the run.
+- Capability: abfc reads it from the tool list (`catalog` is in `tools/list`) and from the `abfc_extensions` feature `catalog`.
 
 ## `backend_info` (2.4.0)
 

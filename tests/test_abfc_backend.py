@@ -84,9 +84,9 @@ class CompileLogTests(unittest.TestCase):
 
 
 class ToolTableTests(unittest.TestCase):
-    def test_build_returns_exactly_three_tools_with_schemas(self):
+    def test_build_returns_exactly_four_tools_with_schemas(self):
         tools = abfc_tools.build("x")
-        self.assertEqual([t[0] for t in tools], ["abfc_extensions", "reflect", "warm_session"])
+        self.assertEqual([t[0] for t in tools], ["abfc_extensions", "reflect", "catalog", "warm_session"])
         for name, fn, desc, props, required in tools:
             self.assertTrue(callable(fn))
             self.assertTrue(desc)
@@ -109,7 +109,7 @@ class ToolTableTests(unittest.TestCase):
         self.assertEqual(d["extProtocol"], 1)
         self.assertEqual(d["serverVersion"], "9.9.9")
         self.assertEqual(d["python"], sys.version.split()[0])
-        self.assertEqual(d["features"], ["reflect", "compile_node_refs", "bp_read_seconds"])
+        self.assertEqual(d["features"], ["reflect", "compile_node_refs", "bp_read_seconds", "catalog"])
         self.assertEqual(sorted(d), ["extProtocol", "features", "python", "serverVersion"])
 
     def test_reflect_host_refuses_foreign_paths(self):
@@ -318,11 +318,11 @@ class StdioOptInTests(unittest.TestCase):
     def test_tools_register_only_when_opted_in(self):
         plain = self.tool_names(False)
         extra = self.tool_names(True)
-        for n in ("reflect", "abfc_extensions", "warm_session"):
+        for n in ("reflect", "abfc_extensions", "catalog", "warm_session"):
             self.assertNotIn(n, plain)
             self.assertIn(n, extra)
         self.assertEqual(len(set(extra)), len(extra))
-        self.assertEqual(len(extra), len(plain) + 3)
+        self.assertEqual(len(extra), len(plain) + 4)
 
 
 class FakeWarmProc:
