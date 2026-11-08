@@ -741,6 +741,15 @@ class LivePublishEditorSideTests(unittest.TestCase):
         self.assertEqual(names, ["/ModX/A", "/ModX/B"])
         self.assertEqual(out["reloaded_referencers"], ["/ModX/B"])
 
+    def test_forget_rescans_parent_folders_and_reports_what_is_still_listed(self):
+        u = self.u
+        reg = u.AssetRegistryHelpers.get_asset_registry.return_value
+        u.EditorAssetLibrary.does_asset_exist.side_effect = lambda path: path == "/ModX/Sub/B.B"
+        out = self.lp.forget({"root": "/ModX", "packages": ["/ModX/Sub/B", "/ModX/Sub/C", "/ModX/D"]})
+        reg.scan_paths_synchronous.assert_called_once_with(["/ModX", "/ModX/Sub"], True)
+        self.assertEqual(out["still_listed"], ["/ModX/Sub/B"])
+        self.assertEqual(out["forgotten"], ["/ModX/Sub/C", "/ModX/D"])
+
     def test_reload_assets_reloads_referencers_after_the_published(self):
         u = self.u
         u.find_object.side_effect = lambda outer, path: mock.MagicMock()
@@ -916,6 +925,7 @@ class BackendInfoCapabilityTests(unittest.TestCase):
         self.assertIs(caps["gameplayTags"], True)
         self.assertIs(caps["reflectDefaults"], True)
         self.assertEqual(caps["assetOps"], ["rename", "delete", "reparent", "recreate"])
+        self.assertIs(caps["publishDeletes"], True)
         self.assertIs(caps["compileErrorNodeRefs"], True)
         self.assertIs(caps["functionLocals"], False)
         self.assertIs(caps["userPureFunctions"], False)

@@ -181,6 +181,10 @@ class LiveEditor:
     def prepare(self, packages):
         return self._call("prepare", {"root": "/" + self.mod, "packages": packages})
 
+    def forget(self, packages):
+        """Make the open editor's asset registry drop packages whose files were just deleted from the real mod."""
+        return self._call("forget", {"root": "/" + self.mod, "packages": list(packages)})
+
     RECOMPILE_ROUNDS = 3
 
     def reload(self, packages, also=None):
@@ -697,7 +701,8 @@ def build(run_json, remote_errors, t3d_errors, kit_root, forbidden, py_status, l
                 errs.append({"asset": u.get("asset"), "message": "could not be checked (%s): the compile gate fails closed" % (u.get("reason") or "unreadable")})
             return errs
 
-        return _out(staging.publish(stage, editor, gate, assets=args.get("assets") or None, dry_run=bool(args.get("dry_run"))))
+        return _out(staging.publish(stage, editor, gate, assets=args.get("assets") or None, dry_run=bool(args.get("dry_run")),
+                                       delete_removed=bool(args.get("delete_removed"))))
 
     # ---------------------------------------------------------------- table
     return [
@@ -751,7 +756,9 @@ def build(run_json, remote_errors, t3d_errors, kit_root, forbidden, py_status, l
          dict(mod=STR, stage=BOOL, timeout_seconds=NUM), ["mod"]),
         ("bp_publish", t_bp_publish,
          "Copy the staged Content changes into the real mod. Backs up the files it replaces first (outside the mod), refuses on compile errors, "
-         "modified assets in an open editor, locked files or files changed in the real mod since staging_sync, and never deletes anything. "
+         "modified assets in an open editor, locked files or files changed in the real mod since staging_sync, and deletes nothing unless "
+         "delete_removed is true: then the files that are gone from staging (of the requested assets) are deleted from the real mod too, "
+         "backed up first, refused when the real file changed since staging_sync, restored if the editor cannot reload. "
          "Works with the editor closed (file copy) or open (release the files, copy, reload in place; asset editor tabs of those assets are closed). dry_run only reports.",
-         dict(mod=STR, assets={"type": "array", "items": STR}, dry_run=BOOL), ["mod"]),
+         dict(mod=STR, assets={"type": "array", "items": STR}, dry_run=BOOL, delete_removed=BOOL), ["mod"]),
     ]

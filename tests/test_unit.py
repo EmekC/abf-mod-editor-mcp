@@ -795,12 +795,14 @@ class HeadlessTests(unittest.TestCase):
 class FakeEditor:
     def __init__(self, state="closed", refused=None, real=None, missing=None, on_prepare=None, prepare_raises=None, detail="",
                  kept_loaded=None, reload_error=None, dirty_after=None, reason="modified assets", referencers=None,
-                 refused_referencers=None, compile_errors=None, skipped_dirty=None, dirty_published=None):
+                 refused_referencers=None, compile_errors=None, skipped_dirty=None, dirty_published=None,
+                 forget_error=None, still_listed=None):
         self.st, self.refused, self.calls, self.real, self.missing = state, refused, [], real, missing
         self.on_prepare, self.prepare_raises, self.detail = on_prepare, prepare_raises, detail
         self.kept_loaded, self.reload_error, self.dirty_after, self.reason = kept_loaded, reload_error, dirty_after, reason
         self.referencers, self.refused_referencers, self.compile_errors = referencers, refused_referencers, compile_errors
         self.skipped_dirty, self.dirty_published = skipped_dirty, dirty_published
+        self.forget_error, self.still_listed, self.forgotten, self.prepared = forget_error, still_listed, [], []
         self.seen = {}
         self.also_seen = []
 
@@ -808,8 +810,16 @@ class FakeEditor:
         self.calls.append("state")
         return self.st
 
+    def forget(self, packages):
+        self.calls.append("forget")
+        self.forgotten.append(list(packages))
+        if self.forget_error:
+            raise RuntimeError(self.forget_error)
+        return {"forgotten": [], "still_listed": list(self.still_listed or [])}
+
     def prepare(self, packages):
         self.calls.append("prepare")
+        self.prepared.append(list(packages))
         if self.prepare_raises:
             raise self.prepare_raises
         if self.on_prepare:
@@ -1133,6 +1143,113 @@ class StagingTests(unittest.TestCase):
         self.assertTrue((self.real / "Content" / "Sub" / "B.uasset").is_file())
         self.assertIn("yourself", r["message"])
 
+    def remove_staged(self, rel):
+        (self.stage.dir / rel).unlink()
+
+    def test_delete_removed_closed_editor_backs_up_and_drops_baseline(self):
+        self.remove_staged("Content/Sub/B.uasset")
+        ed = FakeEditor("closed")
+        r = staging.publish(self.stage, ed, self.gate_ok, now="20260101-000010", delete_removed=True)
+        self.assertEqual(r["deleted"], ["Content/Sub/B.uasset"])
+        self.assertEqual(r["published"], [])
+        self.assertEqual(r["route"], "file-copy")
+        self.assertEqual(r["removed_in_staging"], [])
+        self.assertFalse((self.real / "Content" / "Sub" / "B.uasset").exists())
+        self.assertIn("Deleted 1 file(s)", r["message"])
+        self.assertNotIn("Nothing to publish", r["message"])
+        self.assertNotIn("yourself", r["message"])
+        backup = Path(r["backup"])
+        self.assertEqual((backup / "Content" / "Sub" / "B.uasset").read_bytes(), b"B-original" * 50)
+        man = json.loads((backup / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(man["deleted"], ["Content/Sub/B.uasset"])
+        self.assertEqual(man["files"][0]["sha256"], hashlib.sha256(b"B-original" * 50).hexdigest())
+        self.assertNotIn("Content/Sub/B.uasset", self.stage.meta()["baseline"])
+        d = staging.diff(self.stage)
+        self.assertEqual((d["changed"], d["added"], d["removed"], d["conflicts"]), ([], [], [], []))
+        self.assertEqual(ed.calls, ["state"])
+
+    def test_delete_removed_with_a_copy_and_the_assets_filter(self):
+        self.remove_staged("Content/Sub/B.uasset")
+        self.remove_staged("Content/A.uasset")
+        self.stage_write("Content/New.uasset", b"new")
+        r = staging.publish(self.stage, FakeEditor("closed"), self.gate_ok, assets=["/Fake/Sub/B", "/Fake/New"], delete_removed=True)
+        self.assertEqual((r["published"], r["deleted"]), (["Content/New.uasset"], ["Content/Sub/B.uasset"]))
+        self.assertTrue((self.real / "Content" / "A.uasset").is_file())      # not requested: kept, and still reported
+        self.assertFalse((self.real / "Content" / "Sub" / "B.uasset").exists())
+        self.assertEqual(staging.diff(self.stage)["removed"], ["Content/A.uasset"])
+
+    def test_delete_removed_conflicts_when_the_real_file_changed(self):
+        self.remove_staged("Content/Sub/B.uasset")
+        (self.real / "Content" / "Sub" / "B.uasset").write_bytes(b"someone else")
+        before = tree_bytes(self.real)
+        ed = FakeEditor("closed")
+        r = staging.publish(self.stage, ed, self.gate_ok, delete_removed=True)
+        self.assertEqual(r["refused"], "conflicts")
+        self.assertEqual(tree_bytes(self.real), before)
+        self.assertEqual(ed.calls, [])
+        self.assertIn("Content/Sub/B.uasset", r["error"])
+
+    def test_delete_removed_dry_run_changes_nothing(self):
+        self.remove_staged("Content/Sub/B.uasset")
+        before = tree_bytes(self.real)
+        r = staging.publish(self.stage, FakeEditor("closed"), self.gate_ok, dry_run=True, delete_removed=True)
+        self.assertEqual(r["would_delete"], ["Content/Sub/B.uasset"])
+        self.assertEqual(tree_bytes(self.real), before)
+
+    def test_delete_removed_live_prepares_reloads_then_forgets(self):
+        self.remove_staged("Content/Sub/B.uasset")
+        self.stage_write("Content/A.uasset", b"edited")
+        ed = FakeEditor("open", real=self.real, still_listed=["/Fake/Sub/B"])
+        r = staging.publish(self.stage, ed, self.gate_ok)
+        self.assertEqual(ed.calls, ["state", "prepare", "reload"])           # without the flag: old behaviour
+        self.assertIn("yourself", r["message"])
+        self.assertTrue((self.real / "Content" / "Sub" / "B.uasset").is_file())
+        self.stage_write("Content/A.uasset", b"edited again")
+        ed = FakeEditor("open", real=self.real, still_listed=["/Fake/Sub/B"])
+        r = staging.publish(self.stage, ed, self.gate_ok, delete_removed=True)
+        self.assertEqual(ed.calls, ["state", "prepare", "reload", "forget"])
+        self.assertEqual(sorted(ed.prepared[0]), ["/Fake/A", "/Fake/Sub/B"])
+        self.assertEqual(ed.forgotten, [["/Fake/Sub/B"]])
+        self.assertFalse((self.real / "Content" / "Sub" / "B.uasset").exists())
+        self.assertEqual(r["route"], "live-reload")
+        self.assertIn("still lists", r["message"])
+
+    def test_delete_removed_failing_reload_restores_the_deleted_file(self):
+        self.remove_staged("Content/Sub/B.uasset")
+        self.stage_write("Content/A.uasset", b"edited")
+        ed = FakeEditor("open", real=self.real, missing=["/Fake/A"])
+        r = staging.publish(self.stage, ed, self.gate_ok, delete_removed=True)
+        self.assertEqual(r["refused"], "reload failed")
+        self.assertTrue(r["restored"])
+        self.assertEqual((self.real / "Content" / "Sub" / "B.uasset").read_bytes(), b"B-original" * 50)
+        self.assertEqual((self.real / "Content" / "A.uasset").read_bytes(), b"A-original" * 50)
+        self.assertIn("Content/Sub/B.uasset", self.stage.meta()["baseline"])
+
+    def test_delete_removed_failing_forget_restores_the_deleted_file(self):
+        self.remove_staged("Content/Sub/B.uasset")
+        ed = FakeEditor("open", real=self.real, forget_error="scan failed")
+        r = staging.publish(self.stage, ed, self.gate_ok, delete_removed=True)
+        self.assertEqual(r["refused"], "reload failed")
+        self.assertTrue(r["restored"])
+        self.assertEqual((self.real / "Content" / "Sub" / "B.uasset").read_bytes(), b"B-original" * 50)
+        self.assertIn("Content/Sub/B.uasset", self.stage.meta()["baseline"])
+
+    def test_delete_removed_failing_delete_restores_everything(self):
+        self.remove_staged("Content/Sub/B.uasset")
+        self.stage_write("Content/A.uasset", b"edited")
+        before = tree_bytes(self.real)
+        real_unlink = Path.unlink
+        real_dir = self.real
+
+        def failing_unlink(path, *a, **kw):
+            if path == real_dir / "Content" / "Sub" / "B.uasset":
+                raise OSError("denied")
+            return real_unlink(path, *a, **kw)
+        with mock.patch.object(Path, "unlink", failing_unlink):
+            r = staging.publish(self.stage, FakeEditor("closed"), self.gate_ok, delete_removed=True)
+        self.assertEqual(r["refused"], "copy failed")
+        self.assertEqual(tree_bytes(self.real), before)
+
     def test_assets_filter_and_dry_run(self):
         self.stage_write("Content/A.uasset", b"edited")
         self.stage_write("Content/Sub/B.uasset", b"edited B")
@@ -1410,6 +1527,19 @@ class StagingConfigTrackingTests(unittest.TestCase):
 class LiveEditorTests(unittest.TestCase):
     def make(self, procs, run_json):
         return headless_tools.LiveEditor(run_json, (RuntimeError,), "STATUS", "Fake", None, procs)
+
+    def test_forget_sends_the_deleted_packages_to_livepublish(self):
+        sent = []
+
+        def run_json(code, args, timeout=None):
+            sent.append((code, args))
+            return {"forgotten": ["/Fake/Sub/B"], "still_listed": []}
+        ed = self.make(lambda: [], run_json)
+        out = ed.forget(["/Fake/Sub/B"])
+        self.assertEqual(out["still_listed"], [])
+        self.assertEqual(sent[0][1], {"root": "/Fake", "packages": ["/Fake/Sub/B"]})
+        self.assertTrue(sent[0][0].rstrip().endswith("return forget(args)"))
+        self.assertIn("def forget(args)", sent[0][0])
 
     def test_compile_errors_are_read_from_the_log_written_since_the_reload(self):
         tmp = Path(tempfile.mkdtemp(prefix="abflog"))

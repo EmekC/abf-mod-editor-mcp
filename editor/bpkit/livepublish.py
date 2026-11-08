@@ -186,6 +186,19 @@ def reload_assets(args):
     return out
 
 
+def forget(args):
+    """After the files of deleted packages are gone from disk: force a rescan of their parent folders so the asset registry
+    drops them. `still_listed` names the packages the registry still reports (empty when the rescan cleared them all). Deletes
+    nothing itself; the files were removed by the caller."""
+    pkgs = list(args.get("packages") or [])
+    folders = sorted({p.rsplit("/", 1)[0] for p in pkgs if "/" in p})
+    reg = unreal.AssetRegistryHelpers.get_asset_registry()
+    if folders:
+        reg.scan_paths_synchronous(folders, True)
+    still = [p for p in pkgs if unreal.EditorAssetLibrary.does_asset_exist("%s.%s" % (p, p.rsplit("/", 1)[-1]))]
+    return {"forgotten": [p for p in pkgs if p not in still], "still_listed": still}
+
+
 def recompile(args):
     """Recompile, in memory and without saving, the given loaded Blueprints in dependency order (dependencies first,
     `_dependency_order`). Used after `reload_assets`: `reload_packages` swaps the classes of the reloaded packages while the
