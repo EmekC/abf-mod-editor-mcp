@@ -421,7 +421,7 @@ def run_game(stage, job, map_path="/Game/Maps/Empty", timeout=180):
 
 # ---- warm session ----------------------------------------------------------------------
 
-WARM_OPS = ("apply", "export", "compile", "reflect")     # commandlet ops; bp_game_test (-game) and mod_audit (editor) stay cold
+WARM_OPS = ("apply", "export", "compile", "reflect", "catalog")     # commandlet ops; bp_game_test (-game) and mod_audit (editor) stay cold
 WARM_READY_TIMEOUT = 600.0       # seconds to wait for the warm process to report ready
 WARM_END_WAIT = 10.0             # seconds to wait for the job's end marker to reach the log file
 WARM_SLACK = 10.0                # a warm job may run this much longer than its timeout before the session is killed

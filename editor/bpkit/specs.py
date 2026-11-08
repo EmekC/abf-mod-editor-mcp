@@ -83,6 +83,11 @@ def _message(node, env):
     return BP + "K2Node_Message", ['FunctionReference=(MemberParent="%s",MemberName="%s")' % (env.class_text(node["interface"]), node["function"])]
 
 
+def _std_macro(node, env):
+    _req(node, "name")
+    return t3d.MACRO_CLASS, [t3d.std_macro_ref(node["name"])]
+
+
 def _manual(node, env):
     return None, None
 
@@ -109,6 +114,7 @@ NODE_KINDS = {
     "message": _message,
     "self": _manual,
     "macro": _manual,
+    "std_macro": _std_macro,
     "node": _raw,
 }
 MANUAL_KINDS = ("self", "macro")
@@ -117,20 +123,25 @@ REQUIRED = {
     "call": ("function",), "get": ("name",), "set": ("name",), "event": ("name",), "override": ("function", "class"),
     "cast": ("target",), "call_dispatcher": ("name", "params"), "bind_dispatcher": ("name", "params"),
     "timeline": ("name",), "message": ("function", "interface"), "macro": ("name", "inputs", "outputs"),
-    "node": ("class", "props"),
+    "std_macro": ("name",), "node": ("class", "props"),
 }
 CREATE_CLASSES = ("Blueprint", "WidgetBlueprint", "BlueprintInterface", "UserDefinedStruct")
 RAW_KINDS = ("graph", "tree", "tree_replace", "python")
 # bp_apply features reported by the backend_info tool
-FEATURES = ("cast_object_pin", "class_manager_row", "event_meta","map_types", "pin_types", "self_event_calls", "set_types", "struct_fields")
+FEATURES = ("cast_object_pin", "class_manager_row", "class_manager_row_tag", "event_meta", "function_graphs", "map_types", "pin_types", "self_event_calls",
+            "set_types", "struct_fields", "variable_defaults")
 EVENT_META_KEYS = ("tooltip", "category", "keywords")
 EVENT_META_MAX = 2000
 # keys that make no sense on a UserDefinedStruct asset
-_STRUCT_FORBIDDEN_KEYS = ("variables", "remove_variables", "components", "dispatchers", "timelines", "widget_tree", "animations",
+_STRUCT_FORBIDDEN_KEYS = ("variables", "remove_variables", "variable_defaults", "components", "dispatchers", "timelines", "widget_tree", "animations",
                           "macros", "functions", "remove_functions", "interfaces", "graphs", "raw", "class_manager_row")
 _ROW_ASSET_RX = re.compile(r"^/[A-Za-z0-9_]+(/[A-Za-z0-9_]+)+$")
 _ROW_CLASS_RX = re.compile(r"^/[A-Za-z0-9_]+(/[A-Za-z0-9_]+)+\.[A-Za-z0-9_]+_C$")
-_ROW_KEYS = ("asset_path", "class_path")
+_ROW_KEYS = ("asset_path", "class_path", "gameplay_tag")
+# same rule as tagsini.TAG_RX (the host module cannot be imported editor side); a unit test keeps them equal
+TAG_RX = r"^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)*$"
+TAG_MAX = 200
+_TAG_RE = re.compile(TAG_RX)
 _FORBIDDEN_CODE = tuple("delete_" + n for n in ("asset", "directory", "loaded_asset")) + ("reparent_" + "blueprint", "rename_asset")
 
 
@@ -199,7 +210,8 @@ def check_struct_fields(w, a):
 
 
 def check_class_manager_row(w, row, mod):
-    """Problems of an asset spec's class_manager_row: {asset_path, class_path}, both inside the mod, never /Game."""
+    """Problems of an asset spec's class_manager_row: {asset_path, class_path, gameplay_tag?}, both paths inside the mod,
+    never /Game; the optional gameplay_tag is a dotted tag name written to the row's gameplay tag."""
     if not isinstance(row, dict):
         return [w + ".class_manager_row must be an object {asset_path, class_path}"]
     problems = []
@@ -218,6 +230,100 @@ def check_class_manager_row(w, row, mod):
             problems.append("%s: %r is not a path like %s" % (kw, value, shape))
         elif not value.startswith(prefix):
             problems.append("%s: must start with %s (other roots are refused)" % (kw, prefix))
+    if "gameplay_tag" in row:
+        tag = row["gameplay_tag"]
+        kw = w + ".class_manager_row.gameplay_tag"
+        if not isinstance(tag, str) or not tag:
+            problems.append(kw + " must be a non-empty string like ClassManager.EntityDirector.Name")
+        elif len(tag) > TAG_MAX:
+            problems.append("%s: longer than %d characters" % (kw, TAG_MAX))
+        elif "/" in tag or not _TAG_RE.match(tag):
+            problems.append("%s: %r may only hold letters, digits, '_' and '-' in dot separated segments" % (kw, tag))
+    return problems
+
+
+ASSET_OPS = ("rename", "delete", "reparent", "recreate")
+ASSET_OPS_MAX = 20
+_OP_KEYS = {"rename": ("from", "to"), "delete": ("asset",), "reparent": ("asset", "parent"), "recreate": ("asset",)}
+_ASSET_SEGMENT_RX = re.compile(r"^[A-Za-z0-9_]+$")
+_CLASS_NAME_RX = re.compile(r"^[A-Za-z0-9_]+$")
+_PROTECTED_TOP = ("AbioticModConfig", "UUGC_Metadata")
+_TOOLING_TOP = ("_McpTest", "_McpTmp")
+
+
+def _check_op_asset(where, value, mod):
+    """None, or the problem with one asset package path of an asset op."""
+    if not isinstance(value, str) or not value:
+        return "%s is required (a package path like /%s/Folder/BP_X)" % (where, mod)
+    if value == "/Game" or value.startswith("/Game/"):
+        return "%s: /Game is base content and is never edited" % where
+    prefix = "/%s/" % mod
+    if not value.startswith(prefix):
+        return "%s: %r must start with %s (other roots are refused)" % (where, value, prefix)
+    segments = value[len(prefix):].split("/")
+    if not all(_ASSET_SEGMENT_RX.match(s) for s in segments):
+        return "%s: %r is not a plain package path (letters, digits and '_' in /-separated segments)" % (where, value)
+    if any(s in _TOOLING_TOP for s in segments):
+        return "%s: %r is tooling scratch, never an asset op target" % (where, value)
+    if segments[0] in _PROTECTED_TOP:
+        return "%s: %r is a mod configuration asset and is never renamed, deleted or reparented" % (where, value)
+    return None
+
+
+def _check_op_class(where, value, mod):
+    """None, or the problem with a parent class path of a reparent op: /Script/<Module>.<Class>, or <Class> in /<Mod>/ or /Game/."""
+    if not isinstance(value, str) or not value:
+        return "%s is required (a class path like /Script/Engine.Actor)" % where
+    if "." not in value:
+        return "%s: %r is not a class path like /Script/Engine.Actor or /%s/Folder/BP_X.BP_X_C" % (where, value, mod)
+    pkg, name = value.rsplit(".", 1)
+    if not _CLASS_NAME_RX.match(name):
+        return "%s: %r has a bad class name" % (where, value)
+    parts = pkg.split("/")
+    if len(parts) < 3 or parts[0] != "" or not all(_ASSET_SEGMENT_RX.match(s) for s in parts[1:]):
+        return "%s: %r is not a plain class path" % (where, value)
+    root = parts[1]
+    if root == "Script":
+        if len(parts) != 3:
+            return "%s: %r is not a /Script/<Module>.<Class> path" % (where, value)
+    elif root not in ("Game", mod):
+        return "%s: %r must be a /Script/..., /Game/... or /%s/... class" % (where, value, mod)
+    elif any(s in _TOOLING_TOP or s in _PROTECTED_TOP for s in parts[2:]):
+        return "%s: %r is not a usable parent class" % (where, value)
+    return None
+
+
+def check_asset_ops(ops, mod):
+    """Problems of a bp_asset_ops request: [{op:"rename",from,to} | {op:"delete",asset} | {op:"reparent",asset,parent} |
+    {op:"recreate",asset}], at most ASSET_OPS_MAX, every path inside the mod and never /Game. Pure text: whether the
+    assets exist is checked by the caller (host: staged files, editor side: asset registry)."""
+    if not isinstance(ops, list) or not ops:
+        return ["ops must be a non-empty list of {op, ...} objects"]
+    problems = []
+    if len(ops) > ASSET_OPS_MAX:
+        problems.append("at most %d ops per call (got %d)" % (ASSET_OPS_MAX, len(ops)))
+    for i, o in enumerate(ops[:ASSET_OPS_MAX * 2]):
+        w = "ops[%d]" % i
+        if not isinstance(o, dict):
+            problems.append(w + " must be an object")
+            continue
+        kind = o.get("op")
+        if kind not in ASSET_OPS:
+            problems.append("%s.op must be one of %s (got %r)" % (w, "|".join(ASSET_OPS), kind))
+            continue
+        w = "%s (%s)" % (w, kind)
+        for key in o:
+            if key != "op" and key not in _OP_KEYS[kind]:
+                problems.append("%s: unknown key %r (known: %s)" % (w, key, ", ".join(_OP_KEYS[kind])))
+        for key in _OP_KEYS[kind]:
+            if key == "parent":
+                bad = _check_op_class("%s.parent" % w, o.get(key), mod)
+            else:
+                bad = _check_op_asset("%s.%s" % (w, key), o.get(key), mod)
+            if bad:
+                problems.append(bad)
+        if kind == "rename" and isinstance(o.get("from"), str) and o.get("from") == o.get("to"):
+            problems.append("%s: from and to are the same path" % w)
     return problems
 
 
@@ -264,6 +370,8 @@ def _check_graph_nodes(problems, where, nodes, wires, reserved, existing_ok):
         for key in ("params", "inputs", "outputs"):
             if key in n:
                 _check_params(problems, "%s.%s" % (w, key), n[key])
+        if k == "std_macro" and n.get("name") and n["name"] not in t3d.STD_MACROS:
+            problems.append("%s: unknown standard macro %r (known: %s)" % (w, n["name"], ", ".join(t3d.STD_MACROS)))
         if "pin_types" in n:
             pt = n["pin_types"]
             if k in MANUAL_KINDS:
@@ -340,6 +448,17 @@ def validate(batch, mod):
                 problems.append("%s.variables[%d] needs name and type" % (w, i))
             else:
                 _check_type(problems, "%s.variables[%d] (%s)" % (w, i, v["name"]), v["type"])
+                if v.get("default") is not None and not isinstance(v["default"], (str, int, float, bool)):
+                    # a number or a bool is still accepted (turned into text, bool as true/false) for older callers
+                    problems.append("%s.variables[%d] (%s): default must be a string (Unreal's text form)" % (w, i, v["name"]))
+        vd = a.get("variable_defaults")
+        if vd is not None:
+            if not isinstance(vd, dict):
+                problems.append("%s.variable_defaults must be an object {name: default text or null}" % w)
+            else:
+                for k, val in vd.items():
+                    if val is not None and not isinstance(val, str):
+                        problems.append("%s.variable_defaults[%s] must be a string or null" % (w, k))
         for i, c in enumerate(a.get("components") or []):
             if not isinstance(c, dict) or not c.get("name"):
                 problems.append("%s.components[%d] needs a name" % (w, i))
@@ -371,11 +490,17 @@ def validate(batch, mod):
             _check_params(problems, mw + ".inputs", m.get("inputs") or [])
             _check_params(problems, mw + ".outputs", m.get("outputs") or [])
             _check_graph_nodes(problems, mw, m.get("nodes"), m.get("wires"), ("in", "out"), False)
+        seen_fns = set()
         for i, f in enumerate(a.get("functions") or []):
             fw = "%s.functions[%d]" % (w, i)
             if not isinstance(f, dict) or not f.get("name"):
                 problems.append(fw + " needs a name")
                 continue
+            if f["name"] in seen_fns:
+                problems.append("%s: function %s is listed twice" % (fw, f["name"]))
+            seen_fns.add(f["name"])
+            if "access" in f and f["access"] not in ("public", "protected", "private"):
+                problems.append("%s.access must be public, protected or private" % fw)
             if f.get("pure"):
                 problems.append(fw + ": pure functions are not supported (the engine rejects the generated pure function; make it an ordinary function)")
             _check_params(problems, fw + ".inputs", f.get("inputs") or [])
@@ -391,6 +516,8 @@ def validate(batch, mod):
                 if not isinstance(f, dict) or not f.get("name"):
                     problems.append(fw + " needs a name")
                     continue
+                if "access" in f:
+                    problems.append(fw + ": access is not allowed on an interface function")
                 _check_params(problems, fw + ".inputs", f.get("inputs") or [])
                 _check_params(problems, fw + ".outputs", f.get("outputs") or [])
                 _check_graph_nodes(problems, fw, f.get("nodes"), f.get("wires"), ("entry", "result"), False)

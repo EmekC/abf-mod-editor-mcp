@@ -8,19 +8,19 @@ results below.
 
 ## Opt-in: `ABF_ABFC_TOOLS=1`
 
-Three tools are registered only when the server starts with `ABF_ABFC_TOOLS=1` (abfc sets it when it spawns the server):
-`abfc_extensions`, `reflect` and `warm_session`. Without the variable the tool list is exactly the stock one.
+Four tools are registered only when the server starts with `ABF_ABFC_TOOLS=1` (abfc sets it when it spawns the server):
+`abfc_extensions`, `reflect`, `catalog` and `warm_session`. Without the variable the tool list is exactly the stock one.
 
 ### `abfc_extensions` (no arguments, no editor)
 
 ```json
-{ "extProtocol": 1, "serverVersion": "2.5.0", "python": "3.11.9",
-  "features": ["reflect", "compile_node_refs", "bp_read_seconds"] }
+{ "extProtocol": 1, "serverVersion": "2.6.0", "python": "3.11.9",
+  "features": ["reflect", "compile_node_refs", "bp_read_seconds", "catalog"] }
 ```
 
 ### `reflect`
 
-`reflect(mod, classes, structs = [], cast_targets = [], meta = true, timeout_seconds = 900)`. Hidden editor on the staging copy, read only.
+`reflect(mod, classes, structs = [], cast_targets = [], supers_of = [], meta = true, timeout_seconds = 900)`. Hidden editor on the staging copy, read only.
 Paths must be `/Script/...`, `/Game/...` or `/<mod>/...` (anything else is refused on the host before an editor starts).
 Classes are loaded with `unreal.load_class` (never `load_asset`, never an export of a `/Game` asset). Returns:
 
@@ -40,13 +40,21 @@ or `{ "error", "run", "log_tail" }`. `<run>/reflect.json`:
                            "properties": [{ "name": "...", "pins": [Pin] }],
                            "castPin": "<cast result output pin name or null>" } },
   "structs": { "<path>": { "fields": [Pin] } },
+  "supers": { "<path>": ["<parent>", "...", "/Script/CoreUObject.Object"] },
   "errors": ["..."] }
 ```
 
 A `Pin` is `{ name, dir: "in"|"out", category, subCategory, subCategoryObject (inner path or null), objectMeta, container, hidden, default }`.
 Classes that appear only in `cast_targets` get an entry with empty member lists, their `castPin` and `"castOnly": true`.
+**Members GetClassDefaults cannot list.** Single references to widget and component classes (designer widgets, SCS components, plain variables of widget or component type) are not output pins of GetClassDefaults. `reflect` finds them per requested `/Game` class: candidate names come from the widget tree and SCS template objects, and from the class package in the cooked IoStore content (name map and export names; read only, needs an uncompressed, unencrypted container, otherwise `cookedClass` is missing from `memberSources` and `errors` says why). Each name is checked on the class default object (`get_editor_property`, before any template run), must hold an object reference, and must not exist on the parent class default object (a member is listed only on its declaring class); the survivors are typed by a VariableGet node. Native `/Script` classes use the property list of the Python docstring of their default object (source `pythonDoc`). Such properties carry `kind`: `"widget"`, `"component"` or `"member"` (a plain variable); the result has top-level `memberSources` (`widgetTree`, `scs`, `cookedClass`, `pythonDoc`; those that ran) and `counts.members`.
+
+**Discovery limits.** Native members found from the Python docstring are named by snake_case to PascalCase and can differ in case from the C++ name (acronyms); they still resolve because FNames ignore case. Only widget, component and timeline-typed members are kept (timelines are readonly components); other members GetClassDefaults does not list are deliberately dropped. Numbered variables are found only up to `_9`. Cooked containers that are signed, encrypted, multi-partition or older than TOC version 4 are skipped and reported in `errors`.
+
 Per-member failures go to `errors` and do not abort the run. `ExecuteUbergraph_*` and `*__DelegateSignature` functions are skipped.
-Blueprint parent chains are not walkable from Python, so `ancestors` lists native wrapper classes only.
+`ancestors` stays native-only (the Python wrapper chain). `supers` comes from the asset registry's class inheritance (every parent,
+Blueprint and native, nearest first, ending at `/Script/CoreUObject.Object`) for every loaded class and for each `supers_of` path
+(classes that are loaded only to learn their parents; they get no `classes` entry). Every link is checked with `class_is_child_of`;
+a class whose chain cannot be confirmed has no entry in `supers`. The key is always present, `{}` when nothing could be confirmed.
 
 **Function metadata and the `meta` switch.** The top-level `meta` of the result and of `reflect.json` is `"read"` or `"skipped"`.
 When it is read (the default), each function entry gets `meta: { tooltip, displayName }` from the `ToolTip` and `DisplayName` tags
@@ -55,12 +63,52 @@ run, because it is the part of `reflect` that once crashed the hidden editor (on
 the argument `meta: false`, or, when the argument is absent, with the environment variable `ABF_REFLECT_META=0` on the server; the
 argument wins over the variable. Skipped means every function has `meta: null`.
 
+### `catalog` (2.6.0)
+
+`catalog(mod, timeout_seconds = 300)`. Hidden editor on the staging copy, read only, no asset loads (asset registry tags and the
+already loaded `/Script` objects only; about 0.3 s of work after the editor start). `mod` must be letters, digits and underscores
+(anything else is refused on the host before an editor starts). With `ABF_WARM_SESSION=1` the job goes to the warm session. Returns:
+
+```json
+{ "ok": true, "run": "<run folder>", "seconds": 8.1, "file": "<run>/catalog.json",
+  "counts": { "game": 3098, "scriptClasses": 7316, "scriptStructs": 5308, "scriptEnums": 2234, "libraries": 379, "functions": 5476 },
+  "warm": false }
+```
+
+or `{ "error", "run", "log_tail" }`. `<run>/catalog.json` (version 1, one line of JSON):
+
+```json
+{ "version": 1, "engineVersion": "5.4.4",
+  "game": [{ "path": "/Game/Dir/BP_X.BP_X_C", "kind": "BlueprintGeneratedClass", "parent": "/Script/Engine.Actor", "interface": false }],
+  "scriptClasses": [{ "path": "/Script/Engine.Actor", "parent": "/Script/CoreUObject.Object" },
+                    { "path": "/Script/Fake.IThing", "parent": "/Script/CoreUObject.Interface", "interface": true },
+                    { "path": "/Script/Fake.ThingLibrary", "parent": "/Script/Engine.BlueprintFunctionLibrary",
+                      "library": true, "functions": ["DoThing", "MakeThing"] }],
+  "scriptStructs": ["/Script/CoreUObject.Vector"],
+  "scriptEnums": ["/Script/Engine.EMovementMode"],
+  "counts": { "game": 1, "scriptClasses": 3, "scriptStructs": 1, "scriptEnums": 1, "libraries": 1, "functions": 2 },
+  "errors": ["..."] }
+```
+
+- `game`: every `*GeneratedClass` asset under `/Game` (Blueprint, Widget, Anim, interfaces; the class itself, asset name `X_C`), sorted by
+  `path`. `kind` is the asset class name. `parent` comes from the `ParentClass` tag (a /Game or /Script class path, `null` when absent);
+  `interface` is the `CLASS_Interface` flag (`0x4000`) of the `ClassFlags` tag (`false` when unreadable).
+- `scriptClasses`: every loaded `/Script` class (exact `Class` objects, no `Default__`), sorted by `path`, whether or not it has a Python
+  wrapper. `parent` is the nearest ancestor from the asset registry's class hierarchy, falling back to the nearest Python-wrapped ancestor
+  of the class default object (`null` when neither knows one, for example `Object` itself). `interface: true` when the parent is
+  `/Script/CoreUObject.Interface`. `library: true` marks `BlueprintFunctionLibrary` descendants; `functions` are their function
+  names (sorted, unique, plain identifiers only). Function flags are not readable from Python, so `functions` includes UFunctions that
+  are not Blueprint callable.
+- `scriptStructs`, `scriptEnums`: sorted `/Script` paths.
+- `errors`: per-item failures (at most 200 lines); they never abort the run.
+- Capability: abfc reads it from the tool list (`catalog` is in `tools/list`) and from the `abfc_extensions` feature `catalog`.
+
 ## `backend_info` (2.4.0)
 
 Core tool, no editor needed, no arguments. Keys:
 
 - `protocol`: backend protocol number (`1`).
-- `serverVersion`: this server's version (`"2.5.0"`).
+- `serverVersion`: this server's version (`"2.6.0"`).
 - `engineVersion`: `Major.Minor.Patch` from `<editor root>/Engine/Build/Build.version`, `null` when the file is missing or unreadable.
 - `editorRoot`, `headlessDir`, `documentsDir`: the paths the server uses (`editorRoot` is `null` when no editor install was found).
 - `capabilities.pinTypes`: `bp_apply` node specs accept `pin_types` (wildcard pin resolution in one pass).
@@ -76,9 +124,23 @@ Core tool, no editor needed, no arguments. Keys:
 - `capabilities.audit`: `mod_audit` is available.
 - `capabilities.publish`: `bp_publish` is available.
 - `capabilities.classManagerRows` (2.5.0): `bp_apply` accepts the asset-spec key `class_manager_row` (below).
+- `capabilities.gameplayTags` (2.6.0): `class_manager_row` accepts `gameplay_tag` (bp_apply feature `class_manager_row_tag`) and `reflect`
+  accepts `gameplay_tags` (below).
+- `capabilities.reflectDefaults` (2.6.0): `reflect` function entries carry `meta.defaults` (below).
+- `capabilities.assetOps` (2.6.0): the ops `bp_asset_ops` accepts, `["rename", "delete", "reparent", "recreate"]` (below).
+- `capabilities.publishDeletes` (2.6.0): `bp_publish` accepts `delete_removed` (below).
+- `capabilities.liveTags` (2.6.0): with the mod open in an editor, `bp_publish` registers the tags of the real mod's
+  `Config/Tags/<Mod>Tags.ini` that the editor does not know (in memory, verified) before it reloads the published assets. The result
+  carries `tags_registered`, `tags_unregistered`, `tags_strategy` (`refresh`, `settings` or null) and `tags_error`; tags left in
+  `tags_unregistered` stay unknown to that editor until it restarts.
 - `bpApply.features`, `bpApply.nodeKinds`: the `bp_apply` feature flags and node kinds this build understands.
 
 ## Additive keys in existing tools
+
+- `staging_status`: `stale: [rel paths]`, staged files that are untouched in the stage but differ from (or are gone from) the real
+  mod, for example saved in the Mod Editor; not conflicts. `staging.diff` has the same key.
+- Staged file copies wait up to 60 s for a file in use; a file still locked is a `StageFileBusy` text naming the hidden editor pids.
+- `bp_apply` `variables[i].default`: string, number or bool (a bool as `true`/`false`).
 
 - `bp_read`: `seconds` (wall time of the export run).
 - `bp_compile_report`: `messages: [{ severity: "error"|"warning", asset, message, node, graph }]` next to the existing keys.
@@ -112,6 +174,59 @@ Core tool, no editor needed, no arguments. Keys:
 - Result: `rows: [{ asset, created, changed }]` (in the order of the specs that carry the key; `[]` otherwise). Any failure is an
   error of the whole call, and the staged files, including the row asset, are rolled back like any other failed `bp_apply`.
 - A staged row asset is published by `bp_publish` like any other changed or added file when it is named in `assets`.
+
+## 2.6.0: gameplay tags, reflect defaults, asset ops, publish deletions
+
+**Gameplay tag on a class-manager row** (`capabilities.gameplayTags`). `class_manager_row` takes an optional `gameplay_tag` (a
+dotted tag such as `Feature.Director`, at most 200 characters, no `/`). Before the run the host adds the tag to the stage file
+`Config/Tags/<Mod>Tags.ini` (created with its header when missing; CRLF kept when the file uses it; case-insensitive dedupe) and the
+row's tag is set when it differs. The result gains `tags_added` and each `rows[]` entry gains `tag`. A failed apply restores the ini.
+`Config/Tags/*.ini` is part of the staged baseline, so `bp_publish` copies a changed ini like any other file (no reload). A running
+warm session is stopped when tags were added, so the next run starts with the new tag list.
+
+**`reflect` extras.** `gameplay_tags: true` adds `gameplayTags: { tags: [sorted unique names], sources: { <source>: count | "error: ..." } }`
+to `reflect.json` and `gameplayTags` to `counts`. With `meta` read, each function entry's `meta` gains
+`defaults: { <input pin>: "<default text>" }` from the pin's metadata, in Unreal's own lookup order (`UEdGraphSchema_K2::FindFunctionParameterDefaultValue`):
+the key equal to the parameter name first (`meta=(Duration="0.2")`), then `CPP_Default_<pin>` (`null` when it could not be read; the per-pin
+read is the fallback when the bulk read fails).
+
+**`bp_asset_ops(mod, ops, timeout_seconds)`** (`capabilities.assetOps`). Edits the staged mod only (`bp_apply` still refuses these).
+At most 20 ops, executed in order, all-or-nothing: on any failure the staged `Content/` and `Config/Tags/` are restored.
+
+- `{ "op": "rename", "from": "/Mod/A", "to": "/Mod/B" }`: Unreal's own rename; refused when the target exists or the source is
+  missing; referencers are fixed up (redirector removed) and the changed referencers saved (`touched`).
+- `{ "op": "delete", "asset": "/Mod/A" }`: refused, naming them, while an asset outside the call's delete set still references it.
+- `{ "op": "reparent", "asset": "/Mod/A", "parent": "/Script/Engine.Actor" }`: same family only (Actor, ActorComponent, UserWidget or other
+  objects); compiled and verified.
+- `{ "op": "recreate", "asset": "/Mod/A" }`: removes the staged files of the asset so a following `bp_apply` create makes it again.
+
+Paths must be inside the mod (`/Game`, other mods, config assets and tooling folders are refused). Result:
+`{ ok, results: [{ op, ok, detail }], touched: [...], run, error }`.
+
+**`bp_publish(..., delete_removed = false)`** (`capabilities.publishDeletes`). With `delete_removed: true`, the files that are gone
+from staging (limited to `assets` when given) are deleted from the real mod as part of the publish. Each is backed up first (listed under
+`deleted` in the backup's `manifest.json`), and a real file that changed since `staging_sync` is a conflict that refuses. An open editor
+releases those packages together with the published ones, and afterwards rescans their folders so its asset registry forgets them; any
+failure (including the reload) restores the deleted files from the backup. A publish with only deletions is valid. The result gains
+`deleted: [...]` (and `would_delete` in a dry run). Without the flag nothing is deleted and the old note stays.
+
+## bp_apply feature `function_graphs` (2.6.0)
+
+For tools that own whole function graphs (abfc compiles an undecorated TypeScript method to one). `backend_info.bpApply.features`
+lists `function_graphs`.
+
+- `access` on an own `functions` entry: `"public"` (default), `"protected"` or `"private"`. It is written as the entry node's
+  `ExtraFlags`: 201457664 (public, the default), 201850880 (protected), 201588736 (private). That is the default flag word with the
+  access bits (`FUNC_Public` 0x20000, `FUNC_Protected` 0x80000, `FUNC_Private` 0x40000) swapped. Any other value is a spec problem;
+  `access` on an interface function is refused. Interface functions keep the default flags.
+- A name listed in both `remove_functions` and `functions` is replaced: the old graph is removed, the Blueprint is compiled so the
+  name is free, then the new graph is created. Replacing is the way to change a signature.
+- After `add_function_graph` the graph's name must equal the requested name; otherwise the apply fails with "function graph X was
+  created as Y (the name is still in use)". Adding a function whose graph already exists and is not in `remove_functions` fails with
+  "function graph X already exists; list it in remove_functions to replace it". A name listed twice in `functions` is a spec problem.
+- Unchanged: `pure` is still refused, and a function graph cannot get local variables (`capabilities.functionLocals` stays `false`,
+  `capabilities.userPureFunctions` stays `false`). The body goes in a normal `graphs` edit of the function's graph (`entry` and
+  `result` are the reserved node ids).
 
 ## `mod_audit` on the stage (`backend_info.capabilities.stageAudit`)
 
@@ -178,7 +293,7 @@ Opt-in, off by default. With `ABF_WARM_SESSION=1` the server keeps one hidden `-
 abfc needs protocol >= 1 (a lower number is its error ABFC4001) and warns below server version 2.4.0 (ABFC4014). It reads
 `backend_info`: `protocol`, `serverVersion`, `engineVersion`, `capabilities` (`pinTypes`, `containerTypes` for diagnostics,
 `warmSession`, `stageAudit`, `compileErrorNodeRefs`, and the other keys above) and `bpApply.features` (`pin_types`, `cast_object_pin`,
-`map_types`, `set_types`, `struct_fields`, `event_meta`, `self_event_calls`, `class_manager_row`) and `bpApply.nodeKinds`. `pinTypes` is on only when the
+`map_types`, `set_types`, `struct_fields`, `event_meta`, `self_event_calls`, `class_manager_row`, `function_graphs`) and `bpApply.nodeKinds`. `pinTypes` is on only when the
 tool lists `pin_types`; otherwise (including a backend without `backend_info`) abfc uses a two-phase route: apply, read the rolled-back
 `final_<i>.t3d`, patch the wildcard pins, re-apply as a raw graph. Everything `backend_info` does not report comes from `tools/list`
 (for example whether `reflect` is registered), from `abfc_extensions` and from a static `bp_apply` protocol-1 baseline inside abfc. A

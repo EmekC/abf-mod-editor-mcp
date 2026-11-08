@@ -53,7 +53,7 @@ def op_apply(job):
         row = spec.get("class_manager_row")
         if row:
             from . import rows as rows_mod
-            rows.append(rows_mod.ensure_class_manager_row(row["asset_path"], row["class_path"]))
+            rows.append(rows_mod.ensure_class_manager_row(row["asset_path"], row["class_path"], row.get("gameplay_tag")))
     return {"assets": reports, "saved": saved, "rows": rows}
 
 
@@ -164,7 +164,18 @@ def op_reflect(job):
     return reflect.run(job)
 
 
-COMMANDLET_OPS = {"apply": op_apply, "compile": op_compile, "export": op_export, "reflect": op_reflect}
+def op_catalog(job):
+    from . import catalog
+    return catalog.run(job)
+
+
+def op_asset_ops(job):
+    from . import assetops
+    return assetops.run(job)
+
+
+COMMANDLET_OPS = {"apply": op_apply, "compile": op_compile, "export": op_export, "reflect": op_reflect, "asset_ops": op_asset_ops,
+                  "catalog": op_catalog}
 GENERATOR_OPS = ("game_test", "shots", "audit", "live_publish_test")
 
 

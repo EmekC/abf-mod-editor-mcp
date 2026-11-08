@@ -8,6 +8,7 @@ import py_compile
 import shutil
 import subprocess
 import sys
+import types
 import tempfile
 import threading
 import time
@@ -36,7 +37,7 @@ def tearDownModule():
 import abfc_tools  # noqa: E402
 import headless  # noqa: E402
 import paths  # noqa: E402
-from bpkit import reflectparse  # noqa: E402
+from bpkit import cookedpkg, reflectparse  # noqa: E402
 
 
 class CompileLogTests(unittest.TestCase):
@@ -83,9 +84,9 @@ class CompileLogTests(unittest.TestCase):
 
 
 class ToolTableTests(unittest.TestCase):
-    def test_build_returns_exactly_three_tools_with_schemas(self):
+    def test_build_returns_exactly_four_tools_with_schemas(self):
         tools = abfc_tools.build("x")
-        self.assertEqual([t[0] for t in tools], ["abfc_extensions", "reflect", "warm_session"])
+        self.assertEqual([t[0] for t in tools], ["abfc_extensions", "reflect", "catalog", "warm_session"])
         for name, fn, desc, props, required in tools:
             self.assertTrue(callable(fn))
             self.assertTrue(desc)
@@ -97,6 +98,8 @@ class ToolTableTests(unittest.TestCase):
             self.assertEqual(reflect[3][k]["type"], "array")
         self.assertEqual(reflect[3]["meta"]["type"], "boolean")
         self.assertNotIn("meta", reflect[4])
+        self.assertEqual(reflect[3]["supers_of"]["type"], "array")
+        self.assertNotIn("supers_of", reflect[4])
         self.assertEqual(tools[0][3], {})
 
     def test_abfc_extensions_shape(self):
@@ -106,7 +109,7 @@ class ToolTableTests(unittest.TestCase):
         self.assertEqual(d["extProtocol"], 1)
         self.assertEqual(d["serverVersion"], "9.9.9")
         self.assertEqual(d["python"], sys.version.split()[0])
-        self.assertEqual(d["features"], ["reflect", "compile_node_refs", "bp_read_seconds"])
+        self.assertEqual(d["features"], ["reflect", "compile_node_refs", "bp_read_seconds", "catalog"])
         self.assertEqual(sorted(d), ["extProtocol", "features", "python", "serverVersion"])
 
     def test_reflect_host_refuses_foreign_paths(self):
@@ -120,6 +123,9 @@ class ToolTableTests(unittest.TestCase):
         self.assertIn("structs", json.loads(text)["error"])
         text, is_err = reflect({"mod": "Mod", "classes": [], "cast_targets": ["/Engine/C"]})
         self.assertTrue(is_err)
+        text, is_err = reflect({"mod": "Mod", "classes": [], "supers_of": ["/Engine/X"]})
+        self.assertTrue(is_err)
+        self.assertIn("supers_of", json.loads(text)["error"])
 
 
 class ReflectParseTests(unittest.TestCase):
@@ -179,6 +185,43 @@ class ReflectParseTests(unittest.TestCase):
         self.assertTrue(reflectparse.SKIP_FUNCTION("OnHit__DelegateSignature"))
         self.assertFalse(reflectparse.SKIP_FUNCTION("DoIt"))
 
+    def test_verified_supers(self):
+        obj = "/Script/CoreUObject.Object"
+        bp, parent, native = "/Game/A/BP_X.BP_X_C", "/Game/A/BP_P.BP_P_C", "/Script/Fake.Widget"
+        parents = {bp: parent, parent: native, native: obj}
+
+        def is_child(a, b):
+            while a in parents:
+                a = parents[a]
+                if a == b:
+                    return True
+            return False
+
+        good = reflectparse.verified_supers(bp, [parent, native, obj], is_child)
+        self.assertEqual(good, [parent, native, obj])
+        # the self entry and duplicates are dropped
+        self.assertEqual(reflectparse.verified_supers(bp, [bp, parent, parent, native, obj], is_child), [parent, native, obj])
+        # a native class listing itself first (wrapper chain) still verifies
+        self.assertEqual(reflectparse.verified_supers(native, [native, obj], is_child), [obj])
+        self.assertIsNone(reflectparse.verified_supers(bp, [], is_child))
+        self.assertIsNone(reflectparse.verified_supers(bp, None, is_child))
+        self.assertIsNone(reflectparse.verified_supers(bp, [bp], is_child))
+        # the chain must end at UObject
+        self.assertIsNone(reflectparse.verified_supers(bp, [parent, native], is_child))
+        # one broken link anywhere: the first link, a middle link
+        self.assertIsNone(reflectparse.verified_supers(bp, [native, parent, obj], is_child))
+        self.assertIsNone(reflectparse.verified_supers(bp, [parent, "/Script/Fake.Other", obj], is_child))
+
+        def broken(a, b):
+            return not (a == parent and b == native) and is_child(a, b)
+
+        self.assertIsNone(reflectparse.verified_supers(bp, [parent, native, obj], broken))
+
+        def boom(a, b):
+            raise RuntimeError("no class")
+
+        self.assertIsNone(reflectparse.verified_supers(bp, [parent, native, obj], boom))
+
     def test_function_meta_shape(self):
         tags = {"ToolTip": " Does it. ", "DisplayName": ""}
 
@@ -187,15 +230,76 @@ class ReflectParseTests(unittest.TestCase):
                 raise RuntimeError("no metadata")
             return tags[tag]
 
-        self.assertEqual(reflectparse.read_function_meta(route, "ok"), {"tooltip": "Does it.", "displayName": None})
-        self.assertEqual(reflectparse.read_function_meta(route, "bad"), {"tooltip": None, "displayName": None})
+        self.assertEqual(reflectparse.read_function_meta(route, "ok"), {"tooltip": "Does it.", "displayName": None, "defaults": None})
+        self.assertEqual(reflectparse.read_function_meta(route, "bad"), {"tooltip": None, "displayName": None, "defaults": None})
+
+    def test_function_defaults_from_read_all(self):
+        vals = {"ToolTip": "x", "CPP_Default_InString": "Hello", "CPP_Default_Duration": "2.000000", "CPP_Default_Key": ""}
+        got = reflectparse.read_function_meta(lambda fn, tag: "", "f", read_all=lambda fn: vals)
+        self.assertEqual(got["defaults"], {"InString": "Hello", "Duration": "2.000000"})
+        self.assertEqual(reflectparse.read_function_meta(lambda fn, tag: "", "f", read_all=lambda fn: {})["defaults"], {})
+
+    def test_function_defaults_fall_back_to_per_pin_reads(self):
+        def read_all(fn):
+            raise RuntimeError("no bulk read")
+
+        def route(fn, tag):
+            return {"CPP_Default_InString": "Hello", "CPP_Default_Key": ""}.get(tag, "")
+
+        got = reflectparse.read_function_meta(route, "f", read_all=read_all, pins=["InString", "Key", "Other"])
+        self.assertEqual(got["defaults"], {"InString": "Hello"})
+
+    def test_param_name_metadata_is_a_default(self):
+        # Delay: the engine declares meta=(Latent, LatentInfo="LatentInfo", Duration="0.2"); the Blueprint editor places Duration 0.2
+        vals = {"Duration": "0.2", "Latent": "", "LatentInfo": "LatentInfo", "ToolTip": "x"}
+        got = reflectparse.read_function_meta(lambda fn, tag: "", "f", read_all=lambda fn: vals, pins=["Duration"])
+        self.assertEqual(got["defaults"], {"Duration": "0.2"})
+        # the latent marker (key == value == pin name) is no default, and without pins only CPP_Default_ keys are listed
+        got = reflectparse.read_function_meta(lambda fn, tag: "", "f", read_all=lambda fn: vals, pins=["Duration", "LatentInfo", "Other"])
+        self.assertEqual(got["defaults"], {"Duration": "0.2"})
+        self.assertEqual(reflectparse.read_function_meta(lambda fn, tag: "", "f", read_all=lambda fn: vals)["defaults"], {})
+
+    def test_param_name_metadata_wins_over_cpp_default(self):
+        vals = {"Duration": "0.2", "CPP_Default_Duration": "5.000000", "CPP_Default_Key": "K", "Key": ""}
+        got = reflectparse.read_function_meta(lambda fn, tag: "", "f", read_all=lambda fn: vals, pins=["Duration", "Key"])
+        self.assertEqual(got["defaults"], {"Duration": "0.2", "Key": "K"})
+
+    def test_param_name_metadata_per_pin_fallback(self):
+        def read_all(fn):
+            raise RuntimeError("no bulk read")
+
+        tags = {"Duration": "0.2", "CPP_Default_Duration": "5.000000", "CPP_Default_Key": "K", "LatentInfo": "LatentInfo"}
+        got = reflectparse.read_function_meta(lambda fn, tag: tags.get(tag, ""), "f", read_all=read_all,
+                                              pins=["Duration", "Key", "LatentInfo", "Other"])
+        self.assertEqual(got["defaults"], {"Duration": "0.2", "Key": "K"})
+
+        def route(fn, tag):
+            if tag == "Duration":
+                raise RuntimeError("no")
+            return tags.get(tag, "")
+
+        # a parameter-name read that raises falls through to the C++ default
+        self.assertEqual(reflectparse.read_function_meta(route, "f", read_all=read_all, pins=["Duration"])["defaults"],
+                         {"Duration": "5.000000"})
+
+    def test_function_defaults_unreadable_is_none(self):
+        def boom(fn, tag):
+            if tag.startswith("CPP_Default_"):
+                raise RuntimeError("no")
+            return ""
+
+        def read_all(fn):
+            raise RuntimeError("no")
+
+        self.assertIsNone(reflectparse.read_function_meta(boom, "f", read_all=read_all, pins=["A"])["defaults"])
+        self.assertIsNone(reflectparse.read_function_meta(boom, "f", read_all=read_all)["defaults"])
 
     def test_function_meta_time_cap(self):
         ticks = iter([0.0, 1.0, 25.0, 26.0])   # start, first check, second check (over budget), spare
         got = reflectparse.collect_function_meta(lambda fn, tag: tag + ":" + fn, [("a", "fa"), ("b", "fb")], budget=20.0,
                                                  clock=lambda: next(ticks))
-        self.assertEqual(got["a"], {"tooltip": "ToolTip:fa", "displayName": "DisplayName:fa"})
-        self.assertEqual(got["b"], {"tooltip": None, "displayName": None})
+        self.assertEqual(got["a"], {"tooltip": "ToolTip:fa", "displayName": "DisplayName:fa", "defaults": None})
+        self.assertEqual(got["b"], {"tooltip": None, "displayName": None, "defaults": None})
 
 
 class StdioOptInTests(unittest.TestCase):
@@ -214,11 +318,11 @@ class StdioOptInTests(unittest.TestCase):
     def test_tools_register_only_when_opted_in(self):
         plain = self.tool_names(False)
         extra = self.tool_names(True)
-        for n in ("reflect", "abfc_extensions", "warm_session"):
+        for n in ("reflect", "abfc_extensions", "catalog", "warm_session"):
             self.assertNotIn(n, plain)
             self.assertIn(n, extra)
         self.assertEqual(len(set(extra)), len(extra))
-        self.assertEqual(len(extra), len(plain) + 3)
+        self.assertEqual(len(extra), len(plain) + 4)
 
 
 class FakeWarmProc:
@@ -713,6 +817,15 @@ class LivePublishEditorSideTests(unittest.TestCase):
         self.assertEqual(names, ["/ModX/A", "/ModX/B"])
         self.assertEqual(out["reloaded_referencers"], ["/ModX/B"])
 
+    def test_forget_rescans_parent_folders_and_reports_what_is_still_listed(self):
+        u = self.u
+        reg = u.AssetRegistryHelpers.get_asset_registry.return_value
+        u.EditorAssetLibrary.does_asset_exist.side_effect = lambda path: path == "/ModX/Sub/B.B"
+        out = self.lp.forget({"root": "/ModX", "packages": ["/ModX/Sub/B", "/ModX/Sub/C", "/ModX/D"]})
+        reg.scan_paths_synchronous.assert_called_once_with(["/ModX", "/ModX/Sub"], True)
+        self.assertEqual(out["still_listed"], ["/ModX/Sub/B"])
+        self.assertEqual(out["forgotten"], ["/ModX/Sub/C", "/ModX/D"])
+
     def test_reload_assets_reloads_referencers_after_the_published(self):
         u = self.u
         u.find_object.side_effect = lambda outer, path: mock.MagicMock()
@@ -885,6 +998,11 @@ class BackendInfoCapabilityTests(unittest.TestCase):
 
     def test_fixed_capabilities(self):
         caps = self.capabilities(False)
+        self.assertIs(caps["gameplayTags"], True)
+        self.assertIs(caps["reflectDefaults"], True)
+        self.assertEqual(caps["assetOps"], ["rename", "delete", "reparent", "recreate"])
+        self.assertIs(caps["publishDeletes"], True)
+        self.assertIs(caps["liveTags"], True)
         self.assertIs(caps["compileErrorNodeRefs"], True)
         self.assertIs(caps["functionLocals"], False)
         self.assertIs(caps["userPureFunctions"], False)
@@ -975,7 +1093,7 @@ class ReflectRunOrderTests(unittest.TestCase):
             calls.append(("templates", what))
             return {}
 
-        def collect(get_tag, items):
+        def collect(get_tag, items, **kw):
             calls.append(("meta",))
             return {}
 
@@ -999,6 +1117,523 @@ class ReflectRunOrderTests(unittest.TestCase):
         self.assertNotIn(("meta",), calls)
         self.assertIn(("templates", "function"), calls)
         self.assertEqual((res["meta"], written["meta"]), ("skipped", "skipped"))
+
+
+def _name_batch(names):
+    """Serialized FNameEntry batch (ASCII names, or UTF-16 when the name has a non-latin-1 character); strings are packed."""
+    heads, body = b"", b""
+    for n in names:
+        try:
+            raw, wide = n.encode("latin-1"), False
+        except UnicodeEncodeError:
+            raw, wide = n.encode("utf-16-le"), True
+        length = len(raw) // 2 if wide else len(raw)
+        heads += bytes([(0x80 if wide else 0) | (length >> 8), length & 0xFF])
+        body += raw
+    import struct
+    return struct.pack("<II", len(names), len(body)) + struct.pack("<Q", 0xC1640000) + b"\0" * (8 * len(names)) + heads + body
+
+
+def _outer(i):
+    return 0xFFFFFFFFFFFFFFFF if i is None else i
+
+
+def _zen_package(names, exports, tail=b"\0" * 64):
+    """Zen package chunk: 52-byte summary, name batch, 20 unknown bytes, export map; `exports` = [(name index, number, outer export index)]."""
+    import struct
+    batch = _name_batch(names)
+    hashes_off = 52 + len(batch) + 20
+    export_off = hashes_off + 8
+    bundle_off = export_off + 72 * len(exports)
+    header_size = bundle_off + 16
+    summary = struct.pack("<II", 0, header_size) + struct.pack("<II", 0, 0) + struct.pack("<II", 0, header_size)
+    summary += struct.pack("<7i", hashes_off, hashes_off + 8, export_off, bundle_off, bundle_off, bundle_off + 8, bundle_off + 16)
+    assert len(summary) == 52
+    out = summary + batch + b"\0" * 20 + b"\0" * 8
+    for idx, num, outer in exports:
+        out += struct.pack("<QQIIQQQQQIB3x", 0, 0, idx, num, _outer(outer), 0, 0, 0, 0, 0, 0)
+    return out + b"\0" * 16 + tail
+
+
+def _write_container(paks, files, method=0, name="Test"):
+    """<paks>/<name>.utoc + <name>.ucas holding `files` ({'Dir/Asset': chunk bytes}) under <Project>/Content/ (uncompressed unless method != 0)."""
+    import struct
+    bs = 0x10000
+    ucas, blocks, entries = b"", [], []
+    for chunk in files.values():
+        start = len(blocks)
+        entries.append((start * bs, len(chunk)))
+        for off in range(0, len(chunk), bs):
+            part = chunk[off:off + bs]
+            blocks.append((len(ucas), len(part), method))
+            ucas += part
+    none = 0xFFFFFFFF
+    # directory index: root -> Proj -> Content -> Dir (every file lives in Dir)
+    strings = ["Proj", "Content", "Dir"] + [rel.split("/")[1] + ".uasset" for rel in files]
+    dirs = [(none, 1, none, none), (0, 2, none, none), (1, 3, none, none), (2, none, none, 0)]
+    flist = [(3 + i, i + 1 if i + 1 < len(files) else none, i) for i in range(len(files))]
+    dirblob = struct.pack("<i", 10) + b"../../../\0" + struct.pack("<I", len(dirs))
+    for dname, child, nxt, ff in dirs:
+        dirblob += struct.pack("<4I", dname, child, nxt, ff)
+    dirblob += struct.pack("<I", len(flist)) + b"".join(struct.pack("<3I", *f) for f in flist)
+    dirblob += struct.pack("<I", len(strings)) + b"".join(struct.pack("<i", len(s) + 1) + s.encode("latin-1") + b"\0" for s in strings)
+    count = len(files)
+    header = cookedpkg.TOC_MAGIC + bytes([6, 0, 0, 0]) + struct.pack("<IIIIIII", 144, count, len(blocks), 12, 0, 32, bs)
+    header += struct.pack("<II", len(dirblob), 1) + b"\0" * 8 + b"\0" * 16 + bytes([cookedpkg.FLAG_INDEXED]) + b"\0" * 3
+    header += struct.pack("<I", 0) + struct.pack("<Q", 0) + struct.pack("<I", 0)
+    header = header.ljust(144, b"\0")
+    toc = header + b"\0" * (12 * count)
+    toc += b"".join(o.to_bytes(5, "big") + n.to_bytes(5, "big") for o, n in entries)
+    for off, size, m in blocks:
+        toc += off.to_bytes(5, "little") + size.to_bytes(3, "little") + size.to_bytes(3, "little") + bytes([m])
+    toc += dirblob
+    Path(paks).mkdir(parents=True, exist_ok=True)
+    (Path(paks) / (name + ".utoc")).write_bytes(toc)
+    (Path(paks) / (name + ".ucas")).write_bytes(ucas)
+
+
+class CookedPkgTests(unittest.TestCase):
+    """editor/bpkit/cookedpkg.py on synthetic IoStore containers (uncompressed, unencrypted)."""
+
+    NAMES = ["BP_A_C", "Default__BP_A_C", "PlayerHUD", "NewVar", "Lbl", "WidgetTree", "Arms_GEN_VARIABLE", "Arms", "Elsewhere", "Zip_Template"]
+    EXPORTS = [(0, 0, None), (5, 0, 0), (4, 0, 1), (6, 0, 0), (3, 1, 0), (9, 0, 0)]
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="abfcooked"))
+        self.addCleanup(shutil.rmtree, str(self.tmp), True)
+        self.paks = self.tmp / "Proj" / "Content" / "Paks"
+
+    def index(self, method=0):
+        _write_container(self.paks, {"Dir/BP_A": _zen_package(self.NAMES, self.EXPORTS), "Dir/BP_B": _zen_package(["X"], [(0, 0, None)])},
+                         method)
+        return cookedpkg.CookedIndex(str(self.paks))
+
+    def test_index_maps_game_packages(self):
+        self.assertEqual(set(self.index().files), {"/Game/Dir/BP_A", "/Game/Dir/BP_B"})
+
+    def test_class_members_names_widgets_components(self):
+        got = self.index().class_members("/Game/Dir/BP_A.BP_A_C")
+        self.assertTrue({"PlayerHUD", "NewVar", "Elsewhere", "Lbl", "Arms", "Arms_GEN_VARIABLE"} <= got["names"])
+        self.assertIn("NewVar_0", got["names"])            # a numbered name: base + number 1
+        self.assertEqual(got["widgets"], {"Lbl"})          # export under the WidgetTree export
+        self.assertEqual(got["components"], {"Arms"})      # <Var>_GEN_VARIABLE export
+        self.assertEqual(got["timelines"], {"Zip"})        # <Var>_Template export (timeline template)
+        self.assertIn("Zip", got["names"])
+        self.assertTrue({"PlayerHUD", "NewVar"} <= got["base"] and "NewVar_0" not in got["base"])
+        self.assertEqual(self.index().class_member_candidates("/Game/Dir/BP_A.BP_A_C"), got["names"])
+
+    def test_unknown_package_or_class_is_none(self):
+        idx = self.index()
+        self.assertIsNone(idx.class_members("/Game/Dir/Missing.Missing_C"))
+        self.assertIsNone(idx.class_members("/Game/Dir/BP_A.Other_C"))
+        self.assertIsNone(idx.class_member_candidates("/Game/Dir/Missing.Missing_C"))
+
+    def test_package_paths_and_class_names_compare_case_insensitively(self):
+        idx = self.index()
+        self.assertIsNotNone(idx.package_header("/game/DIR/bp_a"))
+        self.assertIsNotNone(idx.class_members("/Game/dir/BP_A.bp_a_c"))
+        self.assertIsNone(idx.class_members("/Game/dir/nothing.bp_a_c"))
+
+    def test_numbered_names(self):
+        got = cookedpkg.numbered_names(["NewVar", "Timeline", "Old_3", "_5"], count=3)
+        self.assertEqual(got, {"NewVar_0", "NewVar_1", "NewVar_2", "Timeline_0", "Timeline_1", "Timeline_2", "_5_0", "_5_1", "_5_2"})
+        self.assertEqual(len(cookedpkg.numbered_names(["A"])), cookedpkg.NUMBER_PROBES)
+        self.assertEqual(cookedpkg.numbered_names([]), set())
+
+    def broken_containers(self):
+        """Test.utoc (good) plus containers that sort before it and cannot be used."""
+        import struct
+        _write_container(self.paks, {"Dir/BP_A": _zen_package(self.NAMES, self.EXPORTS)})
+        good = (self.paks / "Test.utoc").read_bytes()
+        ucas = (self.paks / "Test.ucas").read_bytes()
+
+        def make(name, data):
+            (self.paks / (name + ".utoc")).write_bytes(bytes(data))
+            (self.paks / (name + ".ucas")).write_bytes(ucas)
+
+        def mutated(pos, value):
+            d = bytearray(good)
+            d[pos:pos + len(value)] = value
+            return d
+        make("A1_signed", mutated(80, bytes([cookedpkg.FLAG_INDEXED | cookedpkg.FLAG_SIGNED])))
+        make("A2_oldversion", mutated(16, bytes([2])))
+        make("A3_partitions", mutated(52, struct.pack("<I", 2)))
+        make("A4_truncated", good[:150])
+        make("A5_dirbad", mutated(48, struct.pack("<I", 8)))              # directory index too small: parse error
+        make("A6_garbage", b"x" * 300)
+        make("A7_encrypted", mutated(80, bytes([cookedpkg.FLAG_INDEXED | cookedpkg.FLAG_ENCRYPTED])))
+        make("A8_global", mutated(80, bytes([0])))                         # not indexed
+        (self.paks / "A9_noucas.utoc").write_bytes(good)
+        (self.paks / "notes.txt").write_text("x")
+
+    def test_unusable_containers_are_skipped_and_listed(self):
+        self.broken_containers()
+        idx = cookedpkg.CookedIndex(str(self.paks))
+        self.assertEqual(set(idx.files), {"/Game/Dir/BP_A"})
+        self.assertEqual(len(idx.containers), 1)
+        skipped = dict(idx.skipped)
+        self.assertEqual(set(skipped), {"A1_signed.utoc", "A2_oldversion.utoc", "A3_partitions.utoc", "A4_truncated.utoc", "A5_dirbad.utoc",
+                                        "A6_garbage.utoc", "A7_encrypted.utoc", "A8_global.utoc", "A9_noucas.utoc"})
+        self.assertIn("signed", skipped["A1_signed.utoc"])
+        self.assertIn("version", skipped["A2_oldversion.utoc"])
+        self.assertIn("partitions", skipped["A3_partitions.utoc"])
+        self.assertIn("encrypted", skipped["A7_encrypted.utoc"])
+        self.assertEqual(skipped["A8_global.utoc"], cookedpkg.NOT_INDEXED)
+        self.assertEqual({n for n, _r in idx.rejected()}, set(skipped) - {"A8_global.utoc"})
+        self.assertIsNotNone(idx.class_members("/Game/Dir/BP_A.BP_A_C"))
+
+    def test_only_unusable_containers_is_a_format_error_with_reasons(self):
+        self.broken_containers()
+        for fn in ("Test.utoc", "Test.ucas"):
+            (self.paks / fn).unlink()
+        with self.assertRaises(cookedpkg.CookedFormatError) as cm:
+            cookedpkg.CookedIndex(str(self.paks))
+        self.assertIn("A1_signed.utoc: signed", str(cm.exception))
+
+    def test_compressed_block_is_a_format_error(self):
+        idx = self.index(method=1)
+        with self.assertRaises(cookedpkg.CookedFormatError):
+            idx.class_members("/Game/Dir/BP_A.BP_A_C")
+
+    def test_no_container_is_a_format_error(self):
+        self.paks.mkdir(parents=True)
+        with self.assertRaises(cookedpkg.CookedFormatError):
+            cookedpkg.CookedIndex(str(self.paks))
+
+    def test_name_batch_ascii_and_utf16(self):
+        names, end = cookedpkg.parse_name_batch(b"\1\2" + _name_batch(["Plain", "Grüße中", "x"]), 2)
+        self.assertEqual(names, ["Plain", "Grüße中", "x"])
+        self.assertEqual(cookedpkg.parse_name_batch(_name_batch([]), 0), ([], 4))
+
+    def test_name_batch_size_mismatch(self):
+        bad = bytearray(_name_batch(["Plain"]))
+        bad[4] += 1
+        with self.assertRaises(cookedpkg.CookedFormatError):
+            cookedpkg.parse_name_batch(bytes(bad), 0)
+
+    def test_mapped_name_numbers(self):
+        self.assertEqual(cookedpkg.mapped_name(["A", "B"], 1, 0), "B")
+        self.assertEqual(cookedpkg.mapped_name(["A", "B"], 1, 3), "B_2")
+        self.assertEqual(cookedpkg.mapped_name(["A"], 0x40000000, 0), "A")     # flag bits above the index are ignored
+        self.assertEqual(cookedpkg.mapped_name(["A"], 5, 0), "?")
+
+    def test_toc_rejects_foreign_files(self):
+        with self.assertRaises(cookedpkg.CookedFormatError):
+            cookedpkg.parse_toc(b"x" * 200)
+
+
+class MemberParseTests(unittest.TestCase):
+    """reflectparse member-discovery helpers."""
+
+    def test_member_name_ok(self):
+        ok, bad = reflectparse.member_name_ok, ["", None, "A.B", "A:B", "A/B", "A(B)", "A\tB", "A#", "A,B", 'A"B', "A=B", "A$"]
+        self.assertTrue(ok("PlayerHUDRef") and ok("NewVar_0") and ok("Has Space"))
+        self.assertFalse(any(ok(b) for b in bad))
+
+    def test_widget_tree_and_scs_names(self):
+        cls = "/Game/Fake/W_A.W_A_C"
+        paths = [cls + ":WidgetTree.Title", cls + ":WidgetTree.Nested.Deep", cls + ":WidgetTree.", cls + ":Arms_GEN_VARIABLE",
+                 cls + ":_GEN_VARIABLE", cls + ":X.Y_GEN_VARIABLE", "/Game/Fake/W_B.W_B_C:WidgetTree.Other", cls, cls + ":Plain"]
+        self.assertEqual(reflectparse.widget_tree_names(paths, cls), {"Title"})
+        self.assertEqual(reflectparse.scs_names(paths, cls), {"Arms"})
+        w, s = reflectparse.group_member_paths(paths)
+        self.assertEqual(w, {cls: {"Title"}, "/Game/Fake/W_B.W_B_C": {"Other"}})
+        self.assertEqual(s, {cls: {"Arms"}})
+
+    def test_member_pin(self):
+        def pin(name, **kw):
+            return dict({"name": name, "dir": "out", "category": "object", "container": "None", "hidden": False}, **kw)
+        pins = [pin("Hud", dir="in"), pin("HUD"), pin("Arr", container="Array"), pin("St", category="struct"), pin("Hid", hidden=True)]
+        self.assertEqual(reflectparse.member_pin(pins, "hud")["name"], "HUD")
+        for n in ("Arr", "St", "Hid", "Nope"):
+            self.assertIsNone(reflectparse.member_pin(pins, n))
+        self.assertIsNone(reflectparse.member_pin(None, "x"))
+
+    def test_member_candidates_priority_and_filtering(self):
+        got = reflectparse.member_candidates({"Btn", "Both"}, {"Both", "Arms"}, {"Both", "Plain", "btn", "Known", "Bad.Name", ""}, {"known"})
+        self.assertEqual(got, {"btn": ("Btn", "widget"), "both": ("Both", "widget"), "arms": ("Arms", "component"), "plain": ("Plain", "member")})
+
+    def test_has_property_and_probe(self):
+        props = {"A": 1, "B": None}
+
+        def get(n):
+            return props[n]
+        self.assertTrue(reflectparse.has_property(get, "B"))
+        self.assertFalse(reflectparse.has_property(get, "C"))
+        self.assertEqual(reflectparse.probe_property(get, "A"), (True, 1))
+        self.assertEqual(reflectparse.probe_property(get, "C"), (False, None))
+
+    def test_is_object_value(self):
+        self.assertTrue(reflectparse.is_object_value(None, dict) and reflectparse.is_object_value({}, dict))
+        self.assertFalse(reflectparse.is_object_value(3, dict))
+
+    def test_doc_property_names(self):
+        doc = ("**Editor Properties:** (see get_editor_property/set_editor_property)\n\n- ``mesh`` (SkeletalMeshComponent): [Read-Only] x\n"
+               "- ``root_component`` (SceneComponent): [Read-Write] y\n- ``mesh`` (SkeletalMeshComponent): dup\n\nnot a property ``x``")
+        self.assertEqual(reflectparse.doc_property_names(doc), ["mesh", "root_component"])
+        self.assertEqual(reflectparse.doc_property_names(None), [])
+        self.assertEqual(reflectparse.snake_to_pascal("character_movement"), "CharacterMovement")
+
+
+_OBJECT_PATH = "/Script/CoreUObject.Object"
+
+
+class FakeObj:
+    """Stand-in for unreal.Object in the member tests."""
+
+
+def _fake_cdo(doc, props):
+    def get(self, name):
+        return props[name]      # KeyError for a name the class does not have, like get_editor_property
+    return type("FakeCdo", (FakeObj,), {"__doc__": doc, "get_editor_property": get})()
+
+
+class ReflectMemberPassTests(unittest.TestCase):
+    """editor/bpkit/reflect.py member pass with a stubbed `unreal`."""
+
+    PATH = "/Game/A/BP_A.BP_A_C"
+
+    def setUp(self):
+        patcher = mock.patch.dict(sys.modules, {"unreal": mock.MagicMock()})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        from bpkit import reflect
+        self.reflect = reflect
+        self.tmp = Path(tempfile.mkdtemp(prefix="abfmember"))
+        self.addCleanup(shutil.rmtree, str(self.tmp), True)
+        self.cls = mock.MagicMock()
+        self.cls.get_path_name.return_value = self.PATH
+        self.cls.get_class.return_value.get_path_name.return_value = "/Script/Engine.BlueprintGeneratedClass"
+
+    def run_reflect(self, classes, cands=None, own=None, doc=None, array=("Btn",), supers=("/Script/Engine.Actor", _OBJECT_PATH), itype=None):
+        r = self.reflect
+        r.unreal.load_class.return_value = self.cls
+        seen = []
+
+        def templates(items, errors, what):
+            seen.append(what)
+            out = {}
+            if what == "property":
+                for k, (_c, body) in items.items():
+                    name = body[0].split('MemberName="')[1].rstrip('")')
+                    out[k] = [{"name": name, "dir": "out", "category": "object", "subCategory": "", "subCategoryObject": "/Script/UMG.TextBlock",
+                               "objectMeta": None, "container": "Array" if name in array else "None", "hidden": False, "default": None}]
+            return out
+
+        patches = [mock.patch.object(r, "_templates", side_effect=templates), mock.patch.object(r, "_function_index", return_value={}),
+                   mock.patch.object(r, "_ancestors", return_value=["/Script/Engine.Actor"]),
+                   mock.patch.object(r, "_supers", return_value=list(supers)),
+                   mock.patch.object(r.rp, "collect_function_meta", return_value={}),
+                   mock.patch.object(r, "_instanced_type", side_effect=itype or (lambda pin: "visual"))]
+        if cands is not None:
+            patches.append(mock.patch.object(r, "_member_candidates", side_effect=cands if isinstance(cands, Exception) else None,
+                                             return_value=None if isinstance(cands, Exception) else cands))
+        if own is not None:
+            patches.append(mock.patch.object(r, "_own_members", return_value=own))
+        if doc is not None:
+            patches.append(mock.patch.object(r, "_doc_members", return_value=doc))
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        res = r.run({"run": str(self.tmp), "classes": classes})
+        return res, json.loads((self.tmp / "reflect.json").read_text(encoding="utf-8")), seen
+
+    def test_blueprint_members_are_listed_with_kind(self):
+        cands = ({self.PATH: {"hud": ("HUD", "member"), "btn": ("Btn", "widget")}}, ["widgetTree", "scs", "cookedClass"])
+        res, written, seen = self.run_reflect([self.PATH], cands=cands, own=[("HUD", "member"), ("Btn", "widget")])
+        props = written["classes"][self.PATH]["properties"]
+        self.assertEqual([(x["name"], x.get("kind")) for x in props], [("HUD", "member")])      # the array-typed Btn is rejected
+        self.assertEqual(props[0]["pins"][0]["name"], "HUD")
+        self.assertEqual(written["memberSources"], ["widgetTree", "scs", "cookedClass"])
+        self.assertEqual(res["counts"]["members"], 1)
+        self.assertEqual(res["counts"]["properties"], 1)
+        self.assertEqual(seen.count("property"), 1)          # no extra template call
+
+    def test_members_known_to_class_defaults_are_not_repeated(self):
+        r = self.reflect
+        cands = ({self.PATH: {}}, ["cookedClass"])
+        defaults = [{"name": "HUD", "dir": "out", "category": "object", "subCategory": "", "subCategoryObject": "x", "objectMeta": None,
+                     "container": "None", "hidden": False, "default": None}]
+
+        def templates(items, errors, what):
+            if what == "class defaults":
+                return {k: defaults for k in items}
+            if what == "property":
+                return {k: [dict(defaults[0], name=b[0].split('MemberName="')[1].rstrip('")'))] for k, (_c, b) in items.items()}
+            return {}
+        with mock.patch.object(r, "_templates", side_effect=templates), mock.patch.object(r, "_function_index", return_value={}), \
+                mock.patch.object(r, "_ancestors", return_value=[]), mock.patch.object(r, "_supers", return_value=["/Script/Engine.Actor", _OBJECT_PATH]), \
+                mock.patch.object(r, "_member_candidates", return_value=cands), mock.patch.object(r, "_own_members", return_value=[("hud", "member"), ("Extra", "member")]), \
+                mock.patch.object(r.rp, "collect_function_meta", return_value={}), mock.patch.object(r, "_instanced_type", return_value="visual"):
+            r.unreal.load_class.return_value = self.cls
+            r.run({"run": str(self.tmp), "classes": [self.PATH]})
+        props = json.loads((self.tmp / "reflect.json").read_text(encoding="utf-8"))["classes"][self.PATH]["properties"]
+        self.assertEqual([(x["name"], x.get("kind")) for x in props], [("HUD", None), ("Extra", "member")])
+
+    def test_candidate_failure_is_one_error_and_properties_survive(self):
+        res, written, _ = self.run_reflect([self.PATH], cands=RuntimeError("boom"), own=[("HUD", "member")])
+        errs = [e for e in written["errors"] if "member discovery" in e]
+        self.assertEqual(len(errs), 1)
+        self.assertIn("boom", errs[0])
+        self.assertEqual(written["classes"][self.PATH]["properties"], [])
+        self.assertEqual((written["memberSources"], res["counts"]["members"]), ([], 0))
+
+    def test_unknown_parent_skips_the_class(self):
+        cands = ({self.PATH: {"hud": ("HUD", "member")}}, ["cookedClass"])
+        _res, written, _ = self.run_reflect([self.PATH], cands=cands, own=[("HUD", "member")], supers=())
+        self.assertEqual(written["classes"][self.PATH]["properties"], [])
+        self.assertTrue(any("parent class unknown" in e for e in written["errors"]))
+
+    def test_native_class_uses_python_doc_and_pin_type_decides_kind(self):
+        self.cls.get_path_name.return_value = "/Script/Engine.Character"
+        types = {"Mesh": "component", "Foo": "visual", "HlodLayer": None, "PreviewBackground": None, "Navigation": None}
+        res, written, _ = self.run_reflect(["/Script/Engine.Character"], doc=["Mesh", "Foo", "HlodLayer", "PreviewBackground", "Navigation"],
+                                           itype=lambda pin: types[pin["name"]])
+        props = written["classes"]["/Script/Engine.Character"]["properties"]
+        # native properties that are not a widget / component type (editor-only, not Blueprint-visible) are dropped
+        self.assertEqual([(x["name"], x["kind"]) for x in props], [("Mesh", "component"), ("Foo", "member")])
+        self.assertEqual(written["memberSources"], ["pythonDoc"])
+
+    def test_blueprint_members_of_other_types_are_dropped_and_timelines_are_components(self):
+        types = {"Hud": "visual", "Arms": "component", "Btn": "visual", "ZipTimeline": "timeline", "Other": None}
+        cands = ({self.PATH: {}}, ["cookedClass"])
+        own = [("Hud", "member"), ("Arms", "member"), ("Btn", "widget"), ("ZipTimeline", "member"), ("Other", "member")]
+        _res, written, _ = self.run_reflect([self.PATH], cands=cands, own=own, array=(), itype=lambda pin: types[pin["name"]])
+        props = written["classes"][self.PATH]["properties"]
+        self.assertEqual([(x["name"], x["kind"]) for x in props],
+                         [("Hud", "member"), ("Arms", "member"), ("Btn", "widget"), ("ZipTimeline", "component")])   # a component-typed variable stays writable
+
+    def test_instanced_type_by_base_class(self):
+        r = self.reflect
+        bases = {"/Script/Engine.TimelineComponent": "T", "/Script/Engine.ActorComponent": "C", "/Script/UMG.Visual": "V"}
+        subs = {"/Game/X/Tl.Tl_C": {"T", "C"}, "/Game/X/Cmp.Cmp_C": {"C"}, "/Game/X/W.W_C": {"V"}, "/Game/X/Plain.Plain_C": set()}
+
+        def load(_outer, path):
+            return bases.get(path) or (path if path in subs else None)
+
+        def child(sub, base):
+            return base in subs[sub]
+        with mock.patch.object(r.unreal, "load_class", side_effect=load), mock.patch.object(r.unreal.MathLibrary, "class_is_child_of", side_effect=child):
+            got = {p: r._instanced_type({"subCategoryObject": p}) for p in list(subs) + ["/Game/X/Missing.Missing_C"]}
+        self.assertEqual(got, {"/Game/X/Tl.Tl_C": "timeline", "/Game/X/Cmp.Cmp_C": "component", "/Game/X/W.W_C": "visual", "/Game/X/Plain.Plain_C": None,
+                               "/Game/X/Missing.Missing_C": None})
+
+    def test_no_game_class_means_empty_sources(self):
+        self.cls.get_path_name.return_value = "/Script/Engine.Actor"
+        _res, written, _ = self.run_reflect(["/Script/Engine.Actor"], doc=[])
+        self.assertEqual(written["memberSources"], ["pythonDoc"])
+        self.assertEqual(written["classes"]["/Script/Engine.Actor"]["properties"], [])
+
+    def test_own_members_keeps_declared_object_valued_members(self):
+        r = self.reflect
+        cdo = _fake_cdo("", {"HUD": None, "Btn": FakeObj(), "Count": 3, "Inherited": None})
+        parent = _fake_cdo("", {"Inherited": None})
+        cand = {"hud": ("HUD", "member"), "btn": ("Btn", "widget"), "count": ("Count", "member"), "inherited": ("Inherited", "member"),
+                "gone": ("Gone", "member")}
+        with mock.patch.object(r.unreal, "get_default_object", side_effect=lambda c: c), mock.patch.object(r.unreal, "Object", FakeObj):
+            self.assertEqual(r._own_members(cdo, cand, parent), [("HUD", "member"), ("Btn", "widget")])
+            self.assertEqual(len(r._own_members(cdo, cand, None)), 3)
+
+    def test_doc_members_minus_parent_doc_and_non_objects(self):
+        r = self.reflect
+        doc = "- ``mesh`` (SkeletalMeshComponent): x\n- ``health`` (float): y\n- ``base_obj`` (Object): z\n- ``capsule_component`` (CapsuleComponent): w\n"
+        cdo = _fake_cdo(doc, {"mesh": None, "health": 1.5, "base_obj": None, "capsule_component": FakeObj()})
+        parent = _fake_cdo("- ``base_obj`` (Object): z\n", {"base_obj": None})
+        with mock.patch.object(r.unreal, "get_default_object", side_effect=lambda c: c), mock.patch.object(r.unreal, "Object", FakeObj):
+            self.assertEqual(r._doc_members(cdo, parent), ["Mesh", "CapsuleComponent"])
+
+    def test_member_candidates_sources(self):
+        r = self.reflect
+        pn = self.PATH
+
+        class It:
+            def __init__(self, p):
+                self.p = p
+
+            def get_path_name(self):
+                return self.p
+        iters = {id(r.unreal.Widget): [It(pn + ":WidgetTree.Lbl"), It("/Game/Other.Other_C:WidgetTree.No")],
+                 id(r.unreal.ActorComponent): [It(pn + ":Arms_GEN_VARIABLE")]}
+
+        class Index:
+            def __init__(self, _paks):
+                pass
+
+            def rejected(self):
+                return []
+
+            def class_members(self, path):
+                return {"names": {"Foo", "Lbl", "Arms", "Zip", "NewVar"}, "base": {"Foo", "NewVar", "A.B"}, "widgets": set(), "components": set(),
+                        "timelines": {"Zip"}}
+        loaded = {pn: (self.cls, pn, "m")}
+        errors = []
+        with mock.patch.object(r.unreal, "ObjectIterator", side_effect=lambda c: iter(iters[id(c)])), \
+                mock.patch.object(r.cookedpkg, "CookedIndex", Index), mock.patch.object(r, "_paks_dir", return_value="x"):
+            cand, sources = r._member_candidates(loaded, [pn], errors)
+        got = cand[pn]
+        # timeline templates are components; numbered probes are added for the name-map entries (not for unusable names)
+        self.assertEqual({k: v for k, v in got.items() if not k.startswith(("foo_", "newvar_"))},
+                         {"lbl": ("Lbl", "widget"), "arms": ("Arms", "component"), "foo": ("Foo", "member"), "zip": ("Zip", "component"),
+                          "newvar": ("NewVar", "member")})
+        self.assertEqual(got["newvar_0"], ("NewVar_0", "member"))
+        self.assertEqual(got["foo_9"], ("Foo_9", "member"))
+        self.assertNotIn("newvar_10", got)
+        self.assertFalse(any(k.startswith("a.b") for k in got))
+        self.assertEqual((sources, errors), (["widgetTree", "scs", "cookedClass"], []))
+
+    def test_member_candidates_reports_skipped_containers(self):
+        r = self.reflect
+        pn = self.PATH
+
+        class Index:
+            def __init__(self, _paks):
+                pass
+
+            def rejected(self):
+                return [("mod.utoc", "signed container")]
+
+            def class_members(self, path):
+                return {"names": {"Foo"}, "base": {"Foo"}, "widgets": set(), "components": set(), "timelines": set()}
+        errors = []
+        with mock.patch.object(r.unreal, "ObjectIterator", side_effect=lambda c: iter([])), mock.patch.object(r.cookedpkg, "CookedIndex", Index), \
+                mock.patch.object(r, "_paks_dir", return_value="x"):
+            _cand, sources = r._member_candidates({pn: (self.cls, pn, "m")}, [pn], errors)
+        self.assertIn("cookedClass", sources)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("mod.utoc: signed container", errors[0])
+
+    def test_member_candidates_without_cooked_reader(self):
+        r = self.reflect
+        pn = self.PATH
+        loaded = {pn: (self.cls, pn, "m")}
+        errors = []
+        with mock.patch.object(r.unreal, "ObjectIterator", side_effect=lambda c: iter([])), \
+                mock.patch.object(r.cookedpkg, "CookedIndex", side_effect=OSError("no paks")), mock.patch.object(r, "_paks_dir", return_value="x"):
+            cand, sources = r._member_candidates(loaded, [pn], errors)
+        self.assertEqual((cand[pn], sources), ({}, ["widgetTree", "scs"]))
+        self.assertEqual(len(errors), 1)
+        self.assertIn("cooked package reader unavailable", errors[0])
+
+    def test_member_candidates_class_missing_from_cooked_content(self):
+        r = self.reflect
+        pn = self.PATH
+        loaded = {pn: (self.cls, pn, "m")}
+        errors = []
+
+        class Index:
+            def __init__(self, _paks):
+                pass
+
+            def rejected(self):
+                return []
+
+            def class_members(self, path):
+                return None
+        with mock.patch.object(r.unreal, "ObjectIterator", side_effect=lambda c: iter([])), mock.patch.object(r.cookedpkg, "CookedIndex", Index), \
+                mock.patch.object(r, "_paks_dir", return_value="x"):
+            _cand, sources = r._member_candidates(loaded, [pn], errors)
+        self.assertNotIn("cookedClass", sources)
+        self.assertTrue(any("not found in the cooked packages" in e for e in errors))
 
 
 NODE_T3D = (
@@ -1205,6 +1840,110 @@ class NodeRefTests(unittest.TestCase):
         finally:
             shutil.rmtree(str(run), ignore_errors=True)
             shutil.rmtree(str(stage_dir), ignore_errors=True)
+
+
+class ApplyTagsIniHostTests(unittest.TestCase):
+    """bp_apply with a class_manager_row gameplay_tag: the stage's tag ini is written before the commandlet runs and
+    restored when the apply fails."""
+    ROW = {"asset_path": "/Mod/Tables/Row_A", "class_path": "/Mod/X/BP_A.BP_A_C", "gameplay_tag": "ClassManager.EntityDirector.A"}
+
+    def run_apply(self, ok, old=None, asset_bytes=None, copy_patch=None):
+        import headless_tools
+        import tagsini
+        run = Path(tempfile.mkdtemp(prefix="abftagrun"))
+        stage_dir = Path(tempfile.mkdtemp(prefix="abftagstage"))
+        self.addCleanup(shutil.rmtree, str(run), True)
+        self.addCleanup(shutil.rmtree, str(stage_dir), True)
+        self.stage_dir = stage_dir
+        if asset_bytes is not None:
+            (stage_dir / "Content" / "X").mkdir(parents=True)
+            (stage_dir / "Content" / "X" / "BP_A.uasset").write_bytes(asset_bytes)
+        ini = tagsini.ini_path(stage_dir, "Mod")
+        if old is not None:
+            ini.parent.mkdir(parents=True)
+            ini.write_bytes(old)
+        log = run / "editor.log"
+        log.write_text("", encoding="utf-8")
+        seen = {}
+
+        def fake_run(stage_, job, timeout=300, prepare=None):
+            prepare(run)
+            seen["ini"] = ini.read_bytes() if ini.is_file() else None
+            return {"ok": ok, "run": str(run), "log": str(log), "seconds": 1.0, "error": None if ok else "boom",
+                    "result": {"assets": [], "rows": [], "saved": 0}}
+
+        tools = {t[0]: t[1] for t in headless_tools.build(lambda *a, **k: None, (RuntimeError,), lambda text, prefix=None: {"problems": []},
+                                                            ROOT / "editor", [], "", list_processes=lambda: [])}
+        stage = SimpleNamespace(dir=stage_dir, name="Mod")
+        with mock.patch.object(headless_tools.staging, "load", return_value=stage), \
+                mock.patch.object(headless_tools.staging, "strip_scratch"), \
+                mock.patch.object(headless, "run_commandlet", side_effect=fake_run), \
+                (copy_patch or __import__("contextlib").nullcontext()):
+            text, _ = tools["bp_apply"]({"mod": "Mod", "assets": [{"asset": "/Mod/X/BP_A", "class_manager_row": dict(self.ROW)}]})
+        return json.loads(text), seen, ini
+
+    def test_rollback_retries_a_sharing_violation(self):
+        import fscopy
+        real = fscopy.copy_file_retry
+        state = {"n": 0}
+
+        def flaky(src, dst, *a, **k):
+            return real(src, dst, delays=(0,), sleep=lambda s: None, copy=one_violation)
+
+        def one_violation(src, dst):
+            if "before" in Path(src).parts and state["n"] == 0:
+                state["n"] += 1
+                e = PermissionError(13, "in use")
+                e.winerror = 32
+                raise e
+            return shutil.copy2(src, dst)
+
+        old = b'[/Script/GameplayTags.GameplayTagsList]\r\nGameplayTagList=(Tag="Other.Tag",DevComment="")\r\n'
+        d, seen, ini = self.run_apply(False, old, asset_bytes=b"GOOD", copy_patch=mock.patch.object(fscopy, "copy_file_retry", side_effect=flaky))
+        self.assertIs(d["rolled_back"], True)
+        self.assertEqual(state["n"], 1)
+        self.assertEqual(ini.read_bytes(), old)
+
+    def test_rollback_failure_still_restores_the_ini(self):
+        import fscopy
+        calls = {"n": 0}
+        real = fscopy.copy_file_retry
+
+        def failing_on_rollback(src, dst, *a, **k):
+            calls["n"] += 1
+            if calls["n"] > 1:          # the first call is the snapshot
+                raise OSError("disk full (simulated)")
+            return real(src, dst, *a, **k)
+
+        old = b'[/Script/GameplayTags.GameplayTagsList]\r\nGameplayTagList=(Tag="Other.Tag",DevComment="")\r\n'
+        with self.assertRaises(OSError):
+            self.run_apply(False, old, asset_bytes=b"GOOD", copy_patch=mock.patch.object(fscopy, "copy_file_retry", side_effect=failing_on_rollback))
+        ini = __import__("tagsini").ini_path(self.stage_dir, "Mod")
+        self.assertEqual(ini.read_bytes(), old)
+
+    def test_tag_is_in_the_ini_before_the_run(self):
+        d, seen, ini = self.run_apply(True)
+        self.assertIn(b'GameplayTagList=(Tag="ClassManager.EntityDirector.A",DevComment="")', seen["ini"])
+        self.assertEqual(d["tags_added"], ["ClassManager.EntityDirector.A"])
+        self.assertTrue(ini.is_file())
+
+    def test_known_tag_adds_nothing(self):
+        old = b'[/Script/GameplayTags.GameplayTagsList]\r\nGameplayTagList=(Tag="ClassManager.EntityDirector.A",DevComment="")\r\n'
+        d, seen, ini = self.run_apply(True, old)
+        self.assertEqual(d["tags_added"], [])
+        self.assertEqual(ini.read_bytes(), old)
+
+    def test_failed_apply_restores_a_missing_ini(self):
+        d, seen, ini = self.run_apply(False)
+        self.assertIsNotNone(seen["ini"])
+        self.assertFalse(ini.exists())
+        self.assertEqual(d["tags_added"], [])
+
+    def test_failed_apply_restores_the_old_ini_bytes(self):
+        old = b'[/Script/GameplayTags.GameplayTagsList]\r\nGameplayTagList=(Tag="Other.Tag",DevComment="")\r\n'
+        d, seen, ini = self.run_apply(False, old)
+        self.assertNotEqual(seen["ini"], old)
+        self.assertEqual(ini.read_bytes(), old)
 
 
 REG_LOG = (
@@ -1441,9 +2180,19 @@ class ClassManagerRowSpecTests(unittest.TestCase):
         caps = BackendInfoCapabilityTests().capabilities(False)
         self.assertIs(caps["classManagerRows"], True)
 
-    def test_server_version_is_2_5_0(self):
+    def test_gameplay_tag_validation(self):
+        from bpkit import specs
+        import tagsini
+        self.assertEqual(specs.TAG_RX, tagsini.TAG_RX)
+        self.assertIn("class_manager_row_tag", specs.FEATURES)
+        for ok in ("ClassManager.EntityDirector.Test", "A", "A-b_c.D1"):
+            self.assertEqual(self.validate(dict(self.good(), gameplay_tag=ok)), [], ok)
+        for bad in ("", "a..b", "a b", "a/b", ".a", "a.", "x" * 201, 5, None, "a\"b"):
+            self.assertTrue(any("gameplay_tag" in p for p in self.validate(dict(self.good(), gameplay_tag=bad))), repr(bad))
+
+    def test_server_version_is_2_6_0(self):
         text = (ROOT / "server.py").read_text(encoding="utf-8")
-        self.assertIn('SERVER_VERSION = "2.5.0"', text)
+        self.assertIn('SERVER_VERSION = "2.6.0"', text)
 
 
 class ClassManagerRowEditorSideTests(unittest.TestCase):
@@ -1475,7 +2224,7 @@ class ClassManagerRowEditorSideTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
         import bpkit
         import importlib
-        for short in ("core", "rows"):
+        for short in ("core", "tags", "rows"):
             name = "bpkit." + short
             sys.modules.pop(name, None)
             if hasattr(bpkit, short):
@@ -1512,7 +2261,7 @@ class ClassManagerRowEditorSideTests(unittest.TestCase):
         made = self.FakeRowAsset(self.RowData())
         u.AssetToolsHelpers.get_asset_tools.return_value.create_asset.return_value = made
         res = self.rows.ensure_class_manager_row(self.ROW, self.CLS)
-        self.assertEqual(res, {"asset": self.ROW, "created": True, "changed": True})
+        self.assertEqual(res, {"asset": self.ROW, "created": True, "changed": True, "tag": None})
         self.assertEqual(made.props["row_name"], "EntityDirector_Test")
         self.assertEqual(made.props["row"].props["object_class"].get_path_name(), self.CLS)
         self.assertEqual(made.props["row"].props["release_group"], 0)
@@ -1526,7 +2275,7 @@ class ClassManagerRowEditorSideTests(unittest.TestCase):
         existing = self.FakeRowAsset(self.RowData(self.Cls(self.CLS)))
         u.load_asset.return_value = existing
         res = self.rows.ensure_class_manager_row(self.ROW, self.CLS)
-        self.assertEqual(res, {"asset": self.ROW, "created": False, "changed": False})
+        self.assertEqual(res, {"asset": self.ROW, "created": False, "changed": False, "tag": None})
         u.EditorAssetLibrary.save_loaded_asset.assert_not_called()
 
     def test_row_with_another_class_changes_only_the_class(self):
@@ -1537,10 +2286,63 @@ class ClassManagerRowEditorSideTests(unittest.TestCase):
         existing = self.FakeRowAsset(data)
         u.load_asset.return_value = existing
         res = self.rows.ensure_class_manager_row(self.ROW, self.CLS)
-        self.assertEqual(res, {"asset": self.ROW, "created": False, "changed": True})
+        self.assertEqual(res, {"asset": self.ROW, "created": False, "changed": True, "tag": None})
         self.assertEqual(existing.props["row"].props["object_class"].get_path_name(), self.CLS)
         self.assertEqual(existing.props["row"].props["release_group"], 3)
         u.EditorAssetLibrary.save_loaded_asset.assert_called_once()
+
+    TAG = "ClassManager.EntityDirector.Test"
+
+    class FakeTag:
+        """A GameplayTag struct: import_text sets the name, export_text reads it (the first strategy of tags.make_tag)."""
+        refuse = False
+
+        def __init__(self, name=""):
+            self.name = name
+
+        def import_text(self, text):
+            if not self.refuse:
+                self.name = text.split('"')[1]
+
+        def export_text(self):
+            return '(TagName="%s")' % (self.name or "None")
+
+    def tag_row(self, name=""):
+        data = self.RowData(self.Cls(self.CLS))
+        data.props["gameplay_tag"] = self.FakeTag(name)
+        return self.FakeRowAsset(data)
+
+    def test_tag_is_set_when_different_and_saved(self):
+        u = self.u
+        u.EditorAssetLibrary.does_asset_exist.return_value = True
+        u.GameplayTag = self.FakeTag
+        existing = self.tag_row("ClassManager.EntityDirector.Old")
+        u.load_asset.return_value = existing
+        res = self.rows.ensure_class_manager_row(self.ROW, self.CLS, self.TAG)
+        self.assertEqual(res, {"asset": self.ROW, "created": False, "changed": True, "tag": self.TAG})
+        self.assertEqual(existing.props["row"].props["gameplay_tag"].name, self.TAG)
+        u.EditorAssetLibrary.save_loaded_asset.assert_called_once()
+
+    def test_unchanged_tag_is_left_alone(self):
+        u = self.u
+        u.EditorAssetLibrary.does_asset_exist.return_value = True
+        u.GameplayTag = self.FakeTag
+        u.load_asset.return_value = self.tag_row(self.TAG)
+        res = self.rows.ensure_class_manager_row(self.ROW, self.CLS, self.TAG)
+        self.assertEqual(res, {"asset": self.ROW, "created": False, "changed": False, "tag": self.TAG})
+        u.EditorAssetLibrary.save_loaded_asset.assert_not_called()
+
+    def test_tag_that_cannot_be_verified_is_an_error_and_nothing_is_saved(self):
+        u = self.u
+        u.EditorAssetLibrary.does_asset_exist.return_value = True
+        u.GameplayTag = self.FakeTag
+        self.FakeTag.refuse = True
+        self.addCleanup(setattr, self.FakeTag, "refuse", False)
+        u.load_asset.return_value = self.tag_row("")
+        with self.assertRaises(RuntimeError) as cm:
+            self.rows.ensure_class_manager_row(self.ROW, self.CLS, self.TAG)
+        self.assertIn("cannot set gameplay tag", str(cm.exception))
+        u.EditorAssetLibrary.save_loaded_asset.assert_not_called()
 
     def test_game_paths_and_foreign_assets_are_refused(self):
         u = self.u
@@ -1564,6 +2366,253 @@ class ClassManagerRowEditorSideTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, str(tmp), True)
         for rel in ("editor/bpkit/rows.py", "editor/bpkit/jobs.py"):
             py_compile.compile(str(ROOT / rel), cfile=str(tmp / "x.pyc"), doraise=True)
+
+
+class RegisterTagsEditorSideTests(unittest.TestCase):
+    """editor/bpkit/livepublish.py register_tags against a fake `unreal` with the cooked 5.4 editor's shape: C++ property names on
+    the settings object, a GameplayTag struct that only exports a registered tag, classes found by path."""
+
+    class Row:
+        def __init__(self, tag=None):
+            self.tag = tag
+
+        def get_editor_property(self, key):
+            if key == "tag":
+                return self.tag
+            raise Exception("no property " + key)
+
+        def set_editor_property(self, key, value, notify_mode=None):
+            if key != "tag":
+                raise Exception("no property " + key)
+            self.tag = value
+
+    class Owner:
+        def __init__(self, class_name):
+            self.class_name = class_name
+
+        def get_class(self):
+            return self
+
+        def get_name(self):
+            return self.class_name
+
+    def setUp(self):
+        test = self
+        self.known = {"Known.Tag"}
+        self.refresh_adds, self.list_adds = set(), set()      # what each notified change makes the fake editor learn
+        self.sets = []                                         # (object name, key, value, notify) of every set_editor_property
+        Row = self.Row
+
+        class Mode:
+            ALWAYS, NEVER = "ALWAYS", "NEVER"
+
+        class Settings:
+            def __init__(self):
+                self.props = {"ImportTagsFromConfig": True, "GameplayTagList": [Row("Known.Tag")]}
+
+            def get_editor_property(self, key):
+                return self.props[key]
+
+            def set_editor_property(self, key, value, notify_mode=None):
+                test.sets.append(("settings", key, value, notify_mode))
+                self.props[key] = value
+                if notify_mode == "ALWAYS":
+                    if key == "ImportTagsFromConfig":
+                        test.known |= test.refresh_adds
+                    elif key == "GameplayTagList":
+                        test.known |= {r.tag for r in value if r.tag in test.list_adds}
+
+        class Source:
+            def __init__(self, name, outer, tags):
+                self.name, self.outer, self.props = name, outer, {"GameplayTagList": [Row(t) for t in tags]}
+
+            def get_name(self):
+                return self.name
+
+            def get_outer(self):
+                return self.outer
+
+            def get_editor_property(self, key):
+                return self.props[key]
+
+            def set_editor_property(self, key, value, notify_mode=None):
+                test.sets.append(("source", key, value, notify_mode))
+                self.props[key] = value
+
+        class Tag:
+            def import_text(self, text):
+                self.name = text.split('"')[1]
+
+            def export_text(self):
+                return '(TagName="%s")' % (self.name if self.name in test.known else "None")
+
+        self.settings = Settings()
+        self.source = Source("FakeTags.ini", self.Owner("GameplayTagsManager"), ["Known.Tag"])
+        other = Source("OtherTags.ini", self.Owner("GameplayTagsManager"), [])
+        stray = Source("FakeTags.ini", self.Owner("Package"), [])
+        u = types.ModuleType("unreal")
+        u.PropertyAccessChangeNotifyMode = Mode
+        u.GameplayTag = Tag
+        u.GameplayTagTableRow = Row
+        u.Name = str
+        u.find_object = lambda outer, path: self.settings if path == "/Script/GameplayTags.Default__GameplayTagsSettings" else None
+        u.load_class = lambda outer, path: "cls:" + path
+        u.ObjectIterator = lambda cls: iter([stray, other, self.source] if cls == "cls:/Script/GameplayTags.GameplayTagsList" else [])
+        patcher = mock.patch.dict(sys.modules, {"unreal": u})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        sys.modules.pop("bpkit.livepublish", None)
+        self.addCleanup(sys.modules.pop, "bpkit.livepublish", None)
+        import importlib
+        self.lp = importlib.import_module("bpkit.livepublish")
+
+    def run_register(self, tags):
+        return self.lp.register_tags({"mod": "Fake", "tags": tags})
+
+    def settings_sets(self):
+        return [x for x in self.sets if x[0] == "settings"]
+
+    def test_known_tags_change_nothing_on_the_settings(self):
+        out = self.run_register(["Known.Tag", "Known.Tag"])
+        self.assertEqual(out["wanted"], ["Known.Tag"])
+        self.assertEqual((out["registered"], out["unregistered"], out["strategy"], out["error"]), ([], [], None, None))
+        self.assertEqual(self.settings_sets(), [])
+
+    def test_refresh_strategy_reapplies_the_setting_with_notification(self):
+        self.refresh_adds = {"New.Tag"}
+        out = self.run_register(["Known.Tag", "New.Tag"])
+        self.assertEqual((out["registered"], out["unregistered"], out["strategy"], out["error"]), (["New.Tag"], [], "refresh", None))
+        self.assertEqual(self.settings_sets(), [("settings", "ImportTagsFromConfig", True, "ALWAYS")])
+
+    def test_settings_strategy_fills_the_list_and_puts_the_original_back_silently(self):
+        self.list_adds = {"New.Tag"}
+        original = self.settings.props["GameplayTagList"]
+        out = self.run_register(["New.Tag"])
+        self.assertEqual((out["registered"], out["unregistered"], out["strategy"], out["error"]), (["New.Tag"], [], "settings", None))
+        sets = self.settings_sets()
+        self.assertEqual([(x[1], x[3]) for x in sets],
+                         [("ImportTagsFromConfig", "ALWAYS"), ("GameplayTagList", "ALWAYS"), ("GameplayTagList", "NEVER")])
+        self.assertEqual([r.tag for r in sets[1][2]], ["Known.Tag", "New.Tag"])
+        self.assertEqual(sets[-1][2], original)
+        self.assertEqual(self.settings.props["GameplayTagList"], original)
+        self.assertIn("New.Tag", self.known)          # the tree keeps the tag after the list is back
+
+    def test_nothing_works_reports_every_missing_tag_and_restores_the_list(self):
+        original = self.settings.props["GameplayTagList"]
+        out = self.run_register(["Known.Tag", "A.One", "A.Two"])
+        self.assertEqual((out["registered"], out["unregistered"], out["strategy"]), ([], ["A.One", "A.Two"], None))
+        self.assertEqual(self.settings.props["GameplayTagList"], original)
+        last = self.settings_sets()[-1]
+        self.assertEqual((last[1], last[3]), ("GameplayTagList", "NEVER"))
+
+    def test_partly_registered_lists_only_the_rest(self):
+        self.refresh_adds = {"A.One"}
+        out = self.run_register(["A.One", "A.Two"])
+        self.assertEqual((out["registered"], out["unregistered"], out["strategy"]), (["A.One"], ["A.Two"], None))
+
+    def test_a_failing_refresh_falls_through_to_the_settings_list(self):
+        self.list_adds = {"New.Tag"}
+        real_set = self.settings.set_editor_property
+
+        def failing(key, value, notify_mode=None):
+            if key == "ImportTagsFromConfig":
+                raise RuntimeError("boom")
+            return real_set(key, value, notify_mode=notify_mode)
+        self.settings.set_editor_property = failing
+        out = self.run_register(["New.Tag"])
+        self.assertEqual((out["strategy"], out["unregistered"]), ("settings", []))
+        self.assertIn("refresh: boom", out["error"])
+
+    def test_missing_settings_object_is_an_error_not_an_exception(self):
+        self.settings = None
+        out = self.run_register(["New.Tag"])
+        self.assertEqual(out["unregistered"], ["New.Tag"])
+        self.assertIn("GameplayTagsSettings not found", out["error"])
+
+    def test_the_mods_source_object_gets_the_missing_file_tags_without_notification(self):
+        self.refresh_adds = {"New.Tag"}
+        out = self.run_register(["Known.Tag", "New.Tag"])
+        self.assertEqual(out["source_added"], ["New.Tag"])
+        src = [x for x in self.sets if x[0] == "source"]
+        self.assertEqual(len(src), 1)
+        self.assertEqual(src[0][1], "GameplayTagList")
+        self.assertEqual([r.tag for r in src[0][2]], ["Known.Tag", "New.Tag"])
+        self.assertEqual(src[0][3], "NEVER")
+
+    def test_no_source_patch_when_the_source_already_lists_the_tags(self):
+        out = self.run_register(["Known.Tag"])
+        self.assertEqual(out["source_added"], [])
+        self.assertEqual([x for x in self.sets if x[0] == "source"], [])
+
+
+class TagListingEditorSideTests(unittest.TestCase):
+    """editor/bpkit/tags.py list_tags against the shape the cooked 5.4 editor really has: no unreal.GameplayTagsList /
+    GameplayTagsSettings / GameplayTagsManager attributes, the classes load by path, properties use their C++ names."""
+
+    class Row:
+        def __init__(self, tag):
+            self.tag = tag
+
+        def get_editor_property(self, key):
+            if key == "tag":
+                return self.tag
+            raise Exception("no property " + key)
+
+    class Source:
+        def __init__(self, tags):
+            self.tags = tags
+
+        def get_editor_property(self, key):
+            if key == "GameplayTagList":      # snake_case "gameplay_tag_list" is not found in the cooked build
+                return [TagListingEditorSideTests.Row(t) for t in self.tags]
+            if key == "GameplayTagTableList":
+                return []
+            raise Exception("Failed to find property " + key)
+
+    def setUp(self):
+        u = types.ModuleType("unreal")
+        sources = [self.Source(["AI.Cinematic", "ClassManager.EntityDirector.Boxy"]), self.Source(["ClassManager.EntityDirector.TADA", "Tadadas"])]
+        u.load_class = lambda outer, path: "cls:" + path
+        u.ObjectIterator = lambda cls: iter(sources if cls == "cls:/Script/GameplayTags.GameplayTagsList" else [])
+        u.find_object = lambda outer, path: sources[0]
+        patcher = mock.patch.dict(sys.modules, {"unreal": u})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        import bpkit
+        sys.modules.pop("bpkit.tags", None)
+        if hasattr(bpkit, "tags"):
+            delattr(bpkit, "tags")
+        self.addCleanup(sys.modules.pop, "bpkit.tags", None)
+        import importlib
+        self.tags = importlib.import_module("bpkit.tags")
+
+    def test_lists_every_source_through_class_paths_and_cpp_property_names(self):
+        res = self.tags.list_tags()
+        self.assertEqual(res["tags"], ["AI.Cinematic", "ClassManager.EntityDirector.Boxy", "ClassManager.EntityDirector.TADA", "Tadadas"])
+        self.assertEqual(res["sources"]["tag_lists"], 4)
+        self.assertEqual(res["sources"]["table_settings"], 0)
+        self.assertTrue(str(res["sources"]["manager"]).startswith("error"))
+
+    def test_make_tag_error_names_the_registration_requirement(self):
+        class Unregistered:
+            def import_text(self, text):
+                return True        # the real editor returns True and leaves TagName empty for an unregistered tag
+
+            def export_text(self):
+                return '(TagName="")'
+
+            def set_editor_property(self, key, value):
+                raise Exception("read-only")
+
+        sys.modules["unreal"].GameplayTag = Unregistered
+        sys.modules["unreal"].Name = str
+        with self.assertRaises(RuntimeError) as cm:
+            self.tags.make_tag("ClassManager.EntityDirector.New")
+        self.assertIn("Config/Tags ini before the editor process starts", str(cm.exception))
+
+
+from tests.test_asset_ops import AssetOpsEditorSideTests, AssetOpsHostTests, AssetOpsSpecTests  # noqa: E402,F401  (bp_asset_ops tests)
+from tests.test_fscopy import CopyRetryTests, StageFileBusyTests  # noqa: E402,F401  (copy_file_retry and staged-file tests)
 
 
 if __name__ == "__main__":

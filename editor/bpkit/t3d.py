@@ -9,6 +9,8 @@ import uuid
 
 FLAGS_FN = 201457664              # default ExtraFlags of a function entry
 FLAGS_PURE = 0x10000000           # added for a pure function
+ACCESS_FLAGS = {"public": 0x00020000, "protected": 0x00080000, "private": 0x00040000}   # FUNC_Public / Protected / Private
+ACCESS_MASK = 0x000E0000
 FLAGS_DELEGATE = 335675392        # ExtraFlags of a dispatcher signature entry
 DISPATCHER_PROPERTY_FLAGS = 17592454479877
 SCHEMA_K2 = "/Script/CoreUObject.Class'/Script/BlueprintGraph.EdGraphSchema_K2'"
@@ -18,6 +20,9 @@ RESULT_CLASS = "/Script/BlueprintGraph.K2Node_FunctionResult"
 TUNNEL_CLASS = "/Script/BlueprintGraph.K2Node_Tunnel"
 SELF_CLASS = "/Script/BlueprintGraph.K2Node_Self"
 MACRO_CLASS = "/Script/BlueprintGraph.K2Node_MacroInstance"
+STD_MACROS_PACKAGE = "/Engine/EditorBlueprintResources/StandardMacros"
+STD_MACROS_ASSET = STD_MACROS_PACKAGE + ".StandardMacros"
+STD_MACROS = ("ForEachLoop", "ForEachLoopWithBreak", "ForLoop", "ForLoopWithBreak", "ReverseForEachLoop", "WhileLoop")
 
 
 class SpecError(ValueError):
@@ -26,6 +31,14 @@ class SpecError(ValueError):
 
 def gid():
     return uuid.uuid4().hex.upper()
+
+
+def std_macro_ref(name):
+    """MacroGraphReference line of an instance of an engine StandardMacros macro (the engine allocates the pins on import)."""
+    if name not in STD_MACROS:
+        raise SpecError("unknown standard macro %r (known: %s)" % (name, ", ".join(STD_MACROS)))
+    return ("MacroGraphReference=(MacroGraph=\"/Script/Engine.EdGraph'%s:%s'\",GraphBlueprint=\"/Script/Engine.Blueprint'%s'\")"
+            % (STD_MACROS_ASSET, name, STD_MACROS_ASSET))
 
 
 # ---- types ------------------------------------------------------------------
@@ -194,13 +207,31 @@ def user_pin(name, type_str, direction):
         name, _compact_type(parse_type(type_str)), _direction(direction))
 
 
+def escape_default(text):
+    """A variable default as the inside of a quoted T3D attribute (backslash, quote and control characters escaped)."""
+    if isinstance(text, bool):
+        text = "true" if text else "false"
+    return (str(text).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t"))
+
+
 def var_line(name, type_str, guid=None, default=None, flags=5):
     """Value of one `NewVariables(i)=` line."""
     s = '(VarName="%s",VarGuid=%s,VarType=(%s),FriendlyName="%s",PropertyFlags=%d' % (
         name, guid or gid(), _compact_type(parse_type(type_str)), name, flags)
     if default is not None:
-        s += ',DefaultValue="%s"' % default
+        s += ',DefaultValue="%s"' % escape_default(default)
     return s + ")"
+
+
+_DEFAULT_ATTR_RX = re.compile(r',DefaultValue="(?:[^"\\]|\\.)*"')
+
+
+def with_default(line, default):
+    """A `NewVariables` line value with its DefaultValue replaced by `default`, or dropped when `default` is None (guid and the rest kept)."""
+    s = _DEFAULT_ATTR_RX.sub("", line, count=1)
+    if default is None:
+        return s
+    return s[:-1] + ',DefaultValue="%s")' % escape_default(default)
 
 
 def dispatcher_var(name, guid=None):
@@ -430,6 +461,16 @@ class GraphNode:
         if p.container != (t["container"] or "None"):
             raise SpecError("pin_types: pin %r on %s is %s" % (pin, self.name, _CONTAINER_HINT.get(p.container, p.container)))
         p.set_type(t)
+
+    def set_resolved_wildcard(self, t):
+        """K2Node_MacroInstance.ResolvedWildcardType (the element type; never a container): a reconstruct keeps the pin types."""
+        line = "ResolvedWildcardType=(%s)" % _compact_type(dict(t, container=None, value=None))
+        self.head = [h for h in self.head if not h.startswith("ResolvedWildcardType=")]
+        for i, h in enumerate(self.head):
+            if h.startswith("NodeGuid="):
+                self.head.insert(i, line)
+                return
+        self.head.append(line)
 
     def fill_default_wildcards(self):
         """Type the wildcard pins whose type never depends on the wiring (bp_apply wires by text and the
@@ -675,6 +716,11 @@ def retarget(lines, class_text):
 
 def _fref(fn, parent):
     return 'FunctionReference=(%sMemberName="%s")' % ('MemberParent="%s",' % parent if parent else "", fn)
+
+
+def fn_flags(access=None):
+    """ExtraFlags of an own function entry for an access specifier (default public). KeyError on a bad value."""
+    return (FLAGS_FN & ~ACCESS_MASK) | ACCESS_FLAGS[access or "public"]
 
 
 def entry_node(fn, inputs, flags=FLAGS_FN, parent=None, editable=True, pos=(0, 0), exec_pin=True, name="K2Node_FunctionEntry_0"):

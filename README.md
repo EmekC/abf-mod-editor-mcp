@@ -50,7 +50,7 @@ The server uses remote execution first and the bridge second, opens a fresh conn
 | Mod data | `list_mods`, `list_mod_templates`, `find_assets`, `get_row`, `set_row` (plain values, Python expressions, or whole export text), `create_row_asset` (any of the 72 `*ModRowAsset` classes, optionally copied from a base-game row or another mod row), `delete_asset`, `save_assets`, `compile_blueprint`, `validate_assets` |
 | Base-game data | `get_game_row` — list or read any row the game exposes through its `<Kind>HandleFunctionLibrary` (gear_item, weapon_item, recipe, buff_debuff, npc, pet, trait, …) |
 | Blueprints | `paste_graph` (clipboard T3D → graph in one step), `inspect_blueprint` (parent, variables, graphs, every reference, errors, nodes and pins), `export_t3d`, `t3d_errors`, `blueprint_filter_check` |
-| Headless Blueprints | `staging_sync`, `staging_status`, `bp_apply` (create/edit Blueprints from a JSON spec), `bp_read`, `bp_compile_report`, `bp_game_test`, `hidden_editor_shot`, `mod_audit` (the editor's own upload audit), `bp_publish` — all in hidden processes on a staging copy, no mouse, keyboard or focus. See [Hidden Blueprint workflow](#hidden-blueprint-workflow) |
+| Headless Blueprints | `staging_sync`, `staging_status`, `bp_apply` (create/edit Blueprints from a JSON spec; `class_manager_row` with an optional `gameplay_tag`), `bp_asset_ops` (rename, delete, reparent, recreate on the staged copy), `bp_read`, `bp_compile_report`, `bp_game_test`, `hidden_editor_shot`, `mod_audit` (the editor's own upload audit), `bp_publish` — all in hidden processes on a staging copy, no mouse, keyboard or focus. See [Hidden Blueprint workflow](#hidden-blueprint-workflow) |
 | Window | `editor_windows`, `editor_screenshot` (one editor window, returned as an image, works in the background), `editor_click`, `editor_keys`, `close_editor_window` |
 | Map and play | `load_map`, `play_in_editor` start/stop, `pie_info` (players, pawns, locations, chosen pawn properties), `console_command` (editor or game world) |
 | Release | `check_upload` (offline pre-upload check), `read_editor_log` |
@@ -79,12 +79,17 @@ What it does not touch: your running editor (unless the mod is open there and yo
 
 ```
 staging_sync(mod_dir)        copy the mod (minus Saved, Intermediate, Binaries, DerivedDataCache, .git)
+staging_status(mod)          changed / added / removed / conflicts, and stale (untouched staged files that differ in the real mod)
 bp_apply(mod, assets)        create/edit Blueprints from a JSON spec (rolls back on compile errors)
+bp_asset_ops(mod, ops)       rename, delete, reparent or recreate staged Blueprints (all-or-nothing)
 bp_read / bp_compile_report  read the structure back, compile everything and list errors per asset
 bp_game_test(mod, steps)     run steps in a hidden game and assert on state
 mod_audit(mod)               the editor's own upload Asset Audit on the staged copy (the real gate)
 hidden_editor_shot(...)      screenshots of asset editors on the hidden desktop
-bp_publish(mod)              back up, then copy changed Content into the real mod (dry_run to preview)
+bp_publish(mod)              back up, then copy changed Content into the real mod (dry_run to preview;
+                             delete_removed also deletes the files that are gone from staging; an open
+                             editor first gets the mod's gameplay tags registered in memory)
+reflect(..., gameplay_tags)  with ABF_ABFC_TOOLS=1: also list the gameplay tags (see ABFC.md)
 ```
 
 `bp_read` gets components and variable defaults from the hidden process, because the Blueprint text export omits them. `components` rows are `name, class, parent, inherited, native, default_scene_root`, and they include the default root and inherited ones. `[]` means there are none (a class that is not an Actor); `null` with `components_status: "unavailable"` and `components_error` means they could not be read. `default` is a string; `default_status` is `ok`, `unavailable` (with `default_error`) or `not_applicable`; `defaults_status` summarises.
@@ -111,6 +116,7 @@ Logs can contain tokens: they stay in the run folders, which `.gitignore` covers
  "create":{"class":"Blueprint","parent":"/Script/Engine.Actor","if_missing":true},
  "variables":[{"name":"Score","type":"int","default":"10","flags":5}],
  "remove_variables":["Old"],
+ "variable_defaults":{"Score":"20","Armed":null},
  "components":[{"name":"Box","class":"/Script/Engine.BoxComponent","parent":"Mesh",
                 "properties":{"component_tags":["T"]},"expressions":{"box_extent":"unreal.Vector(11,22,33)"}}],
  "dispatchers":[{"name":"OnPing","params":[{"name":"Amount","type":"int"}]}],
@@ -157,6 +163,7 @@ Node kinds (`k`):
 | `message` | `function`, `interface` | `K2Node_Message` |
 | `self` | | `K2Node_Self` |
 | `macro` | `name`, `inputs`, `outputs` | `K2Node_MacroInstance` of a macro from the same batch |
+| `std_macro` | `name` | `K2Node_MacroInstance` of an engine StandardMacros macro (ForEachLoop, ForEachLoopWithBreak, ForLoop, ForLoopWithBreak, ReverseForEachLoop, WhileLoop); the pins come from the engine, `pin_types` types the wildcard pins and sets `ResolvedWildcardType` |
 | `node` | `class`, `props` | any node class, `props` are raw lines |
 
 How it works, briefly: Python cannot create nodes, so text is imported through a Map import into throwaway carrier objects, and the carrier's arrays are swapped into the real graph in process memory. Pins come from a throwaway scratch Blueprint (never saved) so the engine writes them. Offsets are discovered per build and the tools refuse rather than guess.

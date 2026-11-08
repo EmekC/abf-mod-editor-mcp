@@ -38,6 +38,7 @@ import headless  # noqa: E402
 import headless_tools  # noqa: E402
 import paths  # noqa: E402
 import staging  # noqa: E402
+import tagsini  # noqa: E402
 from bpkit import layout, specs, t3d  # noqa: E402
 from bpkit.t3d import GraphModel, GraphNode, SpecError  # noqa: E402
 
@@ -390,6 +391,31 @@ class T3dTests(unittest.TestCase):
         self.assertIn('PinType.PinSubCategoryObject="/Script/UMG.WidgetBlueprintGeneratedClass\'/TestModXyz34/Example/WBP_Example.WBP_Example_C\'"', txt)
         self.assertIn("PinType.ContainerType=None", txt)
 
+    def test_std_macro_ref(self):
+        ref = t3d.std_macro_ref("ForEachLoop")
+        self.assertIn("StandardMacros.StandardMacros:ForEachLoop'", ref)
+        self.assertIn("GraphBlueprint=\"/Script/Engine.Blueprint'/Engine/EditorBlueprintResources/StandardMacros.StandardMacros'\"", ref)
+        with self.assertRaises(SpecError):
+            t3d.std_macro_ref("NoSuchLoop")
+
+    def test_set_resolved_wildcard(self):
+        n = GraphNode(t3d.MACRO_CLASS, "K2Node_MacroInstance_0", [t3d.std_macro_ref("ForEachLoop"), "NodeGuid=ABC", "NodePosX=0"], [])
+        n.set_resolved_wildcard(t3d.parse_type("object:/Script/Engine.Actor"))
+        lines = [h for h in n.head if h.startswith("ResolvedWildcardType=")]
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].startswith('ResolvedWildcardType=(PinCategory="object",PinSubCategoryObject='))
+        self.assertLess(n.head.index(lines[0]), n.head.index("NodeGuid=ABC"))
+        n.set_resolved_wildcard(t3d.parse_type("int"))
+        lines = [h for h in n.head if h.startswith("ResolvedWildcardType=")]
+        self.assertEqual(lines, ['ResolvedWildcardType=(PinCategory="int")'])
+        n.set_resolved_wildcard(t3d.parse_type("array:object:/Script/Engine.Actor"))
+        lines = [h for h in n.head if h.startswith("ResolvedWildcardType=")]
+        self.assertEqual(len(lines), 1)
+        self.assertNotIn("ContainerType", lines[0])
+        bare = GraphNode(t3d.MACRO_CLASS, "K2Node_MacroInstance_1", ["X=1"], [])
+        bare.set_resolved_wildcard(t3d.parse_type("int"))
+        self.assertEqual(bare.head[-1], 'ResolvedWildcardType=(PinCategory="int")')
+
     def test_resolve_wildcard_refusals(self):
         n = GraphNode.from_template(_CALLARRAY, "K2Node_CallArrayFunction_9001", [WILD_TA, WILD_ONE, INT_PIN], (0, 0))
         with self.assertRaises(SpecError) as cm:
@@ -467,6 +493,18 @@ class T3dTests(unittest.TestCase):
         with self.assertRaises(SpecError):
             t3d.animation_text({"name": "F", "tracks": [{"widget": "Nope"}]}, {"Txt": "x"})
 
+    def test_fn_flags(self):
+        self.assertEqual(t3d.fn_flags("public"), 201457664)
+        self.assertEqual(t3d.fn_flags("private"), 201588736)
+        self.assertEqual(t3d.fn_flags("protected"), 201850880)
+        self.assertEqual(t3d.fn_flags(None), 201457664)
+        with self.assertRaises(KeyError):
+            t3d.fn_flags("secret")
+
+    def test_entry_node_access_flags(self):
+        e = t3d.entry_node("F", [], flags=t3d.fn_flags("private"))
+        self.assertIn("ExtraFlags=201588736", e.head)
+
     def test_function_nodes(self):
         e = t3d.entry_node("F", [{"name": "A", "type": "int"}], flags=t3d.FLAGS_FN | t3d.FLAGS_PURE, exec_pin=False)
         self.assertEqual([p.name for p in e.pins], ["A"])
@@ -541,6 +579,26 @@ class SpecTests(unittest.TestCase):
     def test_valid_sample_passes(self):
         self.assertEqual(specs.validate(self.GOOD, "Mod"), [])
 
+    def test_function_access_valid(self):
+        self.assertEqual(self.problems(lambda a: a["functions"][0].update(access="private")), [])
+
+    def test_function_access_invalid(self):
+        problems = self.problems(lambda a: a["functions"][0].update(access="secret"))
+        self.assertTrue(any("access must be public, protected or private" in p for p in problems), problems)
+
+    def test_function_duplicate_names(self):
+        problems = self.problems(lambda a: a["functions"].append({"name": "AddScore"}))
+        self.assertTrue(any("function AddScore is listed twice" in p for p in problems), problems)
+
+    def test_function_replace_in_one_spec(self):
+        self.assertEqual(self.problems(lambda a: a.update(remove_functions=["AddScore"])), [])
+
+    def test_interface_function_access_refused(self):
+        def mutate(a):
+            a["interfaces"] = [{"class": "/Mod/BPI_X.BPI_X_C", "functions": [{"name": "Ping", "access": "private"}]}]
+        problems = self.problems(mutate)
+        self.assertTrue(any("access is not allowed on an interface function" in p for p in problems), problems)
+
     def test_event_meta_prop_text_and_escaping(self):
         text = t3d.function_meta_prop({"tooltip": 'Say "hi"\nsecond \\ line\r', "category": "My Cat", "keywords": "a b"}, "Go")
         key = lambda field: hashlib.md5(("Go:" + field).encode("utf-8")).hexdigest().upper()
@@ -568,6 +626,50 @@ class SpecTests(unittest.TestCase):
         self.assertEqual(plain, ['CustomFunctionName="Go"'])
         cls, empty = specs.NODE_KINDS["event"]({"id": "x", "k": "event", "name": "Go", "meta": {"tooltip": ""}}, env)
         self.assertEqual(empty, ['CustomFunctionName="Go"'])
+
+    def test_variable_defaults_text_and_validation(self):
+        self.assertIn("variable_defaults", specs.FEATURES)
+        # a default is escaped inside the quoted attribute
+        v = t3d.var_line("Label", "string", guid="G", default='say "hi"\\n')
+        self.assertIn('DefaultValue="say \\"hi\\"\\\\n"', v)
+        line = t3d.var_line("Speed", "real", guid="G", default="2.5")
+        # replacing keeps guid, type and the other attributes; dropping removes the attribute only
+        r = t3d.with_default(line, "4.000000")
+        self.assertIn("VarGuid=G", r)
+        self.assertIn('DefaultValue="4.000000"', r)
+        self.assertNotIn("2.5", r)
+        self.assertEqual(r.count("DefaultValue"), 1)
+        dropped = t3d.with_default(line, None)
+        self.assertNotIn("DefaultValue", dropped)
+        self.assertTrue(dropped.endswith(")"))
+        # a line without a default gains one; a default followed by more attributes keeps them
+        bare = t3d.var_line("Armed", "bool", guid="G")
+        self.assertIn('DefaultValue="true"', t3d.with_default(bare, "true"))
+        mid = line[:-1] + ',RepNotifyFunc="OnRep")'
+        self.assertIn('RepNotifyFunc="OnRep"', t3d.with_default(mid, "9"))
+        self.assertEqual(t3d.with_default(mid, "9").count("DefaultValue"), 1)
+        # an escaped quote inside the old default does not end the match early
+        tricky = t3d.var_line("S", "string", guid="G", default='a"b')
+        self.assertEqual(t3d.with_default(tricky, "c"), t3d.var_line("S", "string", guid="G", default="c"))
+
+        def vd(value):
+            def m(a):
+                a["variable_defaults"] = value
+            return m
+        self.assertEqual(self.problems(vd({"Speed": "4.0", "Old": None})), [])
+        self.assertTrue(any("variable_defaults must be an object" in p for p in self.problems(vd(["Speed"]))))
+        self.assertTrue(any("variable_defaults[Speed] must be a string or null" in p for p in self.problems(vd({"Speed": 4}))))
+
+        def bad_default(a):
+            a["variables"] = [{"name": "N", "type": "int", "default": ["x"]}]
+        self.assertTrue(any("default must be a string" in p for p in self.problems(bad_default)))
+
+        # numbers and bools are still accepted (older callers), written as Unreal's text
+        for value, text in ((3, "3"), (2.5, "2.5"), (True, "true"), (False, "false")):
+            def num_default(a, value=value):
+                a["variables"] = [{"name": "N", "type": "int", "default": value}]
+            self.assertEqual(self.problems(num_default), [], value)
+            self.assertIn('DefaultValue="%s"' % text, t3d.var_line("N", "int", guid="G", default=value))
 
     def test_event_meta_validation(self):
         def event(meta):
@@ -603,6 +705,16 @@ class SpecTests(unittest.TestCase):
             a["graphs"][0]["add"].append({"id": "sf", "k": "self", "pin_types": {"X": "int"}})
         self.assertTrue(any("not offered" in p for p in self.problems(on_self)))
         self.assertEqual(self.problems(lambda a: a["variables"].append({"name": "M", "type": "map:name:int"})), [])
+
+    def test_std_macro_validation(self):
+        def add(extra):
+            def m(a):
+                a["graphs"][0]["add"].append(dict({"id": "fe", "k": "std_macro"}, **extra))
+            return m
+        self.assertEqual(self.problems(add({"name": "ForEachLoop", "pin_types": {"Array": "array:int", "Array Element": "int"}})), [])
+        self.assertEqual(self.problems(add({"name": "ForLoop"})), [])
+        self.assertTrue(any("unknown standard macro" in p for p in self.problems(add({"name": "Nope"}))))
+        self.assertTrue(any("needs 'name'" in p for p in self.problems(add({}))))
 
     def test_game_refused(self):
         self.assertTrue(any("/Game" in p for p in self.problems(lambda a: a.update(asset="/Game/Maps/X"))))
@@ -698,7 +810,14 @@ class SpecTests(unittest.TestCase):
         self.assertEqual(specs.NODE_KINDS["self"]({}, env), (None, None))
         self.assertEqual(sorted(specs.NODE_KINDS), sorted(["call", "get", "set", "event", "override", "branch", "sequence", "cast", "spawn",
                                                            "create_widget", "call_dispatcher", "bind_dispatcher", "timeline", "message",
-                                                           "self", "macro", "node"]))
+                                                           "self", "macro", "std_macro", "node"]))
+        cls, body = specs.NODE_KINDS["std_macro"]({"id": "x", "k": "std_macro", "name": "ForEachLoop"}, env)
+        self.assertEqual(cls, t3d.MACRO_CLASS)
+        self.assertEqual(len(body), 1)
+        self.assertIn("StandardMacros:ForEachLoop'", body[0])
+        self.assertIn("GraphBlueprint=", body[0])
+        with self.assertRaises(SpecError):
+            specs.NODE_KINDS["std_macro"]({"id": "x", "k": "std_macro", "name": "Nope"}, env)
 
 
 # ---------------------------------------------------------------- headless
@@ -794,12 +913,15 @@ class HeadlessTests(unittest.TestCase):
 class FakeEditor:
     def __init__(self, state="closed", refused=None, real=None, missing=None, on_prepare=None, prepare_raises=None, detail="",
                  kept_loaded=None, reload_error=None, dirty_after=None, reason="modified assets", referencers=None,
-                 refused_referencers=None, compile_errors=None, skipped_dirty=None, dirty_published=None):
+                 refused_referencers=None, compile_errors=None, skipped_dirty=None, dirty_published=None,
+                 forget_error=None, still_listed=None, tag_result=None):
+        self.tag_result, self.tags_seen = tag_result, []
         self.st, self.refused, self.calls, self.real, self.missing = state, refused, [], real, missing
         self.on_prepare, self.prepare_raises, self.detail = on_prepare, prepare_raises, detail
         self.kept_loaded, self.reload_error, self.dirty_after, self.reason = kept_loaded, reload_error, dirty_after, reason
         self.referencers, self.refused_referencers, self.compile_errors = referencers, refused_referencers, compile_errors
         self.skipped_dirty, self.dirty_published = skipped_dirty, dirty_published
+        self.forget_error, self.still_listed, self.forgotten, self.prepared = forget_error, still_listed, [], []
         self.seen = {}
         self.also_seen = []
 
@@ -807,8 +929,23 @@ class FakeEditor:
         self.calls.append("state")
         return self.st
 
+    def register_tags(self, tags):
+        self.calls.append("register_tags")
+        self.tags_seen.append(list(tags))
+        if isinstance(self.tag_result, Exception):
+            raise self.tag_result
+        return self.tag_result or {"registered": [], "unregistered": [], "strategy": None}
+
+    def forget(self, packages):
+        self.calls.append("forget")
+        self.forgotten.append(list(packages))
+        if self.forget_error:
+            raise RuntimeError(self.forget_error)
+        return {"forgotten": [], "still_listed": list(self.still_listed or [])}
+
     def prepare(self, packages):
         self.calls.append("prepare")
+        self.prepared.append(list(packages))
         if self.prepare_raises:
             raise self.prepare_raises
         if self.on_prepare:
@@ -912,6 +1049,52 @@ class StagingTests(unittest.TestCase):
         staging.strip_tooling(self.stage)
         self.assertFalse((self.stage.dir / "Content" / "_McpTest").exists())
 
+    def test_untouched_stage_file_saved_in_the_real_mod_is_stale_not_a_conflict(self):
+        (self.real / "Content" / "A.uasset").write_bytes(b"saved in the Mod Editor")
+        (self.real / "Content" / "Sub" / "B.uasset").unlink()
+        d = staging.diff(self.stage)
+        self.assertEqual(d["stale"], ["Content/A.uasset", "Content/Sub/B.uasset"])
+        self.assertEqual(d["conflicts"], [])
+        self.assertEqual(d["changed"], [])
+        # a staged edit of the same file is a conflict, not stale
+        self.stage_write("Content/A.uasset", b"staged edit")
+        d = staging.diff(self.stage)
+        self.assertEqual(d["stale"], ["Content/Sub/B.uasset"])
+        self.assertEqual([c["path"] for c in d["conflicts"]], ["Content/A.uasset"])
+
+    def test_nothing_stale_when_the_real_mod_is_unchanged(self):
+        self.assertEqual(staging.diff(self.stage)["stale"], [])
+
+    def test_stale_hashes_only_real_files_written_since_the_sync(self):
+        hashed = []
+        real_sha = staging._sha
+
+        def counting(p):
+            hashed.append(Path(p))
+            return real_sha(p)
+
+        sync_ts = staging.time.mktime(staging.time.strptime(self.stage.meta()["synced_at"], "%Y-%m-%dT%H:%M:%S"))
+        a, b = self.real / "Content" / "A.uasset", self.real / "Content" / "Sub" / "B.uasset"
+        for p in (a, b):
+            os.utime(p, (sync_ts - 100, sync_ts - 100))
+
+        def real_hashes():
+            return [h for h in hashed if self.real in h.parents]
+        with mock.patch.object(staging, "_sha", counting):
+            self.assertEqual(staging.diff(self.stage)["stale"], [])
+            self.assertEqual(real_hashes(), [])                      # old mtime, same size: not hashed
+            # same size, new content, mtime after the sync: hashed and stale
+            a.write_bytes(bytes(len(a.read_bytes())))
+            os.utime(a, (sync_ts + 100, sync_ts + 100))
+            self.assertEqual(staging.diff(self.stage)["stale"], ["Content/A.uasset"])
+            self.assertEqual(real_hashes(), [a])
+            # a different size is stale without a hash, whatever the mtime
+            hashed.clear()
+            b.write_bytes(b.read_bytes() + b"more")
+            os.utime(b, (sync_ts - 100, sync_ts - 100))
+            self.assertEqual(staging.diff(self.stage)["stale"], ["Content/A.uasset", "Content/Sub/B.uasset"])
+            self.assertEqual(real_hashes(), [a])
+
     def test_conflict_refuses(self):
         self.stage_write("Content/A.uasset", b"staged edit")
         (self.real / "Content" / "A.uasset").write_bytes(b"someone else")
@@ -972,6 +1155,77 @@ class StagingTests(unittest.TestCase):
         self.assertEqual(ed.seen["at_prepare"], b"A-original" * 50)
         self.assertEqual(ed.seen["at_reload"], b"edited")
         self.assertEqual(r["route"], "live-reload")
+
+    def write_real_tag_ini(self, tags=("ClassManager.EntityDirector.One", "ClassManager.EntityDirector.Two")):
+        ini = self.real / "Config" / "Tags" / "FakeTags.ini"
+        ini.parent.mkdir(parents=True, exist_ok=True)
+        ini.write_text("[/Script/GameplayTags.GameplayTagsList]\n" + "".join(
+            'GameplayTagList=(Tag="%s",DevComment="")\n' % t for t in tags), encoding="utf-8")
+        return list(tags)
+
+    def test_live_publish_registers_the_mod_tags_before_the_reload(self):
+        tags = self.write_real_tag_ini()
+        self.stage_write("Content/A.uasset", b"edited")
+        ed = FakeEditor("open", real=self.real, tag_result={"registered": [tags[1]], "unregistered": [], "strategy": "refresh"})
+        r = staging.publish(self.stage, ed, self.gate_ok)
+        self.assertEqual(ed.calls, ["state", "prepare", "register_tags", "reload"])
+        self.assertEqual(ed.tags_seen, [tags])
+        self.assertEqual(r["tags_registered"], [tags[1]])
+        self.assertEqual(r["tags_unregistered"], [])
+        self.assertEqual(r["tags_strategy"], "refresh")
+        self.assertIsNone(r["tags_error"])
+        self.assertIn("Registered gameplay tags in the open editor: %s." % tags[1], r["message"])
+
+    def test_live_publish_reports_tags_the_editor_could_not_register(self):
+        tags = self.write_real_tag_ini()
+        self.stage_write("Content/A.uasset", b"edited")
+        ed = FakeEditor("open", real=self.real, tag_result={"registered": [], "unregistered": [tags[0]], "strategy": None, "error": "refresh: x"})
+        r = staging.publish(self.stage, ed, self.gate_ok)
+        self.assertEqual(r["route"], "live-reload")
+        self.assertEqual(r["tags_unregistered"], [tags[0]])
+        self.assertEqual(r["tags_error"], "refresh: x")
+        self.assertIn("does not know these gameplay tags", r["message"])
+
+    def test_tag_registration_failure_does_not_fail_the_publish(self):
+        tags = self.write_real_tag_ini()
+        self.stage_write("Content/A.uasset", b"edited")
+        ed = FakeEditor("open", real=self.real, tag_result=RuntimeError("bridge down"))
+        r = staging.publish(self.stage, ed, self.gate_ok)
+        self.assertEqual(ed.calls, ["state", "prepare", "register_tags", "reload"])
+        self.assertEqual(r["route"], "live-reload")
+        self.assertEqual(r["published"], ["Content/A.uasset"])
+        self.assertEqual(r["tags_error"], "bridge down")
+        self.assertEqual(r["tags_unregistered"], tags)
+        self.assertEqual((self.real / "Content" / "A.uasset").read_bytes(), b"edited")
+
+    def test_unreadable_tag_ini_does_not_fail_the_publish(self):
+        self.write_real_tag_ini()
+        self.stage_write("Content/A.uasset", b"edited")
+        ed = FakeEditor("open", real=self.real)
+        with mock.patch.object(tagsini, "read_tags", side_effect=PermissionError("sharing violation")):
+            r = staging.publish(self.stage, ed, self.gate_ok)
+        self.assertEqual(ed.calls, ["state", "prepare", "reload"])
+        self.assertEqual(r["route"], "live-reload")
+        self.assertEqual(r["published"], ["Content/A.uasset"])
+        self.assertEqual(r["tags_error"], "sharing violation")
+        self.assertEqual((self.real / "Content" / "A.uasset").read_bytes(), b"edited")
+
+    def test_closed_editor_registers_no_tags(self):
+        self.write_real_tag_ini()
+        self.stage_write("Content/A.uasset", b"edited")
+        ed = FakeEditor("closed")
+        r = staging.publish(self.stage, ed, self.gate_ok)
+        self.assertNotIn("register_tags", ed.calls)
+        self.assertEqual(r["tags_registered"], [])
+        self.assertEqual(r["tags_unregistered"], [])
+        self.assertIsNone(r["tags_strategy"])
+
+    def test_open_editor_without_a_tag_ini_registers_no_tags(self):
+        self.stage_write("Content/A.uasset", b"edited")
+        ed = FakeEditor("open", real=self.real)
+        r = staging.publish(self.stage, ed, self.gate_ok)
+        self.assertNotIn("register_tags", ed.calls)
+        self.assertEqual(r["tags_registered"], [])
 
     def test_reload_failure_restores(self):
         self.stage_write("Content/A.uasset", b"edited")
@@ -1132,6 +1386,113 @@ class StagingTests(unittest.TestCase):
         self.assertTrue((self.real / "Content" / "Sub" / "B.uasset").is_file())
         self.assertIn("yourself", r["message"])
 
+    def remove_staged(self, rel):
+        (self.stage.dir / rel).unlink()
+
+    def test_delete_removed_closed_editor_backs_up_and_drops_baseline(self):
+        self.remove_staged("Content/Sub/B.uasset")
+        ed = FakeEditor("closed")
+        r = staging.publish(self.stage, ed, self.gate_ok, now="20260101-000010", delete_removed=True)
+        self.assertEqual(r["deleted"], ["Content/Sub/B.uasset"])
+        self.assertEqual(r["published"], [])
+        self.assertEqual(r["route"], "file-copy")
+        self.assertEqual(r["removed_in_staging"], [])
+        self.assertFalse((self.real / "Content" / "Sub" / "B.uasset").exists())
+        self.assertIn("Deleted 1 file(s)", r["message"])
+        self.assertNotIn("Nothing to publish", r["message"])
+        self.assertNotIn("yourself", r["message"])
+        backup = Path(r["backup"])
+        self.assertEqual((backup / "Content" / "Sub" / "B.uasset").read_bytes(), b"B-original" * 50)
+        man = json.loads((backup / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(man["deleted"], ["Content/Sub/B.uasset"])
+        self.assertEqual(man["files"][0]["sha256"], hashlib.sha256(b"B-original" * 50).hexdigest())
+        self.assertNotIn("Content/Sub/B.uasset", self.stage.meta()["baseline"])
+        d = staging.diff(self.stage)
+        self.assertEqual((d["changed"], d["added"], d["removed"], d["conflicts"]), ([], [], [], []))
+        self.assertEqual(ed.calls, ["state"])
+
+    def test_delete_removed_with_a_copy_and_the_assets_filter(self):
+        self.remove_staged("Content/Sub/B.uasset")
+        self.remove_staged("Content/A.uasset")
+        self.stage_write("Content/New.uasset", b"new")
+        r = staging.publish(self.stage, FakeEditor("closed"), self.gate_ok, assets=["/Fake/Sub/B", "/Fake/New"], delete_removed=True)
+        self.assertEqual((r["published"], r["deleted"]), (["Content/New.uasset"], ["Content/Sub/B.uasset"]))
+        self.assertTrue((self.real / "Content" / "A.uasset").is_file())      # not requested: kept, and still reported
+        self.assertFalse((self.real / "Content" / "Sub" / "B.uasset").exists())
+        self.assertEqual(staging.diff(self.stage)["removed"], ["Content/A.uasset"])
+
+    def test_delete_removed_conflicts_when_the_real_file_changed(self):
+        self.remove_staged("Content/Sub/B.uasset")
+        (self.real / "Content" / "Sub" / "B.uasset").write_bytes(b"someone else")
+        before = tree_bytes(self.real)
+        ed = FakeEditor("closed")
+        r = staging.publish(self.stage, ed, self.gate_ok, delete_removed=True)
+        self.assertEqual(r["refused"], "conflicts")
+        self.assertEqual(tree_bytes(self.real), before)
+        self.assertEqual(ed.calls, [])
+        self.assertIn("Content/Sub/B.uasset", r["error"])
+
+    def test_delete_removed_dry_run_changes_nothing(self):
+        self.remove_staged("Content/Sub/B.uasset")
+        before = tree_bytes(self.real)
+        r = staging.publish(self.stage, FakeEditor("closed"), self.gate_ok, dry_run=True, delete_removed=True)
+        self.assertEqual(r["would_delete"], ["Content/Sub/B.uasset"])
+        self.assertEqual(tree_bytes(self.real), before)
+
+    def test_delete_removed_live_prepares_reloads_then_forgets(self):
+        self.remove_staged("Content/Sub/B.uasset")
+        self.stage_write("Content/A.uasset", b"edited")
+        ed = FakeEditor("open", real=self.real, still_listed=["/Fake/Sub/B"])
+        r = staging.publish(self.stage, ed, self.gate_ok)
+        self.assertEqual(ed.calls, ["state", "prepare", "reload"])           # without the flag: old behaviour
+        self.assertIn("yourself", r["message"])
+        self.assertTrue((self.real / "Content" / "Sub" / "B.uasset").is_file())
+        self.stage_write("Content/A.uasset", b"edited again")
+        ed = FakeEditor("open", real=self.real, still_listed=["/Fake/Sub/B"])
+        r = staging.publish(self.stage, ed, self.gate_ok, delete_removed=True)
+        self.assertEqual(ed.calls, ["state", "prepare", "reload", "forget"])
+        self.assertEqual(sorted(ed.prepared[0]), ["/Fake/A", "/Fake/Sub/B"])
+        self.assertEqual(ed.forgotten, [["/Fake/Sub/B"]])
+        self.assertFalse((self.real / "Content" / "Sub" / "B.uasset").exists())
+        self.assertEqual(r["route"], "live-reload")
+        self.assertIn("still lists", r["message"])
+
+    def test_delete_removed_failing_reload_restores_the_deleted_file(self):
+        self.remove_staged("Content/Sub/B.uasset")
+        self.stage_write("Content/A.uasset", b"edited")
+        ed = FakeEditor("open", real=self.real, missing=["/Fake/A"])
+        r = staging.publish(self.stage, ed, self.gate_ok, delete_removed=True)
+        self.assertEqual(r["refused"], "reload failed")
+        self.assertTrue(r["restored"])
+        self.assertEqual((self.real / "Content" / "Sub" / "B.uasset").read_bytes(), b"B-original" * 50)
+        self.assertEqual((self.real / "Content" / "A.uasset").read_bytes(), b"A-original" * 50)
+        self.assertIn("Content/Sub/B.uasset", self.stage.meta()["baseline"])
+
+    def test_delete_removed_failing_forget_restores_the_deleted_file(self):
+        self.remove_staged("Content/Sub/B.uasset")
+        ed = FakeEditor("open", real=self.real, forget_error="scan failed")
+        r = staging.publish(self.stage, ed, self.gate_ok, delete_removed=True)
+        self.assertEqual(r["refused"], "reload failed")
+        self.assertTrue(r["restored"])
+        self.assertEqual((self.real / "Content" / "Sub" / "B.uasset").read_bytes(), b"B-original" * 50)
+        self.assertIn("Content/Sub/B.uasset", self.stage.meta()["baseline"])
+
+    def test_delete_removed_failing_delete_restores_everything(self):
+        self.remove_staged("Content/Sub/B.uasset")
+        self.stage_write("Content/A.uasset", b"edited")
+        before = tree_bytes(self.real)
+        real_unlink = Path.unlink
+        real_dir = self.real
+
+        def failing_unlink(path, *a, **kw):
+            if path == real_dir / "Content" / "Sub" / "B.uasset":
+                raise OSError("denied")
+            return real_unlink(path, *a, **kw)
+        with mock.patch.object(Path, "unlink", failing_unlink):
+            r = staging.publish(self.stage, FakeEditor("closed"), self.gate_ok, delete_removed=True)
+        self.assertEqual(r["refused"], "copy failed")
+        self.assertEqual(tree_bytes(self.real), before)
+
     def test_assets_filter_and_dry_run(self):
         self.stage_write("Content/A.uasset", b"edited")
         self.stage_write("Content/Sub/B.uasset", b"edited B")
@@ -1263,11 +1624,195 @@ class StagingTests(unittest.TestCase):
         self.assertIn("staging_sync", str(cm.exception))
 
 
+TAGS_REL = "Config/Tags/FakeTags.ini"
+TAGS_HEAD = "[/Script/GameplayTags.GameplayTagsList]"
+
+
+class TagsIniTests(unittest.TestCase):
+    def setUp(self):
+        self.work = Path(tempfile.mkdtemp(prefix="abftags"))
+        self.ini = self.work / "Config" / "Tags" / "FakeTags.ini"
+
+    def tearDown(self):
+        shutil.rmtree(self.work, ignore_errors=True)
+
+    def test_missing_file_reads_empty(self):
+        self.assertEqual(tagsini.read_tags(self.ini), [])
+
+    def test_utf16_file_is_refused_clearly(self):
+        self.ini.parent.mkdir(parents=True)
+        self.ini.write_bytes(TAGS_HEAD.encode("utf-16"))      # BOM + UTF-16LE, as Unreal saves non-ASCII ini files
+        with self.assertRaisesRegex(ValueError, "UTF-16"):
+            tagsini.read_tags(self.ini)
+        with self.assertRaisesRegex(ValueError, "UTF-16"):
+            tagsini.ensure_tags(self.ini, ["ClassManager.EntityDirector.One"])
+
+    def test_files_for_ignores_name_case(self):
+        import staging
+        from types import SimpleNamespace
+        (self.work / "Content" / "X").mkdir(parents=True)
+        (self.work / "Content" / "X" / "BP_Thing.uasset").write_bytes(b"1")
+        stage = SimpleNamespace(dir=self.work)
+        self.assertEqual(staging.files_for(stage, "Content/X/bp_thing"), ["Content/X/BP_Thing.uasset"])
+        self.assertEqual(staging.files_for(stage, "Content/X/Other"), [])
+
+    def test_creates_folder_file_and_header(self):
+        added = tagsini.ensure_tags(self.ini, ["ClassManager.EntityDirector.One", "ClassManager.EntityDirector.Two"])
+        self.assertEqual(added, ["ClassManager.EntityDirector.One", "ClassManager.EntityDirector.Two"])
+        text = self.ini.read_bytes().decode("utf-8")
+        self.assertTrue(text.startswith(TAGS_HEAD + "\r\n"))
+        self.assertIn('GameplayTagList=(Tag="ClassManager.EntityDirector.One",DevComment="")\r\n', text)
+        self.assertEqual(tagsini.read_tags(self.ini), ["ClassManager.EntityDirector.One", "ClassManager.EntityDirector.Two"])
+
+    def test_crlf_kept_and_trailing_blank_line(self):
+        self.ini.parent.mkdir(parents=True)
+        old = TAGS_HEAD + '\r\nGameplayTagList=(Tag="ClassManager.EntityDirector.TADA",DevComment="")\r\n\r\n'
+        self.ini.write_bytes(old.encode("utf-8"))
+        added = tagsini.ensure_tags(self.ini, ["ClassManager.EntityDirector.New"])
+        self.assertEqual(added, ["ClassManager.EntityDirector.New"])
+        self.assertEqual(self.ini.read_bytes().decode("utf-8"),
+                         TAGS_HEAD + '\r\nGameplayTagList=(Tag="ClassManager.EntityDirector.TADA",DevComment="")\r\n'
+                         'GameplayTagList=(Tag="ClassManager.EntityDirector.New",DevComment="")\r\n\r\n')
+
+    def test_lf_file_stays_lf_and_no_trailing_newline_stays(self):
+        self.ini.parent.mkdir(parents=True)
+        self.ini.write_bytes((TAGS_HEAD + '\nGameplayTagList=(Tag="A.B",DevComment="")').encode("utf-8"))
+        tagsini.ensure_tags(self.ini, ["A.C"])
+        raw = self.ini.read_bytes().decode("utf-8")
+        self.assertNotIn("\r", raw)
+        self.assertFalse(raw.endswith("\n"))
+        self.assertEqual(tagsini.read_tags(self.ini), ["A.B", "A.C"])
+
+    def test_dedupe_is_case_insensitive_and_idempotent(self):
+        tagsini.ensure_tags(self.ini, ["Foo.Bar"])
+        before = self.ini.read_bytes()
+        self.assertEqual(tagsini.ensure_tags(self.ini, ["foo.bar", "FOO.BAR"]), [])
+        self.assertEqual(self.ini.read_bytes(), before)
+        self.assertEqual(tagsini.ensure_tags(self.ini, ["Foo.Baz", "foo.baz"]), ["Foo.Baz"])
+
+    def test_invalid_tag_raises_and_writes_nothing(self):
+        for bad in ("", "a..b", "a b", ".a", "a.", 'a"b', "a/b", "x" * 201, None, 5):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                tagsini.ensure_tags(self.ini, ["Good.Tag", bad])
+        self.assertFalse(self.ini.exists())
+
+    def test_new_tags_go_into_the_tag_section_before_later_sections(self):
+        self.ini.parent.mkdir(parents=True)
+        self.ini.write_bytes((TAGS_HEAD + '\nGameplayTagList=(Tag="A.B",DevComment="")\n[Other]\nKey=1\n').encode("utf-8"))
+        tagsini.ensure_tags(self.ini, ["A.C"])
+        self.assertEqual(self.ini.read_bytes().decode("utf-8"),
+                         TAGS_HEAD + '\nGameplayTagList=(Tag="A.B",DevComment="")\nGameplayTagList=(Tag="A.C",DevComment="")\n[Other]\nKey=1\n')
+
+
+class StagingConfigTrackingTests(unittest.TestCase):
+    def setUp(self):
+        self.work = Path(tempfile.mkdtemp(prefix="abffake"))
+        self.real = make_fake_mod(self.work)
+        (self.real / "Config" / "Tags").mkdir(parents=True)
+        self.real_ini = self.real / TAGS_REL
+        self.real_ini.write_bytes((TAGS_HEAD + '\r\nGameplayTagList=(Tag="A.B",DevComment="")\r\n').encode("utf-8"))
+        shutil.rmtree(staging.root() / "stages", ignore_errors=True)
+        self.stage = staging.sync(self.real)
+        self.gate_ok = lambda packages: []
+
+    def tearDown(self):
+        shutil.rmtree(self.work, ignore_errors=True)
+
+    def test_sync_baseline_holds_the_tag_ini(self):
+        self.assertIn(TAGS_REL, self.stage.meta()["baseline"])
+        d = staging.diff(self.stage)
+        self.assertEqual((d["changed"], d["added"], d["removed"], d["conflicts"]), ([], [], [], []))
+
+    def test_ini_change_is_listed_and_published_with_backup(self):
+        tagsini.ensure_tags(self.stage.dir / TAGS_REL, ["A.C"])
+        d = staging.diff(self.stage)
+        self.assertEqual(d["changed"], [TAGS_REL])
+        r = staging.publish(self.stage, FakeEditor("closed"), self.gate_ok, now="20260101-000000")
+        self.assertEqual(r["published"], [TAGS_REL])
+        self.assertEqual(r["route"], "file-copy")
+        self.assertEqual(tagsini.read_tags(self.real_ini), ["A.B", "A.C"])
+        backup = Path(r["backup"])
+        self.assertEqual(tagsini.read_tags(backup / TAGS_REL), ["A.B"])
+        self.assertEqual(staging.diff(self.stage)["changed"], [])
+
+    def test_ini_publish_can_be_requested_as_an_asset_path(self):
+        tagsini.ensure_tags(self.stage.dir / TAGS_REL, ["A.C"])
+        (self.stage.dir / "Content" / "A.uasset").write_bytes(b"edited")
+        r = staging.publish(self.stage, FakeEditor("closed"), self.gate_ok, assets=[TAGS_REL], now="20260101-000001")
+        self.assertEqual(r["published"], [TAGS_REL])
+        self.assertEqual((self.real / "Content" / "A.uasset").read_bytes(), b"A-original" * 50)
+
+    def test_new_ini_in_a_mod_without_one_is_added(self):
+        self.real_ini.unlink()
+        stage = staging.sync(self.real, discard_changes=True)
+        tagsini.ensure_tags(stage.dir / TAGS_REL, ["X.Y"])
+        d = staging.diff(stage)
+        self.assertEqual(d["added"], [TAGS_REL])
+        r = staging.publish(stage, FakeEditor("closed"), self.gate_ok, now="20260101-000002")
+        self.assertEqual(r["published"], [TAGS_REL])
+        self.assertEqual(tagsini.read_tags(self.real_ini), ["X.Y"])
+
+    def test_real_ini_changed_since_sync_is_a_conflict(self):
+        tagsini.ensure_tags(self.stage.dir / TAGS_REL, ["A.C"])
+        tagsini.ensure_tags(self.real_ini, ["Elsewhere.Tag"])
+        r = staging.publish(self.stage, FakeEditor("closed"), self.gate_ok)
+        self.assertEqual(r["refused"], "conflicts")
+
+    def test_old_baseline_is_upgraded_not_reported_as_added(self):
+        meta = self.stage.meta()
+        del meta["baseline"][TAGS_REL]
+        del meta["tracked_config"]
+        self.stage.save_meta(meta)
+        d = staging.diff(self.stage)
+        self.assertEqual((d["changed"], d["added"], d["removed"], d["conflicts"]), ([], [], [], []))
+        self.assertIn(TAGS_REL, self.stage.meta()["baseline"])
+        self.assertTrue(self.stage.meta()["tracked_config"])
+
+    def test_old_baseline_with_a_stage_edit_is_changed(self):
+        meta = self.stage.meta()
+        del meta["baseline"][TAGS_REL]
+        del meta["tracked_config"]
+        self.stage.save_meta(meta)
+        tagsini.ensure_tags(self.stage.dir / TAGS_REL, ["A.C"])
+        d = staging.diff(self.stage)
+        self.assertEqual((d["changed"], d["added"]), ([TAGS_REL], []))
+        r = staging.publish(self.stage, FakeEditor("closed"), self.gate_ok, now="20260101-000003")
+        self.assertEqual(r["published"], [TAGS_REL])
+        self.assertEqual(tagsini.read_tags(self.real_ini), ["A.B", "A.C"])
+        self.assertTrue(self.stage.meta()["tracked_config"])
+
+
 # ---------------------------------------------------------------- headless_tools helpers
 
 class LiveEditorTests(unittest.TestCase):
     def make(self, procs, run_json):
         return headless_tools.LiveEditor(run_json, (RuntimeError,), "STATUS", "Fake", None, procs)
+
+    def test_forget_sends_the_deleted_packages_to_livepublish(self):
+        sent = []
+
+        def run_json(code, args, timeout=None):
+            sent.append((code, args))
+            return {"forgotten": ["/Fake/Sub/B"], "still_listed": []}
+        ed = self.make(lambda: [], run_json)
+        out = ed.forget(["/Fake/Sub/B"])
+        self.assertEqual(out["still_listed"], [])
+        self.assertEqual(sent[0][1], {"root": "/Fake", "packages": ["/Fake/Sub/B"]})
+        self.assertTrue(sent[0][0].rstrip().endswith("return forget(args)"))
+        self.assertIn("def forget(args)", sent[0][0])
+
+    def test_register_tags_sends_the_mod_and_the_tags_to_livepublish(self):
+        sent = []
+
+        def run_json(code, args, timeout=None):
+            sent.append((code, args))
+            return {"registered": ["A.B"], "unregistered": [], "strategy": "refresh"}
+        ed = self.make(lambda: [], run_json)
+        out = ed.register_tags(("A.B", "A.C"))
+        self.assertEqual(out["strategy"], "refresh")
+        self.assertEqual(sent[0][1], {"mod": "Fake", "tags": ["A.B", "A.C"]})
+        self.assertTrue(sent[0][0].rstrip().endswith("return register_tags(args)"))
+        self.assertIn("def register_tags(args)", sent[0][0])
 
     def test_compile_errors_are_read_from_the_log_written_since_the_reload(self):
         tmp = Path(tempfile.mkdtemp(prefix="abflog"))
@@ -2012,6 +2557,9 @@ class SelfEventCallTests(unittest.TestCase):
     def test_feature_is_advertised(self):
         self.assertIn("self_event_calls", specs.FEATURES)
 
+    def test_function_graphs_feature_is_advertised(self):
+        self.assertIn("function_graphs", specs.FEATURES)
+
 
 class BpReadToolTests(unittest.TestCase):
     def test_bp_read_after_crash_in_live_read(self):
@@ -2061,20 +2609,36 @@ class SafetyTests(unittest.TestCase):
         out += sorted((ROOT / "editor" / "bpkit").glob("*.py"))
         return out
 
+    # editor/bpkit/assetops.py is the one module behind bp_asset_ops (staged copy only, host validated and snapshotted)
+    ASSET_OPS_FILE = "assetops.py"
+
     def test_no_input_automation_or_deletes(self):
         for f in self.files():
             text = f.read_text(encoding="utf-8")
             for token in self.FORBIDDEN:
+                if f.name == self.ASSET_OPS_FILE and token == "delete_asset":
+                    continue
                 self.assertNotIn(token, text, "%s contains %s" % (f.name, token))
 
-    def test_reparent_only_in_scratch_helper(self):
+    def test_deleting_only_in_asset_ops(self):
+        lines = (ROOT / "editor" / "bpkit" / self.ASSET_OPS_FILE).read_text(encoding="utf-8").splitlines()
+        seen = 0
+        for i, l in enumerate(lines):
+            if "delete_asset" in l and not l.lstrip().startswith(("#", '"""')):
+                seen += 1
+                start = max(j for j in range(i + 1) if lines[j].startswith("def "))
+                self.assertTrue(lines[start].startswith(("def rename", "def delete")), (i, lines[start]))
+        self.assertGreater(seen, 0)
+
+    def test_reparent_only_in_scratch_helper_and_asset_ops(self):
         for f in self.files():
             lines = f.read_text(encoding="utf-8").splitlines()
             for i, l in enumerate(lines):
                 if "reparent_blueprint" in l:
-                    self.assertEqual(f.name, "graphs.py")
+                    self.assertIn(f.name, ("graphs.py", self.ASSET_OPS_FILE))
                     start = max(j for j in range(i + 1) if lines[j].startswith("def "))
-                    self.assertTrue(lines[start].startswith("def _rebuild_scratch_pins"), (f.name, i))
+                    want = "def _rebuild_scratch_pins" if f.name == "graphs.py" else "def reparent"
+                    self.assertTrue(lines[start].startswith(want), (f.name, i))
 
     def test_cursor_patch_guard(self):
         text = (ROOT / "editor" / "bpkit" / "cursorpatch.py").read_text(encoding="utf-8")
@@ -2099,11 +2663,11 @@ class StdioSmokeTests(unittest.TestCase):
         p = subprocess.run([sys.executable, "-I", str(ROOT / "server.py")], input="\n".join(json.dumps(r) for r in reqs) + "\n",
                            capture_output=True, text=True, env=env, timeout=60, cwd=str(ROOT))
         replies = {json.loads(l)["id"]: json.loads(l) for l in p.stdout.splitlines() if l.strip()}
-        self.assertEqual(replies[1]["result"]["serverInfo"]["version"], "2.5.0")
+        self.assertEqual(replies[1]["result"]["serverInfo"]["version"], "2.6.0")
         names = [t["name"] for t in replies[2]["result"]["tools"]]
-        self.assertEqual(len(names), 43)
+        self.assertEqual(len(names), 44)
         for n in ("staging_sync", "staging_status", "bp_apply", "bp_read", "bp_compile_report", "bp_game_test",
-                  "hidden_editor_shot", "mod_audit", "bp_publish", "backend_info"):
+                  "hidden_editor_shot", "mod_audit", "bp_publish", "bp_asset_ops", "backend_info"):
             self.assertIn(n, names)
         bi = replies[4]["result"]
         self.assertFalse(bi.get("isError"))

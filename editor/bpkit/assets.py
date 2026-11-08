@@ -42,8 +42,9 @@ def _var_name(v):
     return m.group(1) if m else None
 
 
-def set_vars(bp, add_lines, remove=()):
-    """Rewrite NewVariables from the export: drop `remove`, append `add_lines`. Duplicate names raise."""
+def set_vars(bp, add_lines, remove=(), defaults=None):
+    """Rewrite NewVariables from the export: drop `remove`, append `add_lines`. Duplicate names raise.
+    `defaults` ({name: text or None}) replaces (None drops) the DefaultValue of variables that stay, keeping their guid."""
     off = core.find_vars_off(bp)
     cur = variable_lines(bp)
     gone = set(remove)
@@ -52,6 +53,11 @@ def set_vars(bp, add_lines, remove=()):
         raise RuntimeError("cannot remove unknown variable(s): %s" % sorted(missing))
     cur = [v for v in cur if _var_name(v) not in gone]
     names = [_var_name(v) for v in cur]
+    if defaults:
+        unknown = set(defaults) - set(names)
+        if unknown:
+            raise RuntimeError("cannot set the default of unknown variable(s): %s" % sorted(unknown))
+        cur = [t3d.with_default(v, defaults[_var_name(v)]) if _var_name(v) in defaults else v for v in cur]
     for v in add_lines:
         n = _var_name(v)
         if n in names:

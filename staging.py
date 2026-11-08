@@ -15,6 +15,7 @@ import warnings
 from pathlib import Path
 
 import paths
+import tagsini
 
 
 class StagingError(RuntimeError):
@@ -93,18 +94,49 @@ class Stage:
         os.replace(tmp, self.meta_path)
 
 
-def _content_files(base):
-    """Relative posix paths of every file under <base>/Content, minus tooling folders."""
+def _config_files(base):
+    """Relative posix paths of the tracked config files: <base>/Config/Tags/*.ini (a mod's gameplay tag lists)."""
+    tags = Path(base) / "Config" / "Tags"
+    if not tags.is_dir():
+        return []
+    return sorted((tags / f.name).relative_to(base).as_posix() for f in tags.iterdir()
+                  if f.is_file() and f.suffix.lower() == ".ini")
+
+
+def _tracked_files(base):
+    """Relative posix paths of every tracked file: all of <base>/Content (minus tooling folders) and Config/Tags/*.ini."""
     out = []
     content = Path(base) / "Content"
-    if not content.is_dir():
-        return out
-    for dirpath, _dirs, files in os.walk(content):
-        for f in files:
-            rel = (Path(dirpath) / f).relative_to(base).as_posix()
-            if not _is_tooling(rel):
-                out.append(rel)
+    if content.is_dir():
+        for dirpath, _dirs, files in os.walk(content):
+            for f in files:
+                rel = (Path(dirpath) / f).relative_to(base).as_posix()
+                if not _is_tooling(rel):
+                    out.append(rel)
+    out.extend(_config_files(base))
     return sorted(out)
+
+
+def _upgrade_baseline(stage, meta):
+    """A stage synced before config files were tracked has no baseline entry for Config/Tags/*.ini. Give those files
+    the state of the real mod (the stage file when the real mod has none and the stage was never told), once, so they
+    show up as changed when the stage differs and not as added."""
+    if meta.get("tracked_config") or "baseline" not in meta:
+        return meta
+    base = meta.setdefault("baseline", {})
+    src = Path(meta["source_dir"]) if meta.get("source_dir") else None
+    for rel in _config_files(stage.dir):
+        if rel in base:
+            continue
+        real = (src / rel) if src else None
+        if real is not None and real.is_file():
+            try:
+                base[rel] = {"sha256": _sha(real), "size": real.stat().st_size}
+            except OSError:
+                pass
+    meta["tracked_config"] = True
+    stage.save_meta(meta)
+    return meta
 
 
 def sync(mod_dir, discard_changes=False, forbidden=()):
@@ -140,11 +172,11 @@ def sync(mod_dir, discard_changes=False, forbidden=()):
     count = 0
     for dirpath, _dirs, files in os.walk(stage.dir):
         count += len(files)
-    for rel in _content_files(stage.dir):
+    for rel in _tracked_files(stage.dir):
         p = stage.dir / rel
         baseline[rel] = {"sha256": _sha(p), "size": p.stat().st_size}
     stage.save_meta({"mod": stage.name, "source_dir": str(src), "synced_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                     "uplugin_original": uplugin, "baseline": baseline})
+                     "uplugin_original": uplugin, "baseline": baseline, "tracked_config": True})
     stage.file_count = count
     return stage
 
@@ -180,19 +212,23 @@ def strip_scratch(stage):
 def files_for(stage, stem):
     """Existing files of one asset: every Content/<stem>.* (uasset, uexp, ...)."""
     parent = (stage.dir / stem).parent
-    name = Path(stem).name
+    name = Path(stem).name.casefold()      # Windows and Unreal treat asset names case-insensitively
     if not parent.is_dir():
         return []
     return sorted((parent / f.name).relative_to(stage.dir).as_posix() for f in parent.iterdir()
-                  if f.is_file() and os.path.splitext(f.name)[0] == name)
+                  if f.is_file() and os.path.splitext(f.name)[0].casefold() == name)
 
 
 def diff(stage):
-    meta = stage.meta()
+    meta = _upgrade_baseline(stage, stage.meta())
     base = meta.get("baseline", {})
     src = Path(meta["source_dir"]) if meta.get("source_dir") else None
-    now = {rel: None for rel in _content_files(stage.dir)}
-    changed, added, removed, conflicts = [], [], [], []
+    now = {rel: None for rel in _tracked_files(stage.dir)}
+    changed, added, removed, conflicts, stale = [], [], [], [], []
+    try:
+        synced_ts = time.mktime(time.strptime(meta.get("synced_at"), "%Y-%m-%dT%H:%M:%S"))
+    except (TypeError, ValueError, OverflowError):
+        synced_ts = None
     for rel in now:
         if rel not in base:
             added.append(rel)
@@ -213,10 +249,28 @@ def diff(stage):
                         real_sha = base[rel]["sha256"]       # locked by an editor: the lock probe in publish decides
                     if real_sha != base[rel]["sha256"]:
                         conflicts.append({"path": rel, "reason": "the real file changed since the last sync; run staging_sync again"})
+        elif src is not None:
+            # Untouched in the stage but different (or gone) in the real mod, for example saved in the Mod Editor: nothing
+            # conflicts and nothing is lost by copying the mod again, but the stage no longer shows the real mod.
+            real = src / rel
+            if not real.is_file():
+                stale.append(rel)
+            else:
+                try:
+                    st = real.stat()
+                    if st.st_size != base[rel]["size"]:
+                        stale.append(rel)
+                    elif synced_ts is not None and st.st_mtime < synced_ts:
+                        pass                             # same size, not written since the sync: no need to hash it
+                    elif _sha(real) != base[rel]["sha256"]:
+                        stale.append(rel)
+                except OSError:
+                    pass                                 # locked by an editor: the lock probe in publish decides
     for rel in base:
         if rel not in now and not _is_tooling(rel):
             removed.append(rel)
-    return {"changed": sorted(changed), "added": sorted(added), "removed": sorted(removed), "conflicts": conflicts}
+    return {"changed": sorted(changed), "added": sorted(added), "removed": sorted(removed), "conflicts": conflicts,
+            "stale": sorted(stale)}
 
 
 # ---- publish ------------------------------------------------------------------
@@ -277,11 +331,11 @@ def _try_reload(editor, packages, also=None):
         return None
 
 
-def publish(stage, editor, compile_gate, assets=None, dry_run=False, now=None):
+def publish(stage, editor, compile_gate, assets=None, dry_run=False, now=None, delete_removed=False):
     name = stage.name
+    d = diff(stage)                       # may upgrade the stored baseline, so read the meta after it
     meta = stage.meta()
     src = Path(meta["source_dir"])
-    d = diff(stage)
     removed = d["removed"]
     if assets:
         wanted = {_asset_rel(a, name) for a in assets}
@@ -291,7 +345,20 @@ def publish(stage, editor, compile_gate, assets=None, dry_run=False, now=None):
              "conflicts": [c for c in d["conflicts"] if keep(c["path"])]}
         removed = d["removed"]
     files = d["changed"] + d["added"]
-    if not files:
+    del_rels = list(removed) if delete_removed else []
+    if del_rels:
+        base0 = meta.get("baseline", {})
+        for rel in del_rels:
+            real = src / rel
+            if not real.is_file():
+                continue                                   # already gone from the real mod: nothing to delete
+            try:
+                real_sha = _sha(real)
+            except OSError:
+                real_sha = base0.get(rel, {}).get("sha256")    # locked by an editor: the lock probe in publish decides
+            if real_sha != base0.get(rel, {}).get("sha256"):
+                d["conflicts"].append({"path": rel, "reason": "the real file changed since the last sync; run staging_sync again"})
+    if not files and not del_rels:
         return {"published": [], "route": None, "backup": None, "removed_in_staging": removed, "editor": None,
                 "message": "Nothing to publish: the staged Content matches the real mod."}
     if d["conflicts"]:
@@ -300,14 +367,17 @@ def publish(stage, editor, compile_gate, assets=None, dry_run=False, now=None):
                        % (len(d["conflicts"]), "; ".join("%s: %s" % (c["path"], c["reason"]) for c in d["conflicts"][:5])),
                        conflicts=d["conflicts"])
     packages = _packages(files, name)
+    prep_pkgs = _packages(files + del_rels, name)          # what the open editor must release (deleted packages included)
+    del_pkgs = [p for p in _packages(del_rels, name) if p not in packages]
     errors = compile_gate(packages)
     if errors:
         return _refuse("compile errors", "Refused: %d compile error(s) or unchecked asset(s) in the staged files; nothing was changed." % len(errors),
                        compile_errors=errors)
     if dry_run:
         return {"published": [], "dry_run": True, "would_publish": files, "changed": d["changed"], "added": d["added"],
-                "removed_in_staging": removed, "editor": None,
-                "message": "Dry run: %d file(s) would be copied into %s. Nothing was changed." % (len(files), src)}
+                "removed_in_staging": removed, "would_delete": del_rels, "editor": None,
+                "message": "Dry run: %d file(s) would be copied%s into %s. Nothing was changed."
+                           % (len(files), (" and %d deleted" % len(del_rels)) if del_rels else "", src)}
     try:
         state = editor.state(name)
     except Exception as e:
@@ -320,8 +390,9 @@ def publish(stage, editor, compile_gate, assets=None, dry_run=False, now=None):
     if state not in ("closed", "open", "other"):
         return _refuse("editor state", "Refused: unknown editor state %r." % (state,))
     existing = [rel for rel in files if (src / rel).is_file()]
+    del_existing = [rel for rel in del_rels if (src / rel).is_file()]
     if state != "open":
-        for rel in existing:
+        for rel in existing + del_existing:
             try:
                 open(src / rel, "r+b").close()
             except OSError as e:
@@ -331,13 +402,13 @@ def publish(stage, editor, compile_gate, assets=None, dry_run=False, now=None):
     def abort(reason, message, **extra):
         """Every non-success path after prepare: give the user's editor its assets back, then refuse."""
         if state == "open":
-            _try_reload(editor, packages, prep.get("referencers"))
+            _try_reload(editor, prep_pkgs, prep.get("referencers"))
         return _refuse(reason, message, **extra)
 
-    prep, rel_res = {}, {}
+    prep, rel_res, still_listed = {}, {}, []
     if state == "open":
         try:
-            prep = editor.prepare(packages)
+            prep = editor.prepare(prep_pkgs)
         except Exception as e:
             return abort("editor error", "Refused: the open editor failed while preparing (%s); it was asked to reload the assets. "
                          "Nothing was copied." % e)
@@ -357,7 +428,7 @@ def publish(stage, editor, compile_gate, assets=None, dry_run=False, now=None):
                            % (", ".join(prep["refused"]), reason, ref_note, tail), editor_result=prep, editor="open")
         # the editor released the files (packages other objects still use stay loaded with their files closed): any file still held
         # means the release did not work, and copying over it would fail or be undone by a later load
-        for rel in existing:
+        for rel in existing + del_existing:
             try:
                 open(src / rel, "r+b").close()
             except OSError as e:
@@ -380,7 +451,7 @@ def publish(stage, editor, compile_gate, assets=None, dry_run=False, now=None):
         for rel in d["added"]:
             if (src / rel).exists():
                 mismatched.append(rel + " (now exists in the real mod)")
-        for rel in existing:
+        for rel in existing + del_existing:
             if rel in d["added"]:
                 continue
             dst = backup / rel
@@ -396,7 +467,8 @@ def publish(stage, editor, compile_gate, assets=None, dry_run=False, now=None):
             return abort("conflicts", "Refused: the real mod changed while publishing was being prepared (%s). Nothing was copied. "
                          "Run staging_sync again." % "; ".join(mismatched[:5]), conflicts=mismatched)
         (backup / "manifest.json").write_text(json.dumps({"mod": name, "created": stamp, "real_mod": str(src), "files": man,
-                                                          "added": [r for r in files if r not in existing]}, indent=2), encoding="utf-8")
+                                                          "added": [r for r in files if r not in existing],
+                                                          "deleted": del_existing}, indent=2), encoding="utf-8")
     except Exception as e:
         return abort("backup failed", "Refused: could not back up the real files (%s). Nothing was copied." % e)
     manifest = {m["path"]: m["sha256"] for m in man}
@@ -412,29 +484,56 @@ def publish(stage, editor, compile_gate, assets=None, dry_run=False, now=None):
             os.replace(tmp, dst)
             if _sha(dst) != _sha(stage.dir / rel):
                 raise OSError("copy of %s did not verify" % rel)
+        for rel in del_existing:
+            done.append(rel)                                   # before the delete: a half-failed delete is restored too
+            (src / rel).unlink()
+            if (src / rel).exists():
+                raise OSError("delete of %s did not verify" % rel)
     except Exception as e:
         failed = _restore(src, backup, done, existed, manifest)
         if state == "open":
-            _try_reload(editor, packages, prep.get("referencers"))
+            _try_reload(editor, prep_pkgs, prep.get("referencers"))
         if failed:
             return _refuse("copy failed", "The copy failed (%s) and the restore from the backup FAILED for: %s. The real mod may be "
                            "half-published: copy these back from %s by hand." % (e, ", ".join(failed), backup),
                            restored=False, failed_paths=failed, backup=str(backup))
         return _refuse("copy failed", "The copy failed (%s). The real mod was restored from the backup in %s." % (e, backup),
                        restored=True, backup=str(backup))
+    tag_res = {}
     if state == "open":
+        # The open editor reads tag ini files at start only: register the mod's tags before the rows that use them are reloaded.
+        register = getattr(editor, "register_tags", None)
+        wanted = []
+        try:
+            ini = tagsini.ini_path(src, name)
+            if register is not None and ini.is_file():
+                wanted = tagsini.read_tags(ini)
+        except Exception as e:
+            tag_res = {"error": str(e)}
+        if wanted:
+            try:
+                tag_res = register(wanted)
+            except Exception as e:
+                tag_res = {"error": str(e), "unregistered": wanted}
+            if not isinstance(tag_res, dict):
+                tag_res = {"error": "unexpected tag registration reply", "unregistered": wanted}
         try:
             rel_res = editor.reload(packages, prep.get("referencers"))
             bad_reload = rel_res.get("missing") or rel_res.get("error")
+            if not bad_reload and del_pkgs:
+                forgot = editor.forget(del_pkgs)
+                still_listed = list((forgot or {}).get("still_listed") or [])
+                if isinstance(forgot, dict) and forgot.get("error"):
+                    bad_reload = "forget: %s" % forgot["error"]
         except Exception as e:
             bad_reload = str(e)
         if bad_reload:
             try:
-                editor.prepare(packages)    # the reload re-opened the files; release them so the restore can write
+                editor.prepare(prep_pkgs)    # the reload re-opened the files; release them so the restore can write
             except Exception:
                 pass
-            failed = _restore(src, backup, files, existed, manifest)
-            _try_reload(editor, packages, prep.get("referencers"))
+            failed = _restore(src, backup, files + del_existing, existed, manifest)
+            _try_reload(editor, prep_pkgs, prep.get("referencers"))
             if failed:
                 return _refuse("reload failed", "The editor could not load the new files (%s) and the restore from the backup FAILED for: %s. "
                                "Copy them back from %s by hand." % (bad_reload, ", ".join(failed), backup),
@@ -444,6 +543,8 @@ def publish(stage, editor, compile_gate, assets=None, dry_run=False, now=None):
     for rel in files:
         p = stage.dir / rel
         meta["baseline"][rel] = {"sha256": _sha(p), "size": p.stat().st_size}
+    for rel in del_rels:
+        meta["baseline"].pop(rel, None)
     stage.save_meta(meta)
     route = "live-reload" if state == "open" else "file-copy"
     msg = "Copied %d file(s) into %s (%s)." % (len(files), src, "the open editor reloaded them in place; the asset editor tabs of the "
@@ -468,10 +569,24 @@ def publish(stage, editor, compile_gate, assets=None, dry_run=False, now=None):
                 "Mod Editor." % (len(errs), "; ".join("%s: %s" % (e.get("asset"), e.get("message")) for e in errs[:3])))
     elif state == "open" and rel_res and rel_res.get("compile_check") not in (None, "editor log"):
         msg += " Blueprint compile errors after the reload were not checked (%s)." % rel_res.get("compile_check")
+    tags_registered = list(tag_res.get("registered") or [])
+    tags_unregistered = list(tag_res.get("unregistered") or [])
+    if tags_registered:
+        msg += " Registered gameplay tags in the open editor: %s." % ", ".join(tags_registered)
+    if tags_unregistered:
+        msg += " The open editor does not know these gameplay tags (restart it before using them): %s." % ", ".join(tags_unregistered)
+    if del_rels:
+        msg += " Deleted %d file(s) from the real mod, as they are gone from staging: %s." % (
+            len(del_existing), ", ".join(del_rels[:5]) + (", ..." if len(del_rels) > 5 else ""))
+        if still_listed:
+            msg += (" The open editor's asset registry still lists these deleted assets (restart the Mod Editor to clear them): %s."
+                    % ", ".join(still_listed))
     msg += " Backup of the previous files: %s." % backup
-    if removed:
-        msg += " %d file(s) are gone from staging; delete them in the Content Browser yourself, nothing was deleted in the real mod." % len(removed)
-    return {"published": files, "route": route, "backup": str(backup), "removed_in_staging": removed, "editor": state, "message": msg,
+    left = [r for r in removed if r not in del_rels]
+    if left:
+        msg += " %d file(s) are gone from staging; delete them in the Content Browser yourself, nothing was deleted in the real mod." % len(left)
+    return {"published": files, "deleted": del_rels, "route": route, "backup": str(backup), "removed_in_staging": left, "editor": state, "message": msg,
             "reloaded_in_place": list(prep.get("kept_loaded") or []), "dirty_after": list(rel_res.get("dirty_after") or []),
             "reloaded_referencers": also, "skipped_dirty": skipped_dirty, "dirty_published": dirty_published,
-            "compile_errors_after": errs}
+            "compile_errors_after": errs, "tags_registered": tags_registered, "tags_unregistered": tags_unregistered,
+            "tags_strategy": tag_res.get("strategy"), "tags_error": tag_res.get("error")}

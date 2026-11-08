@@ -1,4 +1,4 @@
-"""The nine headless Blueprint tools. build() returns tuples in server.TOOLS form: (name, fn, description, properties, required).
+"""The ten headless Blueprint tools. build() returns tuples in server.TOOLS form: (name, fn, description, properties, required).
 
 Everything runs in hidden processes on a staging copy of the mod; only bp_publish writes into the real mod, and it can
 reach the user's editor (through the injected run_json) to unload and reload assets when the mod is open there.
@@ -22,7 +22,9 @@ import bpscan       # noqa: E402
 import headless     # noqa: E402
 import hiddendesk   # noqa: E402
 import paths        # noqa: E402
+import fscopy        # noqa: E402
 import staging      # noqa: E402
+import tagsini      # noqa: E402
 from bpkit import specs   # noqa: E402
 LIVEPUBLISH = HERE / "editor" / "bpkit" / "livepublish.py"
 HARNESS_ASSET = "_McpTest/BP_McpHarness"
@@ -68,8 +70,8 @@ def filter_editor_processes(rows, exe, headless_root):
     return out
 
 
-def list_editor_processes():
-    """Read-only process listing (no handle to the editor is opened, nothing is sent to it): PowerShell + CIM, no window."""
+def _editor_rows():
+    """Every editor process as {"pid","path","command_line"} (read-only: PowerShell + CIM, no window)."""
     name = paths.EDITOR_EXE_REL.name
     cmd = ('Get-CimInstance Win32_Process -Filter "Name=\'%s\'" | Select-Object ProcessId,ExecutablePath,CommandLine '
            '| ConvertTo-Json -Compress' % name)
@@ -91,10 +93,54 @@ def list_editor_processes():
         data = [data]
     if not isinstance(data, list):
         raise headless.HeadlessError("could not read the process list")
-    rows = [{"pid": x.get("ProcessId"), "path": x.get("ExecutablePath"), "command_line": x.get("CommandLine")} for x in data]
+    return [{"pid": x.get("ProcessId"), "path": x.get("ExecutablePath"), "command_line": x.get("CommandLine")} for x in data]
+
+
+def list_editor_processes():
+    """Read-only process listing (no handle to the editor is opened, nothing is sent to it): PowerShell + CIM, no window."""
+    rows = _editor_rows()
     kept = filter_editor_processes(rows, paths.editor_exe(), headless.root())
     # the command line carries a login code: it is used for filtering only and never leaves this function
     return [{"pid": r["pid"], "path": r["path"]} for r in kept]
+
+
+def hidden_pids(rows=None):
+    """Pids of this tool's own hidden editor processes (their command line carries our private -userdir); [] when the list
+    cannot be read."""
+    own = "-userdir=%s/ud" % str(headless.root()).replace("\\", "/").lower().rstrip("/")
+    try:
+        rows = _editor_rows() if rows is None else rows
+    except headless.HeadlessError:
+        return []
+    return [r["pid"] for r in rows if r.get("command_line") and own in r["command_line"].replace("\\", "/").lower()]
+
+
+class StageFileBusy(headless.HeadlessError):
+    """A staged file stayed in use by another process for the whole patience; the message is the readable text."""
+
+
+def copy_stage_file(src, dst, nothing_changed=False, kept=None):
+    """fscopy.copy_file_retry with the long patience a staged file needs: a previous hidden editor run may still be shutting
+    down, or a scanner / another tool holds the file. Only a sharing violation that outlasts the patience is an error, and its
+    text says what to do. `nothing_changed=True` (the copies taken before anything is modified) adds that nothing was changed;
+    otherwise the stage is said to be partly restored, with `kept` (the folder holding the saved copies) when known."""
+    try:
+        return fscopy.copy_file_retry(src, dst, patience=fscopy.PATIENCE)
+    except PermissionError as e:
+        if getattr(e, "winerror", None) not in fscopy.SHARING_WINERRORS:
+            raise
+        name = Path(str(src)).name
+        pids = hidden_pids()
+        if pids:
+            who = "a hidden editor process of a previous run (pid %s) is still running and holds it" % ", ".join(str(p) for p in pids)
+        else:
+            who = "another program (a virus scanner, the search indexer, a second tool using the staged mod) holds it"
+        if nothing_changed:
+            tail = "Nothing was changed; wait a moment and run the command again."
+        else:
+            tail = ("The staged mod is only partly restored%s; once the file is free, restore it from there (or run staging_sync "
+                    "with discard_changes to take the real mod again)." % ((", the saved copies are in %s" % kept) if kept else ""))
+        raise StageFileBusy("the staged file %s is still in use after %d s: %s. %s" % (name, int(fscopy.PATIENCE), who, tail))
 
 
 def valid_map(mod, map_path):
@@ -179,6 +225,14 @@ class LiveEditor:
 
     def prepare(self, packages):
         return self._call("prepare", {"root": "/" + self.mod, "packages": packages})
+
+    def register_tags(self, tags):
+        """Make the open editor know these gameplay tags (in memory only); see livepublish.register_tags."""
+        return self._call("register_tags", {"mod": self.mod, "tags": list(tags)})
+
+    def forget(self, packages):
+        """Make the open editor's asset registry drop packages whose files were just deleted from the real mod."""
+        return self._call("forget", {"root": "/" + self.mod, "packages": list(packages)})
 
     RECOMPILE_ROUNDS = 3
 
@@ -296,7 +350,7 @@ def build(run_json, remote_errors, t3d_errors, kit_root, forbidden, py_status, l
         d = staging.diff(stage)
         return _out({"mod": stage.name, "staging_path": str(stage.dir), "source_dir": meta.get("source_dir"),
                      "synced_at": meta.get("synced_at"), "changed": d["changed"], "added": d["added"], "removed": d["removed"],
-                     "conflicts": d["conflicts"], "kit_found": paths.find_editor_root() is not None})
+                     "conflicts": d["conflicts"], "stale": d["stale"], "kit_found": paths.find_editor_root() is not None})
 
     # ---------------------------------------------------------------- apply
     def apply_batch(stage, batch, timeout, keep_on_error):
@@ -311,6 +365,7 @@ def build(run_json, remote_errors, t3d_errors, kit_root, forbidden, py_status, l
             if stem and stem not in stems:
                 stems.append(stem)
         existing = {}
+        before_dirs = []
 
         def snapshot(run):
             before = run / "before"
@@ -318,10 +373,36 @@ def build(run_json, remote_errors, t3d_errors, kit_root, forbidden, py_status, l
                 for rel in staging.files_for(stage, stem):
                     dst = before / rel
                     dst.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(stage.dir / rel, dst)
+                    copy_stage_file(stage.dir / rel, dst, nothing_changed=True)
                     existing[rel] = dst
+                    before_dirs[:] = [before]
 
-        res = headless.run_commandlet(stage, {"op": "apply", "assets": batch["assets"]}, timeout=timeout, prepare=snapshot)
+        # gameplay tags of class-manager rows: the mod's tag list must hold them before the editor process starts (a plugin's
+        # tag inis are registered when it mounts), so a warm session that already mounted the mod is stopped when the file changed
+        want_tags = []
+        for a in batch["assets"]:
+            row = a.get("class_manager_row")
+            if row and row.get("gameplay_tag") and row["gameplay_tag"] not in want_tags:
+                want_tags.append(row["gameplay_tag"])
+        ini = tagsini.ini_path(stage.dir, mod)
+        old_ini = ini.read_bytes() if ini.is_file() else None
+        tags_added = tagsini.ensure_tags(ini, want_tags) if want_tags else []
+        if tags_added:
+            headless.WARMS.stop_all()
+
+        def restore_ini():
+            if old_ini is None:
+                if ini.is_file():
+                    ini.unlink()
+            else:
+                ini.write_bytes(old_ini)
+
+        try:
+            res = headless.run_commandlet(stage, {"op": "apply", "assets": batch["assets"]}, timeout=timeout, prepare=snapshot)
+        except BaseException:
+            if tags_added:
+                restore_ini()
+            raise
         run = Path(res["run"])
         staging.strip_scratch(stage)
         log_text = _read(res["log"])
@@ -345,18 +426,33 @@ def build(run_json, remote_errors, t3d_errors, kit_root, forbidden, py_status, l
         ok = bool(res["ok"]) and not target_errors
         rolled_back = False
         if not ok and not keep_on_error:
-            for stem in stems:
-                for rel in staging.files_for(stage, stem):
-                    if rel not in existing:
-                        (stage.dir / rel).unlink()
-            for rel, src in existing.items():
-                dst = stage.dir / rel
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src, dst)
-            rolled_back = True
+            def unlink_retry(p):
+                for pause in list(fscopy.COPY_DELAYS) + [None]:
+                    try:
+                        p.unlink()
+                        return
+                    except PermissionError as e:
+                        if getattr(e, "winerror", None) not in fscopy.SHARING_WINERRORS or pause is None:
+                            raise
+                    time.sleep(pause)
+
+            try:
+                for stem in stems:
+                    for rel in staging.files_for(stage, stem):
+                        if rel not in existing:
+                            unlink_retry(stage.dir / rel)
+                for rel, src in existing.items():
+                    dst = stage.dir / rel
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    copy_stage_file(src, dst, kept=before_dirs[0] if before_dirs else None)
+                rolled_back = True
+            finally:
+                if tags_added:
+                    restore_ini()
         out = {"ok": ok, "rolled_back": rolled_back, "assets": (res.get("result") or {}).get("assets"),
                "rows": (res.get("result") or {}).get("rows") or [], "compile": compile_,
-               "problems": t3d_problems, "run": res["run"], "seconds": res["seconds"], "warm": bool(res.get("warm"))}
+               "problems": t3d_problems, "run": res["run"], "seconds": res["seconds"], "warm": bool(res.get("warm")),
+               "tags_added": [] if (rolled_back and tags_added) else tags_added}
         if not ok:
             out["error"] = (res.get("error") or ("%d compile error(s) in the edited assets" % len(target_errors)))
             if res.get("log_tail"):
@@ -379,6 +475,132 @@ def build(run_json, remote_errors, t3d_errors, kit_root, forbidden, py_status, l
     def t_bp_apply(args):
         stage = staging.load(args["mod"])
         return _out(apply_batch(stage, load_batch(args), float(args.get("timeout_seconds") or 600), bool(args.get("keep_on_error"))))
+
+    # ---------------------------------------------------------------- asset ops
+    def stem_of(stage, asset):
+        return "Content/" + asset[len("/%s/" % stage.name):]
+
+    def asset_ops_problems(stage, ops):
+        """Existence checks the pure validator cannot do, simulated in order over the staged files. Returns (problems, expected)
+        where expected maps every touched asset to whether its files must exist after the ops."""
+        exists = {}
+
+        def has(asset):
+            if asset not in exists:
+                exists[asset] = bool(staging.files_for(stage, stem_of(stage, asset)))
+            return exists[asset]
+
+        problems, touched = [], []
+        for i, o in enumerate(ops):
+            w = "ops[%d] (%s)" % (i, o["op"])
+            if o["op"] == "rename":
+                if not has(o["from"]):
+                    problems.append("%s: %s is not in the staged mod" % (w, o["from"]))
+                elif has(o["to"]):
+                    problems.append("%s: the target %s already exists" % (w, o["to"]))
+                else:
+                    exists[o["from"]], exists[o["to"]] = False, True
+                touched += [o["from"], o["to"]]
+            else:
+                if o["op"] != "recreate" and not has(o["asset"]):
+                    problems.append("%s: %s is not in the staged mod" % (w, o["asset"]))
+                elif o["op"] in ("delete", "recreate"):
+                    exists[o["asset"]] = False
+                touched.append(o["asset"])
+        return problems, {a: exists[a] for a in dict.fromkeys(touched) if a in exists}
+
+    def snapshot_stage(stage):
+        snap = staging.root() / "snapshots" / ("%s-%s-%s" % (stage.name, time.strftime("%Y%m%d-%H%M%S"), os.urandom(2).hex()))
+        snap.mkdir(parents=True)
+        for rel in ("Content", "Config/Tags"):
+            if (stage.dir / rel).is_dir():
+                shutil.copytree(stage.dir / rel, snap / rel,
+                                copy_function=lambda s, d: copy_stage_file(s, d, nothing_changed=True))
+        return snap
+
+    def restore_stage(stage, snap):
+        for rel in ("Content", "Config/Tags"):
+            staging._rmtree(stage.dir / rel)
+            if (snap / rel).is_dir():
+                shutil.copytree(snap / rel, stage.dir / rel, copy_function=lambda s, d: copy_stage_file(s, d, kept=snap))
+
+    def asset_ops(stage, ops, timeout):
+        problems, expected = asset_ops_problems(stage, ops)
+        if problems:
+            return {"ok": False, "error": "invalid asset ops", "problems": problems}
+        headless.WARMS.stop_all()      # a warm editor holds the staged packages open
+        snap = snapshot_stage(stage)
+        delete_set = [o["asset"] for o in ops if o["op"] == "delete"]
+        results, touched, runs = [], [], []
+        state = {"error": None, "seconds": 0.0}
+        pending = []
+
+        def flush():
+            if not pending or state["error"]:
+                return
+            batch = list(pending)
+            del pending[:]
+            res = headless.run_commandlet(stage, {"op": "asset_ops", "ops": batch, "delete_set": delete_set}, timeout=timeout)
+            staging.strip_scratch(stage)
+            runs.append(res.get("run"))
+            state["seconds"] += float(res.get("seconds") or 0)
+            inner = res.get("result") or {}
+            results.extend(inner.get("results") or [])
+            for t in inner.get("touched") or []:
+                if t not in touched:
+                    touched.append(t)
+            if not res.get("ok"):
+                state["error"] = res.get("error") or "the asset ops run failed"
+            elif not inner.get("ok"):
+                state["error"] = inner.get("error") or "an asset op failed"
+
+        try:
+            for o in ops:
+                if o["op"] == "recreate":
+                    flush()
+                    if state["error"]:
+                        break
+                    gone = staging.files_for(stage, stem_of(stage, o["asset"]))
+                    for rel in gone:
+                        (stage.dir / rel).unlink()
+                    results.append({"op": "recreate", "ok": True,
+                                    "detail": "removed %d staged file(s) of %s; the next bp_apply create makes it again" % (len(gone), o["asset"])})
+                else:
+                    pending.append(o)
+            flush()
+            if not state["error"]:
+                for asset, want in expected.items():
+                    have = bool(staging.files_for(stage, stem_of(stage, asset)))
+                    if have != want:
+                        state["error"] = "after the ops %s %s in the staged mod (expected %s)" % (
+                            asset, "is still" if have else "is missing", "it to be gone" if not want else "it to exist")
+                        break
+        except Exception as e:
+            state["error"] = "%s: %s" % (type(e).__name__, e)
+        error = state["error"]
+        out = {"ok": error is None, "results": results, "touched": touched, "run": runs[-1] if runs else None, "runs": runs,
+               "seconds": round(state["seconds"], 1), "error": error}
+        if error:
+            try:
+                restore_stage(stage, snap)
+                out["rolled_back"] = True
+                out["note"] = "The staged Content and Config/Tags were restored to their state before this call."
+                out["touched"] = []
+                shutil.rmtree(snap, ignore_errors=True)
+            except Exception as e:
+                out["rolled_back"] = False
+                out["note"] = "The restore FAILED (%s). The snapshot of the staged files before this call is in %s." % (e, snap)
+        else:
+            shutil.rmtree(snap, ignore_errors=True)
+        return out
+
+    def t_bp_asset_ops(args):
+        mod = args["mod"]
+        ops = args.get("ops")
+        problems = specs.check_asset_ops(ops, mod)
+        if problems:
+            return _out({"ok": False, "error": "invalid asset ops", "problems": problems})
+        return _out(asset_ops(staging.load(mod), ops, float(args.get("timeout_seconds") or 600)))
 
     # ---------------------------------------------------------------- read / compile
     def t_bp_read(args):
@@ -543,7 +765,8 @@ def build(run_json, remote_errors, t3d_errors, kit_root, forbidden, py_status, l
                 errs.append({"asset": u.get("asset"), "message": "could not be checked (%s): the compile gate fails closed" % (u.get("reason") or "unreadable")})
             return errs
 
-        return _out(staging.publish(stage, editor, gate, assets=args.get("assets") or None, dry_run=bool(args.get("dry_run"))))
+        return _out(staging.publish(stage, editor, gate, assets=args.get("assets") or None, dry_run=bool(args.get("dry_run")),
+                                       delete_removed=bool(args.get("delete_removed"))))
 
     # ---------------------------------------------------------------- table
     return [
@@ -559,6 +782,14 @@ def build(run_json, remote_errors, t3d_errors, kit_root, forbidden, py_status, l
          "variables, functions, nodes and wires, components, widget tree, macros, dispatchers, interfaces, timelines, widget animations, raw T3D, and class_manager_row (create or update the class-manager row of the asset's class). "
          "Generated nodes are placed below existing ones. Compile errors roll the staged files back (unless keep_on_error). See the README spec reference.",
          dict(mod=STR, assets={"type": "array", "items": OBJ}, spec_file=STR, keep_on_error=BOOL, timeout_seconds=NUM), ["mod"]),
+        ("bp_asset_ops", t_bp_asset_ops,
+         "Rename, delete, reparent or recreate Blueprint assets of the STAGED mod (never the real mod, never /Game; bp_apply refuses these). "
+         "ops: [{op:\"rename\",from,to} (Unreal's own rename, referencers fixed up and saved, redirector removed), {op:\"delete\",asset} "
+         "(refused while an asset outside the delete set still references it), {op:\"reparent\",asset,parent} (same family only: Actor, "
+         "ActorComponent, UserWidget or other objects), {op:\"recreate\",asset} (removes the staged files so a following bp_apply create "
+         "makes the asset again)], at most 20 per call, all-or-nothing: any failure restores the staged Content and Config/Tags. "
+         "Returns results per op and touched (other packages saved by the fix-up). Nothing reaches the real mod before bp_publish.",
+         dict(mod=STR, ops={"type": "array", "items": OBJ}, timeout_seconds=NUM), ["mod", "ops"]),
         ("bp_read", t_bp_read,
          "Structure of a staged mod Blueprint: variables, functions, macros, dispatchers, timelines, interfaces, components, widget tree, "
          "graphs with nodes, positions and resolved links. Refuses /Game. "
@@ -589,7 +820,9 @@ def build(run_json, remote_errors, t3d_errors, kit_root, forbidden, py_status, l
          dict(mod=STR, stage=BOOL, timeout_seconds=NUM), ["mod"]),
         ("bp_publish", t_bp_publish,
          "Copy the staged Content changes into the real mod. Backs up the files it replaces first (outside the mod), refuses on compile errors, "
-         "modified assets in an open editor, locked files or files changed in the real mod since staging_sync, and never deletes anything. "
+         "modified assets in an open editor, locked files or files changed in the real mod since staging_sync, and deletes nothing unless "
+         "delete_removed is true: then the files that are gone from staging (of the requested assets) are deleted from the real mod too, "
+         "backed up first, refused when the real file changed since staging_sync, restored if the editor cannot reload. "
          "Works with the editor closed (file copy) or open (release the files, copy, reload in place; asset editor tabs of those assets are closed). dry_run only reports.",
-         dict(mod=STR, assets={"type": "array", "items": STR}, dry_run=BOOL), ["mod"]),
+         dict(mod=STR, assets={"type": "array", "items": STR}, dry_run=BOOL, delete_removed=BOOL), ["mod"]),
     ]
