@@ -1198,6 +1198,18 @@ class StagingTests(unittest.TestCase):
         self.assertEqual(r["tags_unregistered"], tags)
         self.assertEqual((self.real / "Content" / "A.uasset").read_bytes(), b"edited")
 
+    def test_unreadable_tag_ini_does_not_fail_the_publish(self):
+        self.write_real_tag_ini()
+        self.stage_write("Content/A.uasset", b"edited")
+        ed = FakeEditor("open", real=self.real)
+        with mock.patch.object(tagsini, "read_tags", side_effect=PermissionError("sharing violation")):
+            r = staging.publish(self.stage, ed, self.gate_ok)
+        self.assertEqual(ed.calls, ["state", "prepare", "reload"])
+        self.assertEqual(r["route"], "live-reload")
+        self.assertEqual(r["published"], ["Content/A.uasset"])
+        self.assertEqual(r["tags_error"], "sharing violation")
+        self.assertEqual((self.real / "Content" / "A.uasset").read_bytes(), b"edited")
+
     def test_closed_editor_registers_no_tags(self):
         self.write_real_tag_ini()
         self.stage_write("Content/A.uasset", b"edited")

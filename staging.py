@@ -508,7 +508,7 @@ def publish(stage, editor, compile_gate, assets=None, dry_run=False, now=None, d
             ini = tagsini.ini_path(src, name)
             if register is not None and ini.is_file():
                 wanted = tagsini.read_tags(ini)
-        except ValueError as e:
+        except Exception as e:
             tag_res = {"error": str(e)}
         if wanted:
             try:
