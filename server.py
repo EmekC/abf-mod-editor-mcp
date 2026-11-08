@@ -1231,7 +1231,7 @@ def t_backend_info(args):
                                    "gameplayTags": True, "reflectDefaults": True, "assetOps": list(specs.ASSET_OPS),
                                    "publishDeletes": True,
                                    "createKinds": list(specs.CREATE_CLASSES), "gameTest": True, "audit": True, "publish": True,
-                                   "classManagerRows": True},
+                                   "classManagerRows": True, "liveTags": True},
                   "bpApply": {"features": list(specs.FEATURES), "nodeKinds": sorted(specs.NODE_KINDS)}})
 
 
@@ -1250,7 +1250,8 @@ TOOLS = [
     "containerTypes, warmSession, stageAudit, reflect (the reflect tool is registered), compileErrorNodeRefs, functionLocals, "
     "userPureFunctions, createKinds (asset kinds bp_apply can create), gameTest, audit, publish, classManagerRows, "
     "gameplayTags (class_manager_row gameplay_tag; reflect gameplay_tags), reflectDefaults (reflect meta.defaults), "
-    "assetOps (the ops bp_asset_ops accepts), publishDeletes (bp_publish delete_removed).", S(), []),
+    "assetOps (the ops bp_asset_ops accepts), publishDeletes (bp_publish delete_removed), "
+    "liveTags (bp_publish registers the mod's gameplay tags in an open editor before reloading).", S(), []),
     ("launch_editor", t_launch_editor,
      "Start the Mod Editor and wait until it is reachable. It opens on the Mod Browser picker; then use open_mod.",
      S(wait_seconds=NUM), []),

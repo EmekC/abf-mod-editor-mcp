@@ -81,6 +81,10 @@ Core tool, no editor needed, no arguments. Keys:
 - `capabilities.reflectDefaults` (2.6.0): `reflect` function entries carry `meta.defaults` (below).
 - `capabilities.assetOps` (2.6.0): the ops `bp_asset_ops` accepts, `["rename", "delete", "reparent", "recreate"]` (below).
 - `capabilities.publishDeletes` (2.6.0): `bp_publish` accepts `delete_removed` (below).
+- `capabilities.liveTags` (2.6.0): with the mod open in an editor, `bp_publish` registers the tags of the real mod's
+  `Config/Tags/<Mod>Tags.ini` that the editor does not know (in memory, verified) before it reloads the published assets. The result
+  carries `tags_registered`, `tags_unregistered`, `tags_strategy` (`refresh`, `settings` or null) and `tags_error`; tags left in
+  `tags_unregistered` stay unknown to that editor until it restarts.
 - `bpApply.features`, `bpApply.nodeKinds`: the `bp_apply` feature flags and node kinds this build understands.
 
 ## Additive keys in existing tools

@@ -15,6 +15,7 @@ import warnings
 from pathlib import Path
 
 import paths
+import tagsini
 
 
 class StagingError(RuntimeError):
@@ -498,7 +499,24 @@ def publish(stage, editor, compile_gate, assets=None, dry_run=False, now=None, d
                            restored=False, failed_paths=failed, backup=str(backup))
         return _refuse("copy failed", "The copy failed (%s). The real mod was restored from the backup in %s." % (e, backup),
                        restored=True, backup=str(backup))
+    tag_res = {}
     if state == "open":
+        # The open editor reads tag ini files at start only: register the mod's tags before the rows that use them are reloaded.
+        register = getattr(editor, "register_tags", None)
+        wanted = []
+        try:
+            ini = tagsini.ini_path(src, name)
+            if register is not None and ini.is_file():
+                wanted = tagsini.read_tags(ini)
+        except ValueError as e:
+            tag_res = {"error": str(e)}
+        if wanted:
+            try:
+                tag_res = register(wanted)
+            except Exception as e:
+                tag_res = {"error": str(e), "unregistered": wanted}
+            if not isinstance(tag_res, dict):
+                tag_res = {"error": "unexpected tag registration reply", "unregistered": wanted}
         try:
             rel_res = editor.reload(packages, prep.get("referencers"))
             bad_reload = rel_res.get("missing") or rel_res.get("error")
@@ -551,6 +569,12 @@ def publish(stage, editor, compile_gate, assets=None, dry_run=False, now=None, d
                 "Mod Editor." % (len(errs), "; ".join("%s: %s" % (e.get("asset"), e.get("message")) for e in errs[:3])))
     elif state == "open" and rel_res and rel_res.get("compile_check") not in (None, "editor log"):
         msg += " Blueprint compile errors after the reload were not checked (%s)." % rel_res.get("compile_check")
+    tags_registered = list(tag_res.get("registered") or [])
+    tags_unregistered = list(tag_res.get("unregistered") or [])
+    if tags_registered:
+        msg += " Registered gameplay tags in the open editor: %s." % ", ".join(tags_registered)
+    if tags_unregistered:
+        msg += " The open editor does not know these gameplay tags (restart it before using them): %s." % ", ".join(tags_unregistered)
     if del_rels:
         msg += " Deleted %d file(s) from the real mod, as they are gone from staging: %s." % (
             len(del_existing), ", ".join(del_rels[:5]) + (", ..." if len(del_rels) > 5 else ""))
@@ -564,4 +588,5 @@ def publish(stage, editor, compile_gate, assets=None, dry_run=False, now=None, d
     return {"published": files, "deleted": del_rels, "route": route, "backup": str(backup), "removed_in_staging": left, "editor": state, "message": msg,
             "reloaded_in_place": list(prep.get("kept_loaded") or []), "dirty_after": list(rel_res.get("dirty_after") or []),
             "reloaded_referencers": also, "skipped_dirty": skipped_dirty, "dirty_published": dirty_published,
-            "compile_errors_after": errs}
+            "compile_errors_after": errs, "tags_registered": tags_registered, "tags_unregistered": tags_unregistered,
+            "tags_strategy": tag_res.get("strategy"), "tags_error": tag_res.get("error")}

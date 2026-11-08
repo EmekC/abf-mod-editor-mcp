@@ -87,7 +87,8 @@ bp_game_test(mod, steps)     run steps in a hidden game and assert on state
 mod_audit(mod)               the editor's own upload Asset Audit on the staged copy (the real gate)
 hidden_editor_shot(...)      screenshots of asset editors on the hidden desktop
 bp_publish(mod)              back up, then copy changed Content into the real mod (dry_run to preview;
-                             delete_removed also deletes the files that are gone from staging)
+                             delete_removed also deletes the files that are gone from staging; an open
+                             editor first gets the mod's gameplay tags registered in memory)
 reflect(..., gameplay_tags)  with ABF_ABFC_TOOLS=1: also list the gameplay tags (see ABFC.md)
 ```
 

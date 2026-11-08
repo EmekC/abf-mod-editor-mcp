@@ -26,6 +26,11 @@ All notable changes to abf-mod-editor-mcp. The format follows [Keep a Changelog]
   sharing violation (WinError 32) to clear. A file still in use after that is a readable error (`StageFileBusy`) that names the
   leftover hidden editor process(es) by pid, or blames another program. Before any change it says nothing was changed; during a
   rollback or restore it says the stage is partly restored and where the saved copies are.
+- `bp_publish` with the mod open in an editor registers the tags of the real mod's `Config/Tags/<Mod>Tags.ini` that the editor
+  does not know before it reloads the published assets (the editor reads tag files only at start, so a row that used a new tag
+  loaded with an invalid tag and its director did not start). The editor's tag tree is refreshed in memory, else filled from the
+  settings' tag list, and every tag is read back to verify it; nothing is saved. The result gains `tags_registered`,
+  `tags_unregistered`, `tags_strategy` and `tags_error`; a failure of this step never fails the publish. `capabilities.liveTags`.
 
 ### Fixed
 

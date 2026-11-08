@@ -1,7 +1,10 @@
 """Live publish steps for a mod that is open in an editor. One source, two users: the server sends it to the user's
 editor (through run_json, which appends `def _abf(args)`), and the hidden integration test runs it in a hidden editor.
-Imports `unreal` only, and never saves, deletes or renames anything.
+Imports `unreal` and `re` only, and never saves, deletes or renames anything; `register_tags` changes only the open editor's
+in-memory gameplay tag tree.
 """
+import re
+
 import unreal
 
 
@@ -217,3 +220,135 @@ def recompile(args):
     dirty = sorted(p.get_name() for p in unreal.EditorLoadingAndSavingUtils.get_dirty_content_packages()
                    if p.get_name().startswith((args.get("root") or "/") + "/"))
     return {"compiled": compiled, "skipped": skipped, "dirty_after": dirty}
+
+
+_SETTINGS_PATH = "/Script/GameplayTags.Default__GameplayTagsSettings"
+_TAG_LIST_CLASS = "/Script/GameplayTags.GameplayTagsList"
+_TAG_EXPORT_RX = re.compile(r'TagName\s*=\s*"?([^",)]*)"?')
+
+
+def _tag_known(name):
+    """True when the open editor's gameplay tag tree knows `name`: a GameplayTag struct imported from text keeps the name only
+    for a registered tag (an unknown one exports as None). Any error counts as unknown."""
+    try:
+        t = unreal.GameplayTag()
+        t.import_text('(TagName="%s")' % name)
+        m = _TAG_EXPORT_RX.search(str(t.export_text()))
+        return bool(m) and m.group(1) == name
+    except Exception:
+        return False
+
+
+def _row_tag(row):
+    """The tag name of a GameplayTagTableRow ("" when unset)."""
+    try:
+        v = row.get_editor_property("tag")
+    except Exception:
+        v = row.get_editor_property("Tag")
+    v = str(v)
+    return "" if v == "None" else v
+
+
+def _new_row(name):
+    r = unreal.GameplayTagTableRow()
+    try:
+        r.set_editor_property("tag", unreal.Name(name))
+    except Exception:
+        r.set_editor_property("Tag", unreal.Name(name))
+    return r
+
+
+def _mod_source(mod):
+    """The in-memory source object of the mod's tag ini (`<Mod>Tags.ini`, owned by the tags manager), or None. The editor's
+    Gameplay Tag Manager rewrites the file from this object when a tag is added there."""
+    want = ("%sTags.ini" % mod).lower()
+    cls = unreal.load_class(None, _TAG_LIST_CLASS)
+    if cls is None:
+        return None
+    for o in unreal.ObjectIterator(cls):
+        try:
+            if o.get_name().lower() != want:
+                continue
+            outer = o.get_outer()
+            if outer is not None and outer.get_class().get_name() == "GameplayTagsManager":
+                return o
+        except Exception:
+            continue
+    return None
+
+
+def register_tags(args):
+    """Make the open editor know the gameplay tags `args["tags"]` (the tags of the mod's Config/Tags ini), in memory only.
+    The editor reads tag ini files at start, so a tag added to the file later is unknown to it and a row that uses it loads
+    with an invalid tag. Strategies, each verified by reading every tag back (`_tag_known`):
+      refresh   re-apply the tag settings with change notification, which makes the editor rebuild its tag tree from the
+                tag search paths (finds an ini the editor did not read yet);
+      settings  add the missing tags to the settings' tag list with notification (the tree is rebuilt from that list), then
+                put the original list back without notification (the tree keeps the tags; nothing can be saved into the game's
+                tag config later).
+    Then the tags the file holds and the mod's in-memory source object does not are added to that object without notification,
+    so a tag added later through the Gameplay Tag Manager (which rewrites the file from that object) cannot drop them.
+    Returns wanted, registered (made known now), unregistered (still unknown), strategy (None when nothing was needed or
+    nothing worked), source_added, error. Always returns a dict."""
+    tags = list(dict.fromkeys(t for t in (args.get("tags") or []) if isinstance(t, str) and t))
+    mod = args.get("mod") or ""
+    always = unreal.PropertyAccessChangeNotifyMode.ALWAYS
+    never = unreal.PropertyAccessChangeNotifyMode.NEVER
+    strategy, error, source_added = None, None, []
+    missing, left = [], []
+    try:
+        missing = [t for t in tags if not _tag_known(t)]
+        left = list(missing)
+    except Exception as e:
+        error = "check: %s" % e
+    if missing:
+        settings = None
+        try:
+            settings = unreal.find_object(None, _SETTINGS_PATH)
+        except Exception as e:
+            error = "settings: %s" % e
+        if settings is None:
+            error = error or "GameplayTagsSettings not found"
+        else:
+            try:
+                settings.set_editor_property("ImportTagsFromConfig", settings.get_editor_property("ImportTagsFromConfig"),
+                                             notify_mode=always)
+            except Exception as e:
+                error = "refresh: %s" % e
+            left = [t for t in tags if not _tag_known(t)]
+            if not left:
+                strategy = "refresh"
+            else:
+                try:
+                    original = list(settings.get_editor_property("GameplayTagList"))
+                except Exception as e:
+                    original = None
+                    error = "settings: %s" % e
+                if original is not None:
+                    have = {_row_tag(r).lower() for r in original}
+                    try:
+                        settings.set_editor_property("GameplayTagList", original + [_new_row(t) for t in left if t.lower() not in have],
+                                                     notify_mode=always)
+                        left = [t for t in tags if not _tag_known(t)]
+                    except Exception as e:
+                        error = "settings: %s" % e
+                    finally:
+                        try:
+                            settings.set_editor_property("GameplayTagList", original, notify_mode=never)
+                        except Exception as e:
+                            error = "%s; restore: %s" % (error, e) if error else "restore: %s" % e
+                    if not left:
+                        strategy = "settings"
+    try:
+        src = _mod_source(mod) if tags and mod else None
+        if src is not None:
+            rows = list(src.get_editor_property("GameplayTagList"))
+            have = {_row_tag(r).lower() for r in rows}
+            add = [t for t in tags if t.lower() not in have]
+            if add:
+                src.set_editor_property("GameplayTagList", rows + [_new_row(t) for t in add], notify_mode=never)
+                source_added = add
+    except Exception as e:
+        error = "%s; source: %s" % (error, e) if error else "source: %s" % e
+    return {"wanted": tags, "registered": [t for t in missing if t not in left], "unregistered": left, "strategy": strategy,
+            "source_added": source_added, "error": error}

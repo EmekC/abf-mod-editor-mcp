@@ -226,6 +226,10 @@ class LiveEditor:
     def prepare(self, packages):
         return self._call("prepare", {"root": "/" + self.mod, "packages": packages})
 
+    def register_tags(self, tags):
+        """Make the open editor know these gameplay tags (in memory only); see livepublish.register_tags."""
+        return self._call("register_tags", {"mod": self.mod, "tags": list(tags)})
+
     def forget(self, packages):
         """Make the open editor's asset registry drop packages whose files were just deleted from the real mod."""
         return self._call("forget", {"root": "/" + self.mod, "packages": list(packages)})

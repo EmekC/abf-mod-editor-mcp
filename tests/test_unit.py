@@ -840,7 +840,8 @@ class FakeEditor:
     def __init__(self, state="closed", refused=None, real=None, missing=None, on_prepare=None, prepare_raises=None, detail="",
                  kept_loaded=None, reload_error=None, dirty_after=None, reason="modified assets", referencers=None,
                  refused_referencers=None, compile_errors=None, skipped_dirty=None, dirty_published=None,
-                 forget_error=None, still_listed=None):
+                 forget_error=None, still_listed=None, tag_result=None):
+        self.tag_result, self.tags_seen = tag_result, []
         self.st, self.refused, self.calls, self.real, self.missing = state, refused, [], real, missing
         self.on_prepare, self.prepare_raises, self.detail = on_prepare, prepare_raises, detail
         self.kept_loaded, self.reload_error, self.dirty_after, self.reason = kept_loaded, reload_error, dirty_after, reason
@@ -853,6 +854,13 @@ class FakeEditor:
     def state(self, mod):
         self.calls.append("state")
         return self.st
+
+    def register_tags(self, tags):
+        self.calls.append("register_tags")
+        self.tags_seen.append(list(tags))
+        if isinstance(self.tag_result, Exception):
+            raise self.tag_result
+        return self.tag_result or {"registered": [], "unregistered": [], "strategy": None}
 
     def forget(self, packages):
         self.calls.append("forget")
@@ -1073,6 +1081,65 @@ class StagingTests(unittest.TestCase):
         self.assertEqual(ed.seen["at_prepare"], b"A-original" * 50)
         self.assertEqual(ed.seen["at_reload"], b"edited")
         self.assertEqual(r["route"], "live-reload")
+
+    def write_real_tag_ini(self, tags=("ClassManager.EntityDirector.One", "ClassManager.EntityDirector.Two")):
+        ini = self.real / "Config" / "Tags" / "FakeTags.ini"
+        ini.parent.mkdir(parents=True, exist_ok=True)
+        ini.write_text("[/Script/GameplayTags.GameplayTagsList]\n" + "".join(
+            'GameplayTagList=(Tag="%s",DevComment="")\n' % t for t in tags), encoding="utf-8")
+        return list(tags)
+
+    def test_live_publish_registers_the_mod_tags_before_the_reload(self):
+        tags = self.write_real_tag_ini()
+        self.stage_write("Content/A.uasset", b"edited")
+        ed = FakeEditor("open", real=self.real, tag_result={"registered": [tags[1]], "unregistered": [], "strategy": "refresh"})
+        r = staging.publish(self.stage, ed, self.gate_ok)
+        self.assertEqual(ed.calls, ["state", "prepare", "register_tags", "reload"])
+        self.assertEqual(ed.tags_seen, [tags])
+        self.assertEqual(r["tags_registered"], [tags[1]])
+        self.assertEqual(r["tags_unregistered"], [])
+        self.assertEqual(r["tags_strategy"], "refresh")
+        self.assertIsNone(r["tags_error"])
+        self.assertIn("Registered gameplay tags in the open editor: %s." % tags[1], r["message"])
+
+    def test_live_publish_reports_tags_the_editor_could_not_register(self):
+        tags = self.write_real_tag_ini()
+        self.stage_write("Content/A.uasset", b"edited")
+        ed = FakeEditor("open", real=self.real, tag_result={"registered": [], "unregistered": [tags[0]], "strategy": None, "error": "refresh: x"})
+        r = staging.publish(self.stage, ed, self.gate_ok)
+        self.assertEqual(r["route"], "live-reload")
+        self.assertEqual(r["tags_unregistered"], [tags[0]])
+        self.assertEqual(r["tags_error"], "refresh: x")
+        self.assertIn("does not know these gameplay tags", r["message"])
+
+    def test_tag_registration_failure_does_not_fail_the_publish(self):
+        tags = self.write_real_tag_ini()
+        self.stage_write("Content/A.uasset", b"edited")
+        ed = FakeEditor("open", real=self.real, tag_result=RuntimeError("bridge down"))
+        r = staging.publish(self.stage, ed, self.gate_ok)
+        self.assertEqual(ed.calls, ["state", "prepare", "register_tags", "reload"])
+        self.assertEqual(r["route"], "live-reload")
+        self.assertEqual(r["published"], ["Content/A.uasset"])
+        self.assertEqual(r["tags_error"], "bridge down")
+        self.assertEqual(r["tags_unregistered"], tags)
+        self.assertEqual((self.real / "Content" / "A.uasset").read_bytes(), b"edited")
+
+    def test_closed_editor_registers_no_tags(self):
+        self.write_real_tag_ini()
+        self.stage_write("Content/A.uasset", b"edited")
+        ed = FakeEditor("closed")
+        r = staging.publish(self.stage, ed, self.gate_ok)
+        self.assertNotIn("register_tags", ed.calls)
+        self.assertEqual(r["tags_registered"], [])
+        self.assertEqual(r["tags_unregistered"], [])
+        self.assertIsNone(r["tags_strategy"])
+
+    def test_open_editor_without_a_tag_ini_registers_no_tags(self):
+        self.stage_write("Content/A.uasset", b"edited")
+        ed = FakeEditor("open", real=self.real)
+        r = staging.publish(self.stage, ed, self.gate_ok)
+        self.assertNotIn("register_tags", ed.calls)
+        self.assertEqual(r["tags_registered"], [])
 
     def test_reload_failure_restores(self):
         self.stage_write("Content/A.uasset", b"edited")
@@ -1647,6 +1714,19 @@ class LiveEditorTests(unittest.TestCase):
         self.assertEqual(sent[0][1], {"root": "/Fake", "packages": ["/Fake/Sub/B"]})
         self.assertTrue(sent[0][0].rstrip().endswith("return forget(args)"))
         self.assertIn("def forget(args)", sent[0][0])
+
+    def test_register_tags_sends_the_mod_and_the_tags_to_livepublish(self):
+        sent = []
+
+        def run_json(code, args, timeout=None):
+            sent.append((code, args))
+            return {"registered": ["A.B"], "unregistered": [], "strategy": "refresh"}
+        ed = self.make(lambda: [], run_json)
+        out = ed.register_tags(("A.B", "A.C"))
+        self.assertEqual(out["strategy"], "refresh")
+        self.assertEqual(sent[0][1], {"mod": "Fake", "tags": ["A.B", "A.C"]})
+        self.assertTrue(sent[0][0].rstrip().endswith("return register_tags(args)"))
+        self.assertIn("def register_tags(args)", sent[0][0])
 
     def test_compile_errors_are_read_from_the_log_written_since_the_reload(self):
         tmp = Path(tempfile.mkdtemp(prefix="abflog"))

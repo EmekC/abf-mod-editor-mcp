@@ -960,6 +960,7 @@ class BackendInfoCapabilityTests(unittest.TestCase):
         self.assertIs(caps["reflectDefaults"], True)
         self.assertEqual(caps["assetOps"], ["rename", "delete", "reparent", "recreate"])
         self.assertIs(caps["publishDeletes"], True)
+        self.assertIs(caps["liveTags"], True)
         self.assertIs(caps["compileErrorNodeRefs"], True)
         self.assertIs(caps["functionLocals"], False)
         self.assertIs(caps["userPureFunctions"], False)
@@ -1806,6 +1807,183 @@ class ClassManagerRowEditorSideTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, str(tmp), True)
         for rel in ("editor/bpkit/rows.py", "editor/bpkit/jobs.py"):
             py_compile.compile(str(ROOT / rel), cfile=str(tmp / "x.pyc"), doraise=True)
+
+
+class RegisterTagsEditorSideTests(unittest.TestCase):
+    """editor/bpkit/livepublish.py register_tags against a fake `unreal` with the cooked 5.4 editor's shape: C++ property names on
+    the settings object, a GameplayTag struct that only exports a registered tag, classes found by path."""
+
+    class Row:
+        def __init__(self, tag=None):
+            self.tag = tag
+
+        def get_editor_property(self, key):
+            if key == "tag":
+                return self.tag
+            raise Exception("no property " + key)
+
+        def set_editor_property(self, key, value, notify_mode=None):
+            if key != "tag":
+                raise Exception("no property " + key)
+            self.tag = value
+
+    class Owner:
+        def __init__(self, class_name):
+            self.class_name = class_name
+
+        def get_class(self):
+            return self
+
+        def get_name(self):
+            return self.class_name
+
+    def setUp(self):
+        test = self
+        self.known = {"Known.Tag"}
+        self.refresh_adds, self.list_adds = set(), set()      # what each notified change makes the fake editor learn
+        self.sets = []                                         # (object name, key, value, notify) of every set_editor_property
+        Row = self.Row
+
+        class Mode:
+            ALWAYS, NEVER = "ALWAYS", "NEVER"
+
+        class Settings:
+            def __init__(self):
+                self.props = {"ImportTagsFromConfig": True, "GameplayTagList": [Row("Known.Tag")]}
+
+            def get_editor_property(self, key):
+                return self.props[key]
+
+            def set_editor_property(self, key, value, notify_mode=None):
+                test.sets.append(("settings", key, value, notify_mode))
+                self.props[key] = value
+                if notify_mode == "ALWAYS":
+                    if key == "ImportTagsFromConfig":
+                        test.known |= test.refresh_adds
+                    elif key == "GameplayTagList":
+                        test.known |= {r.tag for r in value if r.tag in test.list_adds}
+
+        class Source:
+            def __init__(self, name, outer, tags):
+                self.name, self.outer, self.props = name, outer, {"GameplayTagList": [Row(t) for t in tags]}
+
+            def get_name(self):
+                return self.name
+
+            def get_outer(self):
+                return self.outer
+
+            def get_editor_property(self, key):
+                return self.props[key]
+
+            def set_editor_property(self, key, value, notify_mode=None):
+                test.sets.append(("source", key, value, notify_mode))
+                self.props[key] = value
+
+        class Tag:
+            def import_text(self, text):
+                self.name = text.split('"')[1]
+
+            def export_text(self):
+                return '(TagName="%s")' % (self.name if self.name in test.known else "None")
+
+        self.settings = Settings()
+        self.source = Source("FakeTags.ini", self.Owner("GameplayTagsManager"), ["Known.Tag"])
+        other = Source("OtherTags.ini", self.Owner("GameplayTagsManager"), [])
+        stray = Source("FakeTags.ini", self.Owner("Package"), [])
+        u = types.ModuleType("unreal")
+        u.PropertyAccessChangeNotifyMode = Mode
+        u.GameplayTag = Tag
+        u.GameplayTagTableRow = Row
+        u.Name = str
+        u.find_object = lambda outer, path: self.settings if path == "/Script/GameplayTags.Default__GameplayTagsSettings" else None
+        u.load_class = lambda outer, path: "cls:" + path
+        u.ObjectIterator = lambda cls: iter([stray, other, self.source] if cls == "cls:/Script/GameplayTags.GameplayTagsList" else [])
+        patcher = mock.patch.dict(sys.modules, {"unreal": u})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        sys.modules.pop("bpkit.livepublish", None)
+        self.addCleanup(sys.modules.pop, "bpkit.livepublish", None)
+        import importlib
+        self.lp = importlib.import_module("bpkit.livepublish")
+
+    def run_register(self, tags):
+        return self.lp.register_tags({"mod": "Fake", "tags": tags})
+
+    def settings_sets(self):
+        return [x for x in self.sets if x[0] == "settings"]
+
+    def test_known_tags_change_nothing_on_the_settings(self):
+        out = self.run_register(["Known.Tag", "Known.Tag"])
+        self.assertEqual(out["wanted"], ["Known.Tag"])
+        self.assertEqual((out["registered"], out["unregistered"], out["strategy"], out["error"]), ([], [], None, None))
+        self.assertEqual(self.settings_sets(), [])
+
+    def test_refresh_strategy_reapplies_the_setting_with_notification(self):
+        self.refresh_adds = {"New.Tag"}
+        out = self.run_register(["Known.Tag", "New.Tag"])
+        self.assertEqual((out["registered"], out["unregistered"], out["strategy"], out["error"]), (["New.Tag"], [], "refresh", None))
+        self.assertEqual(self.settings_sets(), [("settings", "ImportTagsFromConfig", True, "ALWAYS")])
+
+    def test_settings_strategy_fills_the_list_and_puts_the_original_back_silently(self):
+        self.list_adds = {"New.Tag"}
+        original = self.settings.props["GameplayTagList"]
+        out = self.run_register(["New.Tag"])
+        self.assertEqual((out["registered"], out["unregistered"], out["strategy"], out["error"]), (["New.Tag"], [], "settings", None))
+        sets = self.settings_sets()
+        self.assertEqual([(x[1], x[3]) for x in sets],
+                         [("ImportTagsFromConfig", "ALWAYS"), ("GameplayTagList", "ALWAYS"), ("GameplayTagList", "NEVER")])
+        self.assertEqual([r.tag for r in sets[1][2]], ["Known.Tag", "New.Tag"])
+        self.assertEqual(sets[-1][2], original)
+        self.assertEqual(self.settings.props["GameplayTagList"], original)
+        self.assertIn("New.Tag", self.known)          # the tree keeps the tag after the list is back
+
+    def test_nothing_works_reports_every_missing_tag_and_restores_the_list(self):
+        original = self.settings.props["GameplayTagList"]
+        out = self.run_register(["Known.Tag", "A.One", "A.Two"])
+        self.assertEqual((out["registered"], out["unregistered"], out["strategy"]), ([], ["A.One", "A.Two"], None))
+        self.assertEqual(self.settings.props["GameplayTagList"], original)
+        last = self.settings_sets()[-1]
+        self.assertEqual((last[1], last[3]), ("GameplayTagList", "NEVER"))
+
+    def test_partly_registered_lists_only_the_rest(self):
+        self.refresh_adds = {"A.One"}
+        out = self.run_register(["A.One", "A.Two"])
+        self.assertEqual((out["registered"], out["unregistered"], out["strategy"]), (["A.One"], ["A.Two"], None))
+
+    def test_a_failing_refresh_falls_through_to_the_settings_list(self):
+        self.list_adds = {"New.Tag"}
+        real_set = self.settings.set_editor_property
+
+        def failing(key, value, notify_mode=None):
+            if key == "ImportTagsFromConfig":
+                raise RuntimeError("boom")
+            return real_set(key, value, notify_mode=notify_mode)
+        self.settings.set_editor_property = failing
+        out = self.run_register(["New.Tag"])
+        self.assertEqual((out["strategy"], out["unregistered"]), ("settings", []))
+        self.assertIn("refresh: boom", out["error"])
+
+    def test_missing_settings_object_is_an_error_not_an_exception(self):
+        self.settings = None
+        out = self.run_register(["New.Tag"])
+        self.assertEqual(out["unregistered"], ["New.Tag"])
+        self.assertIn("GameplayTagsSettings not found", out["error"])
+
+    def test_the_mods_source_object_gets_the_missing_file_tags_without_notification(self):
+        self.refresh_adds = {"New.Tag"}
+        out = self.run_register(["Known.Tag", "New.Tag"])
+        self.assertEqual(out["source_added"], ["New.Tag"])
+        src = [x for x in self.sets if x[0] == "source"]
+        self.assertEqual(len(src), 1)
+        self.assertEqual(src[0][1], "GameplayTagList")
+        self.assertEqual([r.tag for r in src[0][2]], ["Known.Tag", "New.Tag"])
+        self.assertEqual(src[0][3], "NEVER")
+
+    def test_no_source_patch_when_the_source_already_lists_the_tags(self):
+        out = self.run_register(["Known.Tag"])
+        self.assertEqual(out["source_added"], [])
+        self.assertEqual([x for x in self.sets if x[0] == "source"], [])
 
 
 class TagListingEditorSideTests(unittest.TestCase):
