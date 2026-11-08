@@ -22,6 +22,7 @@ import bpscan       # noqa: E402
 import headless     # noqa: E402
 import hiddendesk   # noqa: E402
 import paths        # noqa: E402
+import fscopy        # noqa: E402
 import staging      # noqa: E402
 import tagsini      # noqa: E402
 from bpkit import specs   # noqa: E402
@@ -323,7 +324,7 @@ def build(run_json, remote_errors, t3d_errors, kit_root, forbidden, py_status, l
                 for rel in staging.files_for(stage, stem):
                     dst = before / rel
                     dst.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(stage.dir / rel, dst)
+                    fscopy.copy_file_retry(stage.dir / rel, dst)
                     existing[rel] = dst
 
         # gameplay tags of class-manager rows: the mod's tag list must hold them before the editor process starts (a plugin's
@@ -451,14 +452,14 @@ def build(run_json, remote_errors, t3d_errors, kit_root, forbidden, py_status, l
         snap.mkdir(parents=True)
         for rel in ("Content", "Config/Tags"):
             if (stage.dir / rel).is_dir():
-                shutil.copytree(stage.dir / rel, snap / rel)
+                shutil.copytree(stage.dir / rel, snap / rel, copy_function=fscopy.copy_file_retry)
         return snap
 
     def restore_stage(stage, snap):
         for rel in ("Content", "Config/Tags"):
             staging._rmtree(stage.dir / rel)
             if (snap / rel).is_dir():
-                shutil.copytree(snap / rel, stage.dir / rel)
+                shutil.copytree(snap / rel, stage.dir / rel, copy_function=fscopy.copy_file_retry)
 
     def asset_ops(stage, ops, timeout):
         problems, expected = asset_ops_problems(stage, ops)

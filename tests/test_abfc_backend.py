@@ -1798,6 +1798,7 @@ class TagListingEditorSideTests(unittest.TestCase):
 
 
 from tests.test_asset_ops import AssetOpsEditorSideTests, AssetOpsHostTests, AssetOpsSpecTests  # noqa: E402,F401  (bp_asset_ops tests)
+from tests.test_fscopy import CopyRetryTests  # noqa: E402,F401  (copy_file_retry tests)
 
 
 if __name__ == "__main__":
