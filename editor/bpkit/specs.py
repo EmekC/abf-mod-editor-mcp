@@ -123,11 +123,11 @@ CREATE_CLASSES = ("Blueprint", "WidgetBlueprint", "BlueprintInterface", "UserDef
 RAW_KINDS = ("graph", "tree", "tree_replace", "python")
 # bp_apply features reported by the backend_info tool
 FEATURES = ("cast_object_pin", "class_manager_row", "class_manager_row_tag", "event_meta", "map_types", "pin_types", "self_event_calls",
-            "set_types", "struct_fields")
+            "set_types", "struct_fields", "variable_defaults")
 EVENT_META_KEYS = ("tooltip", "category", "keywords")
 EVENT_META_MAX = 2000
 # keys that make no sense on a UserDefinedStruct asset
-_STRUCT_FORBIDDEN_KEYS = ("variables", "remove_variables", "components", "dispatchers", "timelines", "widget_tree", "animations",
+_STRUCT_FORBIDDEN_KEYS = ("variables", "remove_variables", "variable_defaults", "components", "dispatchers", "timelines", "widget_tree", "animations",
                           "macros", "functions", "remove_functions", "interfaces", "graphs", "raw", "class_manager_row")
 _ROW_ASSET_RX = re.compile(r"^/[A-Za-z0-9_]+(/[A-Za-z0-9_]+)+$")
 _ROW_CLASS_RX = re.compile(r"^/[A-Za-z0-9_]+(/[A-Za-z0-9_]+)+\.[A-Za-z0-9_]+_C$")
@@ -440,6 +440,16 @@ def validate(batch, mod):
                 problems.append("%s.variables[%d] needs name and type" % (w, i))
             else:
                 _check_type(problems, "%s.variables[%d] (%s)" % (w, i, v["name"]), v["type"])
+                if v.get("default") is not None and not isinstance(v["default"], str):
+                    problems.append("%s.variables[%d] (%s): default must be a string (Unreal's text form)" % (w, i, v["name"]))
+        vd = a.get("variable_defaults")
+        if vd is not None:
+            if not isinstance(vd, dict):
+                problems.append("%s.variable_defaults must be an object {name: default text or null}" % w)
+            else:
+                for k, val in vd.items():
+                    if val is not None and not isinstance(val, str):
+                        problems.append("%s.variable_defaults[%s] must be a string or null" % (w, k))
         for i, c in enumerate(a.get("components") or []):
             if not isinstance(c, dict) or not c.get("name"):
                 problems.append("%s.components[%d] needs a name" % (w, i))

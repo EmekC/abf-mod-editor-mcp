@@ -194,13 +194,29 @@ def user_pin(name, type_str, direction):
         name, _compact_type(parse_type(type_str)), _direction(direction))
 
 
+def escape_default(text):
+    """A variable default as the inside of a quoted T3D attribute (backslash, quote and control characters escaped)."""
+    return (str(text).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t"))
+
+
 def var_line(name, type_str, guid=None, default=None, flags=5):
     """Value of one `NewVariables(i)=` line."""
     s = '(VarName="%s",VarGuid=%s,VarType=(%s),FriendlyName="%s",PropertyFlags=%d' % (
         name, guid or gid(), _compact_type(parse_type(type_str)), name, flags)
     if default is not None:
-        s += ',DefaultValue="%s"' % default
+        s += ',DefaultValue="%s"' % escape_default(default)
     return s + ")"
+
+
+_DEFAULT_ATTR_RX = re.compile(r',DefaultValue="(?:[^"\\]|\\.)*"')
+
+
+def with_default(line, default):
+    """A `NewVariables` line value with its DefaultValue replaced by `default`, or dropped when `default` is None (guid and the rest kept)."""
+    s = _DEFAULT_ATTR_RX.sub("", line, count=1)
+    if default is None:
+        return s
+    return s[:-1] + ',DefaultValue="%s")' % escape_default(default)
 
 
 def dispatcher_var(name, guid=None):

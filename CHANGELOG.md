@@ -16,6 +16,8 @@ All notable changes to abf-mod-editor-mcp. The format follows [Keep a Changelog]
   `capabilities.gameplayTags`.
 - `reflect` argument `gameplay_tags` (lists the editor's gameplay tags) and `meta.defaults` on function entries (the
   `CPP_Default_*` metadata). `capabilities.reflectDefaults`.
+- `variable_defaults` ({name: default text or null}) on a bp_apply asset spec (bp_apply feature `variable_defaults`): replaces or drops the
+  DefaultValue of variables that stay, keeping their guid (no remove and re-add). Variable defaults are now escaped in the T3D text.
 
 ### Changed
 

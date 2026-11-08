@@ -570,6 +570,43 @@ class SpecTests(unittest.TestCase):
         cls, empty = specs.NODE_KINDS["event"]({"id": "x", "k": "event", "name": "Go", "meta": {"tooltip": ""}}, env)
         self.assertEqual(empty, ['CustomFunctionName="Go"'])
 
+    def test_variable_defaults_text_and_validation(self):
+        self.assertIn("variable_defaults", specs.FEATURES)
+        # a default is escaped inside the quoted attribute
+        v = t3d.var_line("Label", "string", guid="G", default='say "hi"\\n')
+        self.assertIn('DefaultValue="say \\"hi\\"\\\\n"', v)
+        line = t3d.var_line("Speed", "real", guid="G", default="2.5")
+        # replacing keeps guid, type and the other attributes; dropping removes the attribute only
+        r = t3d.with_default(line, "4.000000")
+        self.assertIn("VarGuid=G", r)
+        self.assertIn('DefaultValue="4.000000"', r)
+        self.assertNotIn("2.5", r)
+        self.assertEqual(r.count("DefaultValue"), 1)
+        dropped = t3d.with_default(line, None)
+        self.assertNotIn("DefaultValue", dropped)
+        self.assertTrue(dropped.endswith(")"))
+        # a line without a default gains one; a default followed by more attributes keeps them
+        bare = t3d.var_line("Armed", "bool", guid="G")
+        self.assertIn('DefaultValue="true"', t3d.with_default(bare, "true"))
+        mid = line[:-1] + ',RepNotifyFunc="OnRep")'
+        self.assertIn('RepNotifyFunc="OnRep"', t3d.with_default(mid, "9"))
+        self.assertEqual(t3d.with_default(mid, "9").count("DefaultValue"), 1)
+        # an escaped quote inside the old default does not end the match early
+        tricky = t3d.var_line("S", "string", guid="G", default='a"b')
+        self.assertEqual(t3d.with_default(tricky, "c"), t3d.var_line("S", "string", guid="G", default="c"))
+
+        def vd(value):
+            def m(a):
+                a["variable_defaults"] = value
+            return m
+        self.assertEqual(self.problems(vd({"Speed": "4.0", "Old": None})), [])
+        self.assertTrue(any("variable_defaults must be an object" in p for p in self.problems(vd(["Speed"]))))
+        self.assertTrue(any("variable_defaults[Speed] must be a string or null" in p for p in self.problems(vd({"Speed": 4}))))
+
+        def bad_default(a):
+            a["variables"] = [{"name": "N", "type": "int", "default": 3}]
+        self.assertTrue(any("default must be a string" in p for p in self.problems(bad_default)))
+
     def test_event_meta_validation(self):
         def event(meta):
             def m(a):

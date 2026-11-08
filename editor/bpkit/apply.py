@@ -133,8 +133,9 @@ def apply_asset(spec, mod, index=0):
     # 2. variables
     adds = [t3d.var_line(v["name"], v["type"], None, v.get("default"), int(v.get("flags", 5))) for v in spec.get("variables") or []]
     rm = spec.get("remove_variables") or []
-    if adds or rm:
-        assets.set_vars(bp, adds, rm)
+    vdefaults = spec.get("variable_defaults") or {}
+    if adds or rm or vdefaults:
+        assets.set_vars(bp, adds, rm, vdefaults)
         LIB.compile_blueprint(bp)
 
     # 3. components

@@ -114,6 +114,7 @@ Logs can contain tokens: they stay in the run folders, which `.gitignore` covers
  "create":{"class":"Blueprint","parent":"/Script/Engine.Actor","if_missing":true},
  "variables":[{"name":"Score","type":"int","default":"10","flags":5}],
  "remove_variables":["Old"],
+ "variable_defaults":{"Score":"20","Armed":null},
  "components":[{"name":"Box","class":"/Script/Engine.BoxComponent","parent":"Mesh",
                 "properties":{"component_tags":["T"]},"expressions":{"box_extent":"unreal.Vector(11,22,33)"}}],
  "dispatchers":[{"name":"OnPing","params":[{"name":"Amount","type":"int"}]}],
