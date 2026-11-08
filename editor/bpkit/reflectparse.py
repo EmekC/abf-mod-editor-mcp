@@ -226,3 +226,100 @@ def verified_supers(path, names, is_child):
     except Exception:
         return None
     return chain
+
+
+# ---- member discovery (widgets, components and plain object variables that GetClassDefaults cannot list) ----
+
+# characters Unreal refuses in an object name (INVALID_OBJECTNAME_CHARACTERS): such a name is never a member
+INVALID_MEMBER_CHARS = frozenset("\"',/.:|&!~\n\r\t@#(){}[]=;^%$`")
+GEN_VARIABLE = "_GEN_VARIABLE"
+WIDGET_TREE = "WidgetTree."
+
+
+def member_name_ok(name):
+    return isinstance(name, str) and name != "" and not any(c in INVALID_MEMBER_CHARS for c in name)
+
+
+def group_member_paths(object_paths, wanted=None):
+    """({class path: widget names}, {class path: SCS variable names}) from object path names:
+    `<class>:WidgetTree.<N>` and `<class>:<N>_GEN_VARIABLE` (N without `.` or `:`). `wanted` restricts the class paths."""
+    widgets, scs = {}, {}
+    for p in object_paths:
+        head, sep, tail = p.partition(":")
+        if not sep or (wanted is not None and head not in wanted):
+            continue
+        if tail.startswith(WIDGET_TREE):
+            n, into = tail[len(WIDGET_TREE):], widgets
+        elif tail.endswith(GEN_VARIABLE):
+            n, into = tail[:-len(GEN_VARIABLE)], scs
+        else:
+            continue
+        if n and "." not in n and ":" not in n:
+            into.setdefault(head, set()).add(n)
+    return widgets, scs
+
+
+def widget_tree_names(object_paths, class_path):
+    return group_member_paths(object_paths, {class_path})[0].get(class_path, set())
+
+
+def scs_names(object_paths, class_path):
+    return group_member_paths(object_paths, {class_path})[1].get(class_path, set())
+
+
+def probe_property(get, name):
+    """(True, value) when get(name) works, else (False, None). `get` is a CDO's get_editor_property: it raises for a name the
+    class does not have (and for functions), so this is the exact existence check."""
+    try:
+        return True, get(name)
+    except Exception:
+        return False, None
+
+
+def has_property(get, name):
+    return probe_property(get, name)[0]
+
+
+def is_object_value(value, object_type):
+    """True for a value an object reference can hold: None (unset) or an instance of `object_type`."""
+    return value is None or isinstance(value, object_type)
+
+
+def member_pin(pins, name):
+    """The single-object output pin of a VariableGet node named `name` (case-insensitive), else None."""
+    low = name.lower()
+    for p in pins or []:
+        if p.get("dir") == "out" and p.get("category") == "object" and p.get("container") == "None" and not p.get("hidden") \
+                and str(p.get("name") or "").lower() == low:
+            return p
+    return None
+
+
+def member_candidates(widget, scs, other, known_lower=()):
+    """{lower: (name, kind)} from three name sets; a name found by several sources keeps the first kind of widget > component > member.
+    Names in `known_lower` and names that cannot be a member are dropped."""
+    out = {}
+    for names, kind in ((widget, "widget"), (scs, "component"), (other, "member")):
+        for n in sorted(names or ()):
+            low = n.lower()
+            if low in out or low in known_lower or not member_name_ok(n):
+                continue
+            out[low] = (n, kind)
+    return out
+
+
+_DOC_PROPERTY = re.compile(r"- ``([A-Za-z0-9_]+)`` \(")
+
+
+def doc_property_names(doc):
+    """Editor property names (snake_case, in order, unique) listed in the docstring of a native class's Python wrapper."""
+    seen, out = set(), []
+    for n in _DOC_PROPERTY.findall(doc or ""):
+        if n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
+
+
+def snake_to_pascal(name):
+    return "".join(w[:1].upper() + w[1:] for w in name.split("_"))

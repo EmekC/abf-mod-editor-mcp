@@ -37,7 +37,7 @@ def tearDownModule():
 import abfc_tools  # noqa: E402
 import headless  # noqa: E402
 import paths  # noqa: E402
-from bpkit import reflectparse  # noqa: E402
+from bpkit import cookedpkg, reflectparse  # noqa: E402
 
 
 class CompileLogTests(unittest.TestCase):
@@ -1117,6 +1117,395 @@ class ReflectRunOrderTests(unittest.TestCase):
         self.assertNotIn(("meta",), calls)
         self.assertIn(("templates", "function"), calls)
         self.assertEqual((res["meta"], written["meta"]), ("skipped", "skipped"))
+
+
+def _name_batch(names):
+    """Serialized FNameEntry batch (ASCII names, or UTF-16 when the name has a non-latin-1 character); strings are packed."""
+    heads, body = b"", b""
+    for n in names:
+        try:
+            raw, wide = n.encode("latin-1"), False
+        except UnicodeEncodeError:
+            raw, wide = n.encode("utf-16-le"), True
+        length = len(raw) // 2 if wide else len(raw)
+        heads += bytes([(0x80 if wide else 0) | (length >> 8), length & 0xFF])
+        body += raw
+    import struct
+    return struct.pack("<II", len(names), len(body)) + struct.pack("<Q", 0xC1640000) + b"\0" * (8 * len(names)) + heads + body
+
+
+def _outer(i):
+    return 0xFFFFFFFFFFFFFFFF if i is None else i
+
+
+def _zen_package(names, exports, tail=b"\0" * 64):
+    """Zen package chunk: 52-byte summary, name batch, 20 unknown bytes, export map; `exports` = [(name index, number, outer export index)]."""
+    import struct
+    batch = _name_batch(names)
+    hashes_off = 52 + len(batch) + 20
+    export_off = hashes_off + 8
+    bundle_off = export_off + 72 * len(exports)
+    header_size = bundle_off + 16
+    summary = struct.pack("<II", 0, header_size) + struct.pack("<II", 0, 0) + struct.pack("<II", 0, header_size)
+    summary += struct.pack("<7i", hashes_off, hashes_off + 8, export_off, bundle_off, bundle_off, bundle_off + 8, bundle_off + 16)
+    assert len(summary) == 52
+    out = summary + batch + b"\0" * 20 + b"\0" * 8
+    for idx, num, outer in exports:
+        out += struct.pack("<QQIIQQQQQIB3x", 0, 0, idx, num, _outer(outer), 0, 0, 0, 0, 0, 0)
+    return out + b"\0" * 16 + tail
+
+
+def _write_container(paks, files, method=0):
+    """<paks>/Test.utoc + Test.ucas holding `files` ({'Dir/Asset': chunk bytes}) under <Project>/Content/ (uncompressed unless method != 0)."""
+    import struct
+    bs = 0x10000
+    ucas, blocks, entries = b"", [], []
+    for chunk in files.values():
+        start = len(blocks)
+        entries.append((start * bs, len(chunk)))
+        for off in range(0, len(chunk), bs):
+            part = chunk[off:off + bs]
+            blocks.append((len(ucas), len(part), method))
+            ucas += part
+    none = 0xFFFFFFFF
+    # directory index: root -> Proj -> Content -> Dir (every file lives in Dir)
+    strings = ["Proj", "Content", "Dir"] + [rel.split("/")[1] + ".uasset" for rel in files]
+    dirs = [(none, 1, none, none), (0, 2, none, none), (1, 3, none, none), (2, none, none, 0)]
+    flist = [(3 + i, i + 1 if i + 1 < len(files) else none, i) for i in range(len(files))]
+    dirblob = struct.pack("<i", 10) + b"../../../\0" + struct.pack("<I", len(dirs))
+    for dname, child, nxt, ff in dirs:
+        dirblob += struct.pack("<4I", dname, child, nxt, ff)
+    dirblob += struct.pack("<I", len(flist)) + b"".join(struct.pack("<3I", *f) for f in flist)
+    dirblob += struct.pack("<I", len(strings)) + b"".join(struct.pack("<i", len(s) + 1) + s.encode("latin-1") + b"\0" for s in strings)
+    count = len(files)
+    header = cookedpkg.TOC_MAGIC + bytes([6, 0, 0, 0]) + struct.pack("<IIIIIII", 144, count, len(blocks), 12, 0, 32, bs)
+    header += struct.pack("<II", len(dirblob), 1) + b"\0" * 8 + b"\0" * 16 + bytes([cookedpkg.FLAG_INDEXED]) + b"\0" * 3
+    header += struct.pack("<I", 0) + struct.pack("<Q", 0) + struct.pack("<I", 0)
+    header = header.ljust(144, b"\0")
+    toc = header + b"\0" * (12 * count)
+    toc += b"".join(o.to_bytes(5, "big") + n.to_bytes(5, "big") for o, n in entries)
+    for off, size, m in blocks:
+        toc += off.to_bytes(5, "little") + size.to_bytes(3, "little") + size.to_bytes(3, "little") + bytes([m])
+    toc += dirblob
+    Path(paks).mkdir(parents=True, exist_ok=True)
+    (Path(paks) / "Test.utoc").write_bytes(toc)
+    (Path(paks) / "Test.ucas").write_bytes(ucas)
+
+
+class CookedPkgTests(unittest.TestCase):
+    """editor/bpkit/cookedpkg.py on synthetic IoStore containers (uncompressed, unencrypted)."""
+
+    NAMES = ["BP_A_C", "Default__BP_A_C", "PlayerHUD", "NewVar", "Lbl", "WidgetTree", "Arms_GEN_VARIABLE", "Arms", "Elsewhere"]
+    EXPORTS = [(0, 0, None), (5, 0, 0), (4, 0, 1), (6, 0, 0), (3, 1, 0)]
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="abfcooked"))
+        self.addCleanup(shutil.rmtree, str(self.tmp), True)
+        self.paks = self.tmp / "Proj" / "Content" / "Paks"
+
+    def index(self, method=0):
+        _write_container(self.paks, {"Dir/BP_A": _zen_package(self.NAMES, self.EXPORTS), "Dir/BP_B": _zen_package(["X"], [(0, 0, None)])},
+                         method)
+        return cookedpkg.CookedIndex(str(self.paks))
+
+    def test_index_maps_game_packages(self):
+        self.assertEqual(set(self.index().files), {"/Game/Dir/BP_A", "/Game/Dir/BP_B"})
+
+    def test_class_members_names_widgets_components(self):
+        got = self.index().class_members("/Game/Dir/BP_A.BP_A_C")
+        self.assertTrue({"PlayerHUD", "NewVar", "Elsewhere", "Lbl", "Arms", "Arms_GEN_VARIABLE"} <= got["names"])
+        self.assertIn("NewVar_0", got["names"])            # a numbered name: base + number 1
+        self.assertEqual(got["widgets"], {"Lbl"})          # export under the WidgetTree export
+        self.assertEqual(got["components"], {"Arms"})      # <Var>_GEN_VARIABLE export
+        self.assertEqual(self.index().class_member_candidates("/Game/Dir/BP_A.BP_A_C"), got["names"])
+
+    def test_unknown_package_or_class_is_none(self):
+        idx = self.index()
+        self.assertIsNone(idx.class_members("/Game/Dir/Missing.Missing_C"))
+        self.assertIsNone(idx.class_members("/Game/Dir/BP_A.Other_C"))
+        self.assertIsNone(idx.class_member_candidates("/Game/Dir/Missing.Missing_C"))
+
+    def test_compressed_block_is_a_format_error(self):
+        idx = self.index(method=1)
+        with self.assertRaises(cookedpkg.CookedFormatError):
+            idx.class_members("/Game/Dir/BP_A.BP_A_C")
+
+    def test_no_container_is_a_format_error(self):
+        self.paks.mkdir(parents=True)
+        with self.assertRaises(cookedpkg.CookedFormatError):
+            cookedpkg.CookedIndex(str(self.paks))
+
+    def test_name_batch_ascii_and_utf16(self):
+        names, end = cookedpkg.parse_name_batch(b"\1\2" + _name_batch(["Plain", "Grüße中", "x"]), 2)
+        self.assertEqual(names, ["Plain", "Grüße中", "x"])
+        self.assertEqual(cookedpkg.parse_name_batch(_name_batch([]), 0), ([], 4))
+
+    def test_name_batch_size_mismatch(self):
+        bad = bytearray(_name_batch(["Plain"]))
+        bad[4] += 1
+        with self.assertRaises(cookedpkg.CookedFormatError):
+            cookedpkg.parse_name_batch(bytes(bad), 0)
+
+    def test_mapped_name_numbers(self):
+        self.assertEqual(cookedpkg.mapped_name(["A", "B"], 1, 0), "B")
+        self.assertEqual(cookedpkg.mapped_name(["A", "B"], 1, 3), "B_2")
+        self.assertEqual(cookedpkg.mapped_name(["A"], 0x40000000, 0), "A")     # flag bits above the index are ignored
+        self.assertEqual(cookedpkg.mapped_name(["A"], 5, 0), "?")
+
+    def test_toc_rejects_foreign_files(self):
+        with self.assertRaises(cookedpkg.CookedFormatError):
+            cookedpkg.parse_toc(b"x" * 200)
+
+
+class MemberParseTests(unittest.TestCase):
+    """reflectparse member-discovery helpers."""
+
+    def test_member_name_ok(self):
+        ok, bad = reflectparse.member_name_ok, ["", None, "A.B", "A:B", "A/B", "A(B)", "A\tB", "A#", "A,B", 'A"B', "A=B", "A$"]
+        self.assertTrue(ok("PlayerHUDRef") and ok("NewVar_0") and ok("Has Space"))
+        self.assertFalse(any(ok(b) for b in bad))
+
+    def test_widget_tree_and_scs_names(self):
+        cls = "/Game/Fake/W_A.W_A_C"
+        paths = [cls + ":WidgetTree.Title", cls + ":WidgetTree.Nested.Deep", cls + ":WidgetTree.", cls + ":Arms_GEN_VARIABLE",
+                 cls + ":_GEN_VARIABLE", cls + ":X.Y_GEN_VARIABLE", "/Game/Fake/W_B.W_B_C:WidgetTree.Other", cls, cls + ":Plain"]
+        self.assertEqual(reflectparse.widget_tree_names(paths, cls), {"Title"})
+        self.assertEqual(reflectparse.scs_names(paths, cls), {"Arms"})
+        w, s = reflectparse.group_member_paths(paths)
+        self.assertEqual(w, {cls: {"Title"}, "/Game/Fake/W_B.W_B_C": {"Other"}})
+        self.assertEqual(s, {cls: {"Arms"}})
+
+    def test_member_pin(self):
+        def pin(name, **kw):
+            return dict({"name": name, "dir": "out", "category": "object", "container": "None", "hidden": False}, **kw)
+        pins = [pin("Hud", dir="in"), pin("HUD"), pin("Arr", container="Array"), pin("St", category="struct"), pin("Hid", hidden=True)]
+        self.assertEqual(reflectparse.member_pin(pins, "hud")["name"], "HUD")
+        for n in ("Arr", "St", "Hid", "Nope"):
+            self.assertIsNone(reflectparse.member_pin(pins, n))
+        self.assertIsNone(reflectparse.member_pin(None, "x"))
+
+    def test_member_candidates_priority_and_filtering(self):
+        got = reflectparse.member_candidates({"Btn", "Both"}, {"Both", "Arms"}, {"Both", "Plain", "btn", "Known", "Bad.Name", ""}, {"known"})
+        self.assertEqual(got, {"btn": ("Btn", "widget"), "both": ("Both", "widget"), "arms": ("Arms", "component"), "plain": ("Plain", "member")})
+
+    def test_has_property_and_probe(self):
+        props = {"A": 1, "B": None}
+
+        def get(n):
+            return props[n]
+        self.assertTrue(reflectparse.has_property(get, "B"))
+        self.assertFalse(reflectparse.has_property(get, "C"))
+        self.assertEqual(reflectparse.probe_property(get, "A"), (True, 1))
+        self.assertEqual(reflectparse.probe_property(get, "C"), (False, None))
+
+    def test_is_object_value(self):
+        self.assertTrue(reflectparse.is_object_value(None, dict) and reflectparse.is_object_value({}, dict))
+        self.assertFalse(reflectparse.is_object_value(3, dict))
+
+    def test_doc_property_names(self):
+        doc = ("**Editor Properties:** (see get_editor_property/set_editor_property)\n\n- ``mesh`` (SkeletalMeshComponent): [Read-Only] x\n"
+               "- ``root_component`` (SceneComponent): [Read-Write] y\n- ``mesh`` (SkeletalMeshComponent): dup\n\nnot a property ``x``")
+        self.assertEqual(reflectparse.doc_property_names(doc), ["mesh", "root_component"])
+        self.assertEqual(reflectparse.doc_property_names(None), [])
+        self.assertEqual(reflectparse.snake_to_pascal("character_movement"), "CharacterMovement")
+
+
+_OBJECT_PATH = "/Script/CoreUObject.Object"
+
+
+class FakeObj:
+    """Stand-in for unreal.Object in the member tests."""
+
+
+def _fake_cdo(doc, props):
+    def get(self, name):
+        return props[name]      # KeyError for a name the class does not have, like get_editor_property
+    return type("FakeCdo", (FakeObj,), {"__doc__": doc, "get_editor_property": get})()
+
+
+class ReflectMemberPassTests(unittest.TestCase):
+    """editor/bpkit/reflect.py member pass with a stubbed `unreal`."""
+
+    PATH = "/Game/A/BP_A.BP_A_C"
+
+    def setUp(self):
+        patcher = mock.patch.dict(sys.modules, {"unreal": mock.MagicMock()})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        from bpkit import reflect
+        self.reflect = reflect
+        self.tmp = Path(tempfile.mkdtemp(prefix="abfmember"))
+        self.addCleanup(shutil.rmtree, str(self.tmp), True)
+        self.cls = mock.MagicMock()
+        self.cls.get_path_name.return_value = self.PATH
+        self.cls.get_class.return_value.get_path_name.return_value = "/Script/Engine.BlueprintGeneratedClass"
+
+    def run_reflect(self, classes, cands=None, own=None, doc=None, array=("Btn",), supers=("/Script/Engine.Actor", _OBJECT_PATH)):
+        r = self.reflect
+        r.unreal.load_class.return_value = self.cls
+        seen = []
+
+        def templates(items, errors, what):
+            seen.append(what)
+            out = {}
+            if what == "property":
+                for k, (_c, body) in items.items():
+                    name = body[0].split('MemberName="')[1].rstrip('")')
+                    out[k] = [{"name": name, "dir": "out", "category": "object", "subCategory": "", "subCategoryObject": "/Script/UMG.TextBlock",
+                               "objectMeta": None, "container": "Array" if name in array else "None", "hidden": False, "default": None}]
+            return out
+
+        patches = [mock.patch.object(r, "_templates", side_effect=templates), mock.patch.object(r, "_function_index", return_value={}),
+                   mock.patch.object(r, "_ancestors", return_value=["/Script/Engine.Actor"]),
+                   mock.patch.object(r, "_supers", return_value=list(supers)),
+                   mock.patch.object(r.rp, "collect_function_meta", return_value={})]
+        if cands is not None:
+            patches.append(mock.patch.object(r, "_member_candidates", side_effect=cands if isinstance(cands, Exception) else None,
+                                             return_value=None if isinstance(cands, Exception) else cands))
+        if own is not None:
+            patches.append(mock.patch.object(r, "_own_members", return_value=own))
+        if doc is not None:
+            patches.append(mock.patch.object(r, "_doc_members", return_value=doc))
+            patches.append(mock.patch.object(r, "_is_component", side_effect=lambda pin: pin["name"] == "Mesh"))
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        res = r.run({"run": str(self.tmp), "classes": classes})
+        return res, json.loads((self.tmp / "reflect.json").read_text(encoding="utf-8")), seen
+
+    def test_blueprint_members_are_listed_with_kind(self):
+        cands = ({self.PATH: {"hud": ("HUD", "member"), "btn": ("Btn", "widget")}}, ["widgetTree", "scs", "cookedClass"])
+        res, written, seen = self.run_reflect([self.PATH], cands=cands, own=[("HUD", "member"), ("Btn", "widget")])
+        props = written["classes"][self.PATH]["properties"]
+        self.assertEqual([(x["name"], x.get("kind")) for x in props], [("HUD", "member")])      # the array-typed Btn is rejected
+        self.assertEqual(props[0]["pins"][0]["name"], "HUD")
+        self.assertEqual(written["memberSources"], ["widgetTree", "scs", "cookedClass"])
+        self.assertEqual(res["counts"]["members"], 1)
+        self.assertEqual(res["counts"]["properties"], 1)
+        self.assertEqual(seen.count("property"), 1)          # no extra template call
+
+    def test_members_known_to_class_defaults_are_not_repeated(self):
+        r = self.reflect
+        cands = ({self.PATH: {}}, ["cookedClass"])
+        defaults = [{"name": "HUD", "dir": "out", "category": "object", "subCategory": "", "subCategoryObject": "x", "objectMeta": None,
+                     "container": "None", "hidden": False, "default": None}]
+
+        def templates(items, errors, what):
+            if what == "class defaults":
+                return {k: defaults for k in items}
+            if what == "property":
+                return {k: [dict(defaults[0], name=b[0].split('MemberName="')[1].rstrip('")'))] for k, (_c, b) in items.items()}
+            return {}
+        with mock.patch.object(r, "_templates", side_effect=templates), mock.patch.object(r, "_function_index", return_value={}), \
+                mock.patch.object(r, "_ancestors", return_value=[]), mock.patch.object(r, "_supers", return_value=["/Script/Engine.Actor", _OBJECT_PATH]), \
+                mock.patch.object(r, "_member_candidates", return_value=cands), mock.patch.object(r, "_own_members", return_value=[("hud", "member"), ("Extra", "member")]), \
+                mock.patch.object(r.rp, "collect_function_meta", return_value={}):
+            r.unreal.load_class.return_value = self.cls
+            r.run({"run": str(self.tmp), "classes": [self.PATH]})
+        props = json.loads((self.tmp / "reflect.json").read_text(encoding="utf-8"))["classes"][self.PATH]["properties"]
+        self.assertEqual([(x["name"], x.get("kind")) for x in props], [("HUD", None), ("Extra", "member")])
+
+    def test_candidate_failure_is_one_error_and_properties_survive(self):
+        res, written, _ = self.run_reflect([self.PATH], cands=RuntimeError("boom"), own=[("HUD", "member")])
+        errs = [e for e in written["errors"] if "member discovery" in e]
+        self.assertEqual(len(errs), 1)
+        self.assertIn("boom", errs[0])
+        self.assertEqual(written["classes"][self.PATH]["properties"], [])
+        self.assertEqual((written["memberSources"], res["counts"]["members"]), ([], 0))
+
+    def test_unknown_parent_skips_the_class(self):
+        cands = ({self.PATH: {"hud": ("HUD", "member")}}, ["cookedClass"])
+        _res, written, _ = self.run_reflect([self.PATH], cands=cands, own=[("HUD", "member")], supers=())
+        self.assertEqual(written["classes"][self.PATH]["properties"], [])
+        self.assertTrue(any("parent class unknown" in e for e in written["errors"]))
+
+    def test_native_class_uses_python_doc_and_pin_type_decides_kind(self):
+        self.cls.get_path_name.return_value = "/Script/Engine.Character"
+        res, written, _ = self.run_reflect(["/Script/Engine.Character"], doc=["Mesh", "Foo"])
+        props = written["classes"]["/Script/Engine.Character"]["properties"]
+        self.assertEqual([(x["name"], x["kind"]) for x in props], [("Mesh", "component"), ("Foo", "member")])
+        self.assertEqual(written["memberSources"], ["pythonDoc"])
+
+    def test_no_game_class_means_empty_sources(self):
+        self.cls.get_path_name.return_value = "/Script/Engine.Actor"
+        _res, written, _ = self.run_reflect(["/Script/Engine.Actor"], doc=[])
+        self.assertEqual(written["memberSources"], ["pythonDoc"])
+        self.assertEqual(written["classes"]["/Script/Engine.Actor"]["properties"], [])
+
+    def test_own_members_keeps_declared_object_valued_members(self):
+        r = self.reflect
+        cdo = _fake_cdo("", {"HUD": None, "Btn": FakeObj(), "Count": 3, "Inherited": None})
+        parent = _fake_cdo("", {"Inherited": None})
+        cand = {"hud": ("HUD", "member"), "btn": ("Btn", "widget"), "count": ("Count", "member"), "inherited": ("Inherited", "member"),
+                "gone": ("Gone", "member")}
+        with mock.patch.object(r.unreal, "get_default_object", side_effect=lambda c: c), mock.patch.object(r.unreal, "Object", FakeObj):
+            self.assertEqual(r._own_members(cdo, cand, parent), [("HUD", "member"), ("Btn", "widget")])
+            self.assertEqual(len(r._own_members(cdo, cand, None)), 3)
+
+    def test_doc_members_minus_parent_doc_and_non_objects(self):
+        r = self.reflect
+        doc = "- ``mesh`` (SkeletalMeshComponent): x\n- ``health`` (float): y\n- ``base_obj`` (Object): z\n- ``capsule_component`` (CapsuleComponent): w\n"
+        cdo = _fake_cdo(doc, {"mesh": None, "health": 1.5, "base_obj": None, "capsule_component": FakeObj()})
+        parent = _fake_cdo("- ``base_obj`` (Object): z\n", {"base_obj": None})
+        with mock.patch.object(r.unreal, "get_default_object", side_effect=lambda c: c), mock.patch.object(r.unreal, "Object", FakeObj):
+            self.assertEqual(r._doc_members(cdo, parent), ["Mesh", "CapsuleComponent"])
+
+    def test_member_candidates_sources(self):
+        r = self.reflect
+        pn = self.PATH
+
+        class It:
+            def __init__(self, p):
+                self.p = p
+
+            def get_path_name(self):
+                return self.p
+        iters = {id(r.unreal.Widget): [It(pn + ":WidgetTree.Lbl"), It("/Game/Other.Other_C:WidgetTree.No")],
+                 id(r.unreal.ActorComponent): [It(pn + ":Arms_GEN_VARIABLE")]}
+
+        class Index:
+            def __init__(self, _paks):
+                pass
+
+            def class_members(self, path):
+                return {"names": {"Foo", "Lbl", "Arms"}, "widgets": set(), "components": set()}
+        loaded = {pn: (self.cls, pn, "m")}
+        errors = []
+        with mock.patch.object(r.unreal, "ObjectIterator", side_effect=lambda c: iter(iters[id(c)])), \
+                mock.patch.object(r.cookedpkg, "CookedIndex", Index), mock.patch.object(r, "_paks_dir", return_value="x"):
+            cand, sources = r._member_candidates(loaded, [pn], errors)
+        self.assertEqual(cand[pn], {"lbl": ("Lbl", "widget"), "arms": ("Arms", "component"), "foo": ("Foo", "member")})
+        self.assertEqual((sources, errors), (["widgetTree", "scs", "cookedClass"], []))
+
+    def test_member_candidates_without_cooked_reader(self):
+        r = self.reflect
+        pn = self.PATH
+        loaded = {pn: (self.cls, pn, "m")}
+        errors = []
+        with mock.patch.object(r.unreal, "ObjectIterator", side_effect=lambda c: iter([])), \
+                mock.patch.object(r.cookedpkg, "CookedIndex", side_effect=OSError("no paks")), mock.patch.object(r, "_paks_dir", return_value="x"):
+            cand, sources = r._member_candidates(loaded, [pn], errors)
+        self.assertEqual((cand[pn], sources), ({}, ["widgetTree", "scs"]))
+        self.assertEqual(len(errors), 1)
+        self.assertIn("cooked package reader unavailable", errors[0])
+
+    def test_member_candidates_class_missing_from_cooked_content(self):
+        r = self.reflect
+        pn = self.PATH
+        loaded = {pn: (self.cls, pn, "m")}
+        errors = []
+
+        class Index:
+            def __init__(self, _paks):
+                pass
+
+            def class_members(self, path):
+                return None
+        with mock.patch.object(r.unreal, "ObjectIterator", side_effect=lambda c: iter([])), mock.patch.object(r.cookedpkg, "CookedIndex", Index), \
+                mock.patch.object(r, "_paks_dir", return_value="x"):
+            _cand, sources = r._member_candidates(loaded, [pn], errors)
+        self.assertNotIn("cookedClass", sources)
+        self.assertTrue(any("not found in the cooked packages" in e for e in errors))
 
 
 NODE_T3D = (

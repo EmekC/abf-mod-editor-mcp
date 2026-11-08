@@ -6,6 +6,8 @@ All notable changes to abf-mod-editor-mcp. The format follows [Keep a Changelog]
 
 ### Added
 
+- `reflect`: members that `K2Node_GetClassDefaults` cannot list (single references to widget and component classes: designer widgets, SCS components, plain widget/component variables, and the component properties of native classes) are found from the widget tree, SCS templates, the class package name map (`editor/bpkit/cookedpkg.py`, read only) and the Python docstring of native default objects; each is checked on the class default object and typed by a VariableGet node. Properties get `kind` (`widget`, `component`, `member`), the result gets `memberSources` and `counts.members` (ABFC.md).
+
 - abfc tool `catalog(mod)` (and the commandlet op, also served by the warm session): names-only catalog of every `/Game` Blueprint
   class (with parent, interface flag) and every `/Script` class, struct, enum and function library (with function names) into
   `<run>/catalog.json`, read only, no asset loads. Feature `catalog` in `abfc_extensions` (ABFC.md).
