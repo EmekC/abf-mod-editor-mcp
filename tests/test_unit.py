@@ -2203,20 +2203,36 @@ class SafetyTests(unittest.TestCase):
         out += sorted((ROOT / "editor" / "bpkit").glob("*.py"))
         return out
 
+    # editor/bpkit/assetops.py is the one module behind bp_asset_ops (staged copy only, host validated and snapshotted)
+    ASSET_OPS_FILE = "assetops.py"
+
     def test_no_input_automation_or_deletes(self):
         for f in self.files():
             text = f.read_text(encoding="utf-8")
             for token in self.FORBIDDEN:
+                if f.name == self.ASSET_OPS_FILE and token == "delete_asset":
+                    continue
                 self.assertNotIn(token, text, "%s contains %s" % (f.name, token))
 
-    def test_reparent_only_in_scratch_helper(self):
+    def test_deleting_only_in_asset_ops(self):
+        lines = (ROOT / "editor" / "bpkit" / self.ASSET_OPS_FILE).read_text(encoding="utf-8").splitlines()
+        seen = 0
+        for i, l in enumerate(lines):
+            if "delete_asset" in l and not l.lstrip().startswith(("#", '"""')):
+                seen += 1
+                start = max(j for j in range(i + 1) if lines[j].startswith("def "))
+                self.assertTrue(lines[start].startswith(("def rename", "def delete")), (i, lines[start]))
+        self.assertGreater(seen, 0)
+
+    def test_reparent_only_in_scratch_helper_and_asset_ops(self):
         for f in self.files():
             lines = f.read_text(encoding="utf-8").splitlines()
             for i, l in enumerate(lines):
                 if "reparent_blueprint" in l:
-                    self.assertEqual(f.name, "graphs.py")
+                    self.assertIn(f.name, ("graphs.py", self.ASSET_OPS_FILE))
                     start = max(j for j in range(i + 1) if lines[j].startswith("def "))
-                    self.assertTrue(lines[start].startswith("def _rebuild_scratch_pins"), (f.name, i))
+                    want = "def _rebuild_scratch_pins" if f.name == "graphs.py" else "def reparent"
+                    self.assertTrue(lines[start].startswith(want), (f.name, i))
 
     def test_cursor_patch_guard(self):
         text = (ROOT / "editor" / "bpkit" / "cursorpatch.py").read_text(encoding="utf-8")
@@ -2243,9 +2259,9 @@ class StdioSmokeTests(unittest.TestCase):
         replies = {json.loads(l)["id"]: json.loads(l) for l in p.stdout.splitlines() if l.strip()}
         self.assertEqual(replies[1]["result"]["serverInfo"]["version"], "2.5.0")
         names = [t["name"] for t in replies[2]["result"]["tools"]]
-        self.assertEqual(len(names), 43)
+        self.assertEqual(len(names), 44)
         for n in ("staging_sync", "staging_status", "bp_apply", "bp_read", "bp_compile_report", "bp_game_test",
-                  "hidden_editor_shot", "mod_audit", "bp_publish", "backend_info"):
+                  "hidden_editor_shot", "mod_audit", "bp_publish", "bp_asset_ops", "backend_info"):
             self.assertIn(n, names)
         bi = replies[4]["result"]
         self.assertFalse(bi.get("isError"))

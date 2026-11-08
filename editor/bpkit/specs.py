@@ -236,6 +236,91 @@ def check_class_manager_row(w, row, mod):
     return problems
 
 
+ASSET_OPS = ("rename", "delete", "reparent", "recreate")
+ASSET_OPS_MAX = 20
+_OP_KEYS = {"rename": ("from", "to"), "delete": ("asset",), "reparent": ("asset", "parent"), "recreate": ("asset",)}
+_ASSET_SEGMENT_RX = re.compile(r"^[A-Za-z0-9_]+$")
+_CLASS_NAME_RX = re.compile(r"^[A-Za-z0-9_]+$")
+_PROTECTED_TOP = ("AbioticModConfig", "UUGC_Metadata")
+_TOOLING_TOP = ("_McpTest", "_McpTmp")
+
+
+def _check_op_asset(where, value, mod):
+    """None, or the problem with one asset package path of an asset op."""
+    if not isinstance(value, str) or not value:
+        return "%s is required (a package path like /%s/Folder/BP_X)" % (where, mod)
+    if value == "/Game" or value.startswith("/Game/"):
+        return "%s: /Game is base content and is never edited" % where
+    prefix = "/%s/" % mod
+    if not value.startswith(prefix):
+        return "%s: %r must start with %s (other roots are refused)" % (where, value, prefix)
+    segments = value[len(prefix):].split("/")
+    if not all(_ASSET_SEGMENT_RX.match(s) for s in segments):
+        return "%s: %r is not a plain package path (letters, digits and '_' in /-separated segments)" % (where, value)
+    if any(s in _TOOLING_TOP for s in segments):
+        return "%s: %r is tooling scratch, never an asset op target" % (where, value)
+    if segments[0] in _PROTECTED_TOP:
+        return "%s: %r is a mod configuration asset and is never renamed, deleted or reparented" % (where, value)
+    return None
+
+
+def _check_op_class(where, value, mod):
+    """None, or the problem with a parent class path of a reparent op: /Script/<Module>.<Class>, or <Class> in /<Mod>/ or /Game/."""
+    if not isinstance(value, str) or not value:
+        return "%s is required (a class path like /Script/Engine.Actor)" % where
+    if "." not in value:
+        return "%s: %r is not a class path like /Script/Engine.Actor or /%s/Folder/BP_X.BP_X_C" % (where, value, mod)
+    pkg, name = value.rsplit(".", 1)
+    if not _CLASS_NAME_RX.match(name):
+        return "%s: %r has a bad class name" % (where, value)
+    parts = pkg.split("/")
+    if len(parts) < 3 or parts[0] != "" or not all(_ASSET_SEGMENT_RX.match(s) for s in parts[1:]):
+        return "%s: %r is not a plain class path" % (where, value)
+    root = parts[1]
+    if root == "Script":
+        if len(parts) != 3:
+            return "%s: %r is not a /Script/<Module>.<Class> path" % (where, value)
+    elif root not in ("Game", mod):
+        return "%s: %r must be a /Script/..., /Game/... or /%s/... class" % (where, value, mod)
+    elif any(s in _TOOLING_TOP or s in _PROTECTED_TOP for s in parts[2:]):
+        return "%s: %r is not a usable parent class" % (where, value)
+    return None
+
+
+def check_asset_ops(ops, mod):
+    """Problems of a bp_asset_ops request: [{op:"rename",from,to} | {op:"delete",asset} | {op:"reparent",asset,parent} |
+    {op:"recreate",asset}], at most ASSET_OPS_MAX, every path inside the mod and never /Game. Pure text: whether the
+    assets exist is checked by the caller (host: staged files, editor side: asset registry)."""
+    if not isinstance(ops, list) or not ops:
+        return ["ops must be a non-empty list of {op, ...} objects"]
+    problems = []
+    if len(ops) > ASSET_OPS_MAX:
+        problems.append("at most %d ops per call (got %d)" % (ASSET_OPS_MAX, len(ops)))
+    for i, o in enumerate(ops[:ASSET_OPS_MAX * 2]):
+        w = "ops[%d]" % i
+        if not isinstance(o, dict):
+            problems.append(w + " must be an object")
+            continue
+        kind = o.get("op")
+        if kind not in ASSET_OPS:
+            problems.append("%s.op must be one of %s (got %r)" % (w, "|".join(ASSET_OPS), kind))
+            continue
+        w = "%s (%s)" % (w, kind)
+        for key in o:
+            if key != "op" and key not in _OP_KEYS[kind]:
+                problems.append("%s: unknown key %r (known: %s)" % (w, key, ", ".join(_OP_KEYS[kind])))
+        for key in _OP_KEYS[kind]:
+            if key == "parent":
+                bad = _check_op_class("%s.parent" % w, o.get(key), mod)
+            else:
+                bad = _check_op_asset("%s.%s" % (w, key), o.get(key), mod)
+            if bad:
+                problems.append(bad)
+        if kind == "rename" and isinstance(o.get("from"), str) and o.get("from") == o.get("to"):
+            problems.append("%s: from and to are the same path" % w)
+    return problems
+
+
 def _find_key(obj, key):
     if isinstance(obj, dict):
         if key in obj:

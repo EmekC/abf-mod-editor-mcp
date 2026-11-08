@@ -915,6 +915,7 @@ class BackendInfoCapabilityTests(unittest.TestCase):
         caps = self.capabilities(False)
         self.assertIs(caps["gameplayTags"], True)
         self.assertIs(caps["reflectDefaults"], True)
+        self.assertEqual(caps["assetOps"], ["rename", "delete", "reparent", "recreate"])
         self.assertIs(caps["compileErrorNodeRefs"], True)
         self.assertIs(caps["functionLocals"], False)
         self.assertIs(caps["userPureFunctions"], False)
@@ -1717,6 +1718,9 @@ class ClassManagerRowEditorSideTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, str(tmp), True)
         for rel in ("editor/bpkit/rows.py", "editor/bpkit/jobs.py"):
             py_compile.compile(str(ROOT / rel), cfile=str(tmp / "x.pyc"), doraise=True)
+
+
+from tests.test_asset_ops import AssetOpsEditorSideTests, AssetOpsHostTests, AssetOpsSpecTests  # noqa: E402,F401  (bp_asset_ops tests)
 
 
 if __name__ == "__main__":

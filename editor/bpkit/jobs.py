@@ -164,7 +164,12 @@ def op_reflect(job):
     return reflect.run(job)
 
 
-COMMANDLET_OPS = {"apply": op_apply, "compile": op_compile, "export": op_export, "reflect": op_reflect}
+def op_asset_ops(job):
+    from . import assetops
+    return assetops.run(job)
+
+
+COMMANDLET_OPS = {"apply": op_apply, "compile": op_compile, "export": op_export, "reflect": op_reflect, "asset_ops": op_asset_ops}
 GENERATOR_OPS = ("game_test", "shots", "audit", "live_publish_test")
 
 
