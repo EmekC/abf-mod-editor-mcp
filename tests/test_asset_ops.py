@@ -286,6 +286,10 @@ class AssetOpsEditorSideTests(unittest.TestCase):
             return SimpleNamespace(is_dirty=lambda: self.dirty)
 
         def get_editor_property(self, key):
+            # live: a Blueprint's parent_class cannot be read from Python
+            raise RuntimeError("Blueprint: Failed to find property '%s' for attribute '%s' on 'Blueprint'" % (key, key))
+
+        def generated_class(self):
             return self.parent
 
     def setUp(self):
@@ -314,8 +318,10 @@ class AssetOpsEditorSideTests(unittest.TestCase):
         u.Actor.static_class.return_value = "actor"
         u.ActorComponent.static_class.return_value = "component"
         u.UserWidget.static_class.return_value = "widget"
-        u.MathLibrary.class_is_child_of.side_effect = lambda cls, base: cls.family == base
+        u.MathLibrary.class_is_child_of.side_effect = lambda cls, base: cls.family == base or cls is base
         u.AssetRegistryHelpers.get_asset_registry.return_value.get_referencers.side_effect = lambda pkg, opts: list(self.refs.get(pkg, []))
+        u.AssetRegistryHelpers.get_asset_registry.return_value.get_asset_by_object_path.side_effect = lambda obj: SimpleNamespace(
+            get_tag_value=lambda name: "/Script/CoreUObject.Class'%s'" % self.world[obj.split(".")[0]].parent.path)
         lib = u.EditorAssetLibrary
         lib.does_asset_exist.side_effect = lambda obj: obj.split(".")[0] in self.world
         lib.rename_asset.side_effect = self.rename_asset
@@ -464,7 +470,7 @@ class AssetOpsEditorSideTests(unittest.TestCase):
         self.u.BlueprintEditorLibrary.reparent_blueprint.side_effect = lambda b, c: None
         res = self.exec_ops({"op": "reparent", "asset": "/TestMod/A/BP_A", "parent": "/Script/Engine.Pawn"})
         self.assertIs(res["ok"], False)
-        self.assertIn("still derives", res["error"])
+        self.assertIn("does not derive", res["error"])
 
     def test_the_first_failure_stops_the_run(self):
         self.add("/TestMod/A/BP_A")

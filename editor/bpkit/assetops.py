@@ -132,6 +132,25 @@ def family(cls):
     return "object"
 
 
+def _parent_path(asset):
+    """Class path of a Blueprint's parent, or None. `parent_class` cannot be read from Python (the editor says "Failed to find
+    property"); the asset registry's ParentClass tag holds it as "/Script/CoreUObject.Class'<path>'"."""
+    reg = unreal.AssetRegistryHelpers.get_asset_registry()
+    data = reg.get_asset_by_object_path(_object_path(asset))
+    try:
+        value = data.get_tag_value("ParentClass")
+    except Exception:
+        return None
+    if isinstance(value, tuple):
+        value = value[1] if value and value[0] else None
+    if not value:
+        return None
+    value = str(value)
+    if "'" in value:
+        value = value.split("'")[1]
+    return value.strip('"') or None
+
+
 def reparent(op, mod):
     asset, parent = op["asset"], op["parent"]
     if not _exists(asset):
@@ -142,21 +161,22 @@ def reparent(op, mod):
     new_cls = unreal.load_class(None, parent)
     if new_cls is None:
         raise RuntimeError("reparent: class %s cannot be loaded" % parent)
-    old_cls = core.must(bp.get_editor_property("parent_class"), "parent class of " + asset)
-    if _class_path(old_cls) == _class_path(new_cls):
+    gen = core.must(bp.generated_class(), "generated class of " + asset)
+    old_path = _parent_path(asset)
+    if old_path is not None and old_path == _class_path(new_cls):
         return {"detail": "%s already derives from %s" % (asset, parent), "touched": []}
-    old_family, new_family = family(old_cls), family(new_cls)
+    old_family, new_family = family(gen), family(new_cls)
     if old_family != new_family:
         raise RuntimeError("reparent: family mismatch, %s is a %s Blueprint and %s is a %s class (recreate the asset instead)"
                            % (asset, old_family, parent, new_family))
     unreal.BlueprintEditorLibrary.reparent_blueprint(bp, new_cls)
     unreal.BlueprintEditorLibrary.compile_blueprint(bp)
-    now = bp.get_editor_property("parent_class")
-    if now is None or _class_path(now) != _class_path(new_cls):
-        raise RuntimeError("reparent: %s still derives from %s after the reparent" % (asset, _class_path(now) if now is not None else None))
+    now = bp.generated_class()
+    if now is None or not unreal.MathLibrary.class_is_child_of(now, new_cls):
+        raise RuntimeError("reparent: %s still does not derive from %s after the reparent" % (asset, parent))
     if not unreal.EditorAssetLibrary.save_loaded_asset(bp, False):
         raise RuntimeError("reparent: could not save " + asset)
-    return {"detail": "reparented %s: %s -> %s" % (asset, _class_path(old_cls), parent), "touched": []}
+    return {"detail": "reparented %s: %s -> %s" % (asset, old_path or "?", parent), "touched": []}
 
 
 def run(job):
